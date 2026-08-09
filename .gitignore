@@ -1,0 +1,22 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Build
+*.egg-info/
+build/
+dist/
+
+# Playwright
+.playwright-mcp/
+
+# Environment
+.env
+
+# Memory data
+memory/experiences/*.yaml
+memory/reflections/*.yaml
+
+# Logs
+*.log
+
