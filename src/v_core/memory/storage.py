@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
+from enum import Enum
 from pathlib import Path
 
 import yaml
@@ -8,7 +9,10 @@ import yaml
 
 class MemoryStorage:
 
-    def __init__(self, root: Path):
+    def __init__(
+        self,
+        root: Path,
+    ):
 
         self.root = Path(root)
 
@@ -35,6 +39,10 @@ class MemoryStorage:
 
         if is_dataclass(data):
             data = asdict(data)
+
+        data = self._serialize(
+            data
+        )
 
         with open(
             path,
@@ -80,3 +88,37 @@ class MemoryStorage:
         return sorted(
             directory.glob("*.yaml")
         )
+
+    @classmethod
+    def _serialize(
+        cls,
+        value,
+    ):
+        if isinstance(value, Enum):
+            return value.value
+
+        if isinstance(value, dict):
+            return {
+                key: cls._serialize(item)
+                for key, item in value.items()
+            }
+
+        if isinstance(value, list):
+            return [
+                cls._serialize(item)
+                for item in value
+            ]
+
+        if isinstance(value, tuple):
+            return [
+                cls._serialize(item)
+                for item in value
+            ]
+
+        if isinstance(value, set):
+            return [
+                cls._serialize(item)
+                for item in value
+            ]
+
+        return value

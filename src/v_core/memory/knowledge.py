@@ -1,20 +1,18 @@
 from __future__ import annotations
 
-import json
-
 from ..llm import LLM
+from ..utils import parse_llm_json
 from .models import (
-    SummaryEntry,
     KnowledgeEntry,
+    MemoryKind,
+    MemorySource,
+    SummaryEntry,
 )
 
 
 class Knowledge:
 
-    def __init__(
-        self,
-        llm: LLM,
-    ):
+    def __init__(self, llm: LLM):
         self.llm = llm
 
     async def update(
@@ -26,15 +24,38 @@ class Knowledge:
         prompt = f"""
 You are V.
 
+You are updating your long-term knowledge.
+
 Current knowledge:
 
 {knowledge}
 
-New summary:
+New consolidated summary:
 
 {summary}
 
-Determine whether your long-term knowledge should change.
+Determine whether long-term knowledge should change.
+
+Rules:
+
+- Update only when the information is stable and reusable.
+- Ignore one-time events unless they represent a meaningful experience
+  or relationship event.
+- Do not overwrite established knowledge based on a single weak inference.
+- Preserve uncertainty.
+- Do not invent information.
+- Do not turn an inference into a verified fact.
+- A preference should be retained when it is explicitly stated or
+  repeatedly demonstrated.
+- A lesson should be retained when it improves future behaviour.
+- An experience should be retained when the event itself has durable
+  significance.
+- A relationship_event should be retained when it meaningfully changes the
+  understanding of the relationship between V and Boss.
+- If the new summary does not contain durable information, return an
+  empty knowledge entry.
+- Confidence must be between 0.0 and 1.0.
+- Keep the source of the information explicit.
 
 Return ONLY valid JSON.
 
@@ -44,25 +65,79 @@ Schema:
     "title": "...",
     "content": "...",
     "reason": "...",
-    "confidence": 0.0
+    "confidence": 0.0,
+    "kind": "fact | preference | lesson | experience | relationship_event",
+    "source": "observed | directly_told | inferred | self_generated | verified"
 }}
 
-Rules:
+Source rules:
 
-- Update only if the knowledge is stable.
-- Ignore one-time events.
-- Confidence must be between 0.0 and 1.0.
-- Output ONLY JSON.
-- No markdown.
+- directly_told: explicitly stated by Boss.
+- observed: directly established from an interaction or result.
+- inferred: derived from available evidence.
+- self_generated: primarily produced by V's reasoning.
+- verified: explicitly supported by reliable verification in the available
+  context.
+
+Never claim verification without evidence.
+
+Output ONLY JSON.
 """.strip()
 
         response = await self.llm.ask(prompt)
 
-        data = json.loads(response)
+        data = parse_llm_json(
+            response,
+            default={
+                "title": "",
+                "content": "",
+                "reason": "",
+                "confidence": 0.0,
+                "kind": summary.kind.value,
+                "source": summary.source.value,
+            },
+        )
+
+        try:
+            kind = MemoryKind(
+                data.get(
+                    "kind",
+                    summary.kind.value,
+                )
+            )
+        except ValueError:
+            kind = summary.kind
+
+        try:
+            source = MemorySource(
+                data.get(
+                    "source",
+                    summary.source.value,
+                )
+            )
+        except ValueError:
+            source = summary.source
+
+        confidence = float(
+            data.get(
+                "confidence",
+                0.0,
+            )
+        )
+
+        confidence = max(
+            0.0,
+            min(
+                1.0,
+                confidence,
+            ),
+        )
 
         return KnowledgeEntry(
             title=data.get("title", ""),
             content=data.get("content", ""),
             reason=data.get("reason", ""),
-            confidence=float(data.get("confidence", 0.0)),
+            confidence=confidence,
+            kind=kind,
+            source=source,
         )

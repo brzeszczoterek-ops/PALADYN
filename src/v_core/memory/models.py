@@ -2,6 +2,33 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
+
+
+class MemoryKind(str, Enum):
+
+    FACT = "fact"
+
+    PREFERENCE = "preference"
+
+    LESSON = "lesson"
+
+    EXPERIENCE = "experience"
+
+    RELATIONSHIP_EVENT = "relationship_event"
+
+
+class MemorySource(str, Enum):
+
+    OBSERVED = "observed"
+
+    DIRECTLY_TOLD = "directly_told"
+
+    INFERRED = "inferred"
+
+    SELF_GENERATED = "self_generated"
+
+    VERIFIED = "verified"
 
 
 @dataclass
@@ -23,6 +50,10 @@ class ReflectionEntry:
 
     remember: bool = False
 
+    kind: MemoryKind = MemoryKind.LESSON
+
+    source: MemorySource = MemorySource.SELF_GENERATED
+
 
 @dataclass
 class ExperienceEntry:
@@ -39,6 +70,10 @@ class ExperienceEntry:
 
     importance: str = "low"
 
+    kind: MemoryKind = MemoryKind.EXPERIENCE
+
+    source: MemorySource = MemorySource.SELF_GENERATED
+
 
 @dataclass
 class SummaryEntry:
@@ -49,11 +84,17 @@ class SummaryEntry:
 
     summary: str = ""
 
-    lessons: list[str] = field(default_factory=list)
+    lessons: list[str] = field(
+        default_factory=list
+    )
 
     confidence: float = 0.0
 
     importance: str = "low"
+
+    kind: MemoryKind = MemoryKind.LESSON
+
+    source: MemorySource = MemorySource.SELF_GENERATED
 
 
 @dataclass
@@ -71,6 +112,10 @@ class KnowledgeEntry:
 
     confidence: float = 0.0
 
+    kind: MemoryKind = MemoryKind.FACT
+
+    source: MemorySource = MemorySource.INFERRED
+
 
 @dataclass
 class SessionEvent:
@@ -81,4 +126,6 @@ class SessionEvent:
 
     event_type: str = ""
 
-    data: dict = field(default_factory=dict)
+    data: dict = field(
+        default_factory=dict
+    )

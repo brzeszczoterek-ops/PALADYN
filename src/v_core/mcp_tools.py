@@ -11,7 +11,6 @@ class MCPTools:
         self,
         config: Config,
     ):
-
         #
         # MCP clients
         #
@@ -41,7 +40,10 @@ class MCPTools:
 
     async def ensure_browser_session(self) -> None:
 
-        if self.browser_ready and self.browser_session is not None:
+        if (
+            self.browser_ready
+            and self.browser_session is not None
+        ):
             return
 
         params = self.browser_client.server_command
@@ -59,8 +61,13 @@ class MCPTools:
             )
         )
 
-        self._browser_streams = await self._browser_stdio.__aenter__()
-        read_stream, write_stream = self._browser_streams
+        self._browser_streams = (
+            await self._browser_stdio.__aenter__()
+        )
+
+        read_stream, write_stream = (
+            self._browser_streams
+        )
 
         self.browser_session = ClientSession(
             read_stream,
@@ -79,14 +86,29 @@ class MCPTools:
 
     async def close_browser_session(self) -> None:
 
-        if not self.browser_ready or self.browser_session is None:
+        if (
+            not self.browser_ready
+            or self.browser_session is None
+        ):
             return
 
         try:
-            await self.browser_session.__aexit__(None, None, None)
+
+            await self.browser_session.__aexit__(
+                None,
+                None,
+                None,
+            )
+
         finally:
-            if hasattr(self, "_browser_stdio"):
-                await self._browser_stdio.__aexit__(None, None, None)
+
+            if hasattr(
+                self,
+                "_browser_stdio",
+            ):
+                await self._browser_stdio.__aexit__(
+                    None,
+                )
 
             self.browser_session = None
             self.browser_ready = False
@@ -209,8 +231,14 @@ class MCPTools:
         text = []
 
         for item in result.content:
-            if hasattr(item, "text"):
-                text.append(item.text)
+
+            if hasattr(
+                item,
+                "text",
+            ):
+                text.append(
+                    item.text
+                )
 
         return "\n".join(text)
 
@@ -218,30 +246,47 @@ class MCPTools:
     # Metadata
     #
 
-    async def tools(self):
+    async def tools(self) -> list[str]:
 
-        filesystem_tools = await self.filesystem_client.list_tools()
-        browser_tools = await self.browser_client.list_tools()
+        filesystem_tools = (
+            await self.filesystem_client.list_tools()
+        )
 
-        return [
-            tool.name for tool in filesystem_tools.tools
-        ] + [
-            tool.name for tool in browser_tools.tools
-        ]
+        browser_tools = (
+            await self.browser_client.list_tools()
+        )
+
+        return (
+            [
+                tool.name
+                for tool in filesystem_tools.tools
+            ]
+            + [
+                tool.name
+                for tool in browser_tools.tools
+            ]
+        )
 
     async def tool_info(
         self,
         name: str,
     ):
-        filesystem_tools = await self.filesystem_client.list_tools()
+
+        filesystem_tools = (
+            await self.filesystem_client.list_tools()
+        )
 
         for tool in filesystem_tools.tools:
+
             if tool.name == name:
                 return tool
 
-        browser_tools = await self.browser_client.list_tools()
+        browser_tools = (
+            await self.browser_client.list_tools()
+        )
 
         for tool in browser_tools.tools:
+
             if tool.name == name:
                 return tool
 
@@ -257,48 +302,108 @@ class MCPTools:
         arguments: str = "",
     ):
 
+        tool = tool.strip()
+
+        #
+        # Filesystem aliases + native MCP names
+        #
+
         match tool:
 
-            #
-            # Filesystem
-            #
+            case "ls" | "list_directory":
+                return await self.ls(
+                    arguments or "."
+                )
 
-            case "ls":
-                return await self.ls(arguments or ".")
+            case "tree" | "directory_tree":
+                return await self.tree(
+                    arguments or "."
+                )
 
-            case "tree":
-                return await self.tree(arguments or ".")
+            case "cat" | "read_file":
+                return await self.cat(
+                    arguments
+                )
 
-            case "cat":
-                return await self.cat(arguments)
+            case "mkdir" | "create_directory":
+                return await self.mkdir(
+                    arguments
+                )
 
-            case "mkdir":
-                return await self.mkdir(arguments)
+            case "info" | "get_file_info":
+                return await self.info(
+                    arguments
+                )
 
-            case "info":
-                return await self.info(arguments)
+            case "search" | "search_files":
 
-            case "search":
+                try:
+                    path, pattern = (
+                        arguments.split(
+                            ",",
+                            1,
+                        )
+                    )
 
-                path, pattern = arguments.split(",", 1)
+                except ValueError:
+                    return (
+                        "Invalid arguments for "
+                        "search_files. Expected: "
+                        "path,pattern"
+                    )
 
                 return await self.search(
                     path.strip(),
                     pattern.strip(),
                 )
 
-            case "write":
+            case "write" | "write_file":
 
-                path, content = arguments.split("|", 1)
+                try:
+                    path, content = (
+                        arguments.split(
+                            "|",
+                            1,
+                        )
+                    )
+
+                except ValueError:
+                    return (
+                        "Invalid arguments for "
+                        "write_file. Expected: "
+                        "path|content"
+                    )
 
                 return await self.write(
                     path.strip(),
                     content,
                 )
 
-            case "move":
+            case "edit" | "edit_file":
 
-                source, destination = arguments.split(",", 1)
+                return (
+                    "edit_file requires structured "
+                    "arguments and is not supported "
+                    "through the legacy TOOL:name:string "
+                    "format."
+                )
+
+            case "move" | "move_file":
+
+                try:
+                    source, destination = (
+                        arguments.split(
+                            ",",
+                            1,
+                        )
+                    )
+
+                except ValueError:
+                    return (
+                        "Invalid arguments for "
+                        "move_file. Expected: "
+                        "source,destination"
+                    )
 
                 return await self.move(
                     source.strip(),
@@ -331,7 +436,45 @@ class MCPTools:
                     },
                 )
 
+            case "browser_click":
+
+                try:
+                    element = arguments.strip()
+
+                    if not element:
+                        return (
+                            "browser_click requires "
+                            "an element identifier."
+                        )
+
+                    return await self.browser_call(
+                        tool,
+                        {
+                            "element": element,
+                        },
+                    )
+
+                except Exception as exc:
+
+                    return (
+                        "browser_click failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+            case "browser_press_key":
+                return await self.browser_call(
+                    tool,
+                    {
+                        "key": arguments,
+                    },
+                )
+
+            #
+            # Unknown tool
+            #
+
             case _:
-                raise ValueError(
+
+                return (
                     f"Unknown MCP tool: {tool}"
                 )

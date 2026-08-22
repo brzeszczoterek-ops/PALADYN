@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+from .models import (
+    ExperienceEntry,
+    KnowledgeEntry,
+    ReflectionEntry,
+    SummaryEntry,
+)
 from .storage import MemoryStorage
 
 
@@ -18,6 +24,28 @@ class MemoryManager:
         category: str,
         entry,
     ):
+        """
+        Persist a memory entry.
+
+        Entries explicitly marked as non-reusable reflections are not
+        persisted as long-term memory.
+        """
+
+        if isinstance(entry, ReflectionEntry):
+            if not entry.remember:
+                return None
+
+        if isinstance(entry, ExperienceEntry):
+            if not entry.summary and not entry.lesson:
+                return None
+
+        if isinstance(entry, SummaryEntry):
+            if not entry.summary and not entry.lessons:
+                return None
+
+        if isinstance(entry, KnowledgeEntry):
+            if not entry.title and not entry.content:
+                return None
 
         filename = f"{uuid4().hex}.yaml"
 
@@ -51,8 +79,13 @@ class MemoryManager:
         if not files:
             return None
 
+        latest_file = max(
+            files,
+            key=lambda path: path.stat().st_mtime,
+        )
+
         return self.storage.load(
-            files[-1]
+            latest_file
         )
 
     def count(

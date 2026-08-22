@@ -15,7 +15,16 @@ class Config:
 
 def load_config() -> Config:
 
-    workspace = Path.cwd()
+    project_root = Path.cwd()
+
+    workspace = (
+        project_root / "agent_workspace"
+    )
+
+    workspace.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     return Config(
         workspace=workspace,

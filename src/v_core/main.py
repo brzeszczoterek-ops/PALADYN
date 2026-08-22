@@ -15,6 +15,11 @@ from .memory.knowledge import Knowledge
 from .memory.manager import MemoryManager
 from .memory.memory_engine import MemoryEngine
 
+from .relationship import (
+    RelationshipStorage,
+    RelationshipUpdater,
+)
+
 from .llm import LLM
 
 
@@ -52,6 +57,14 @@ class VCore:
             llm
         )
 
+        relationship_storage = RelationshipStorage(
+            "memory/relationship"
+        )
+
+        relationship_updater = RelationshipUpdater(
+            llm
+        )
+
         memory = MemoryEngine(
             session=session,
             reflection=reflection,
@@ -59,6 +72,8 @@ class VCore:
             summary=summary,
             knowledge=knowledge,
             manager=manager,
+            relationship_updater=relationship_updater,
+            relationship_storage=relationship_storage,
         )
 
         self.agent = Agent(
