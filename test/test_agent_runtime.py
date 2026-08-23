@@ -22,8 +22,8 @@ from v_core.persona.voice import VoiceProfile
 from v_core.relationship import RelationshipState
 
 
-def test_public_version_is_1_0_0() -> None:
-    assert v_core.__version__ == "1.0.0"
+def test_public_version_is_1_5_0() -> None:
+    assert v_core.__version__ == "1.5.0"
 
 
 def test_tool_request_accepts_structured_json() -> None:

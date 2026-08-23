@@ -1,11 +1,57 @@
 # PALADYN / V-Core
 
-PALADYN is a local-first agent framework built around V: a persistent persona
-that coordinates an LLM, tools, memory, and task execution. The LLM proposes
-actions; the runtime is responsible for executing and validating them.
+**PALADYN** stands for **Personal AI Logical Autonomous Development Yielding
+Nexus**.
 
-The current target is a dependable single-user V runtime before building the
-reduced client edition or additional personas.
+PALADYN is a local-first framework for building personal AI agents. Its current
+runtime is built around V: a persistent persona that coordinates language
+models, tools, memory, relationship development, and task execution. The model
+provides reasoning, but the framework owns permissions, validation, memory,
+execution, and emergency control. V is therefore meant to become an agent with
+continuity—not merely another temporary chat assistant wrapped around an LLM.
+
+## Vision and intended audience
+
+PALADYN is being created first and foremost for private individuals. The goal
+is to give ordinary users the kind of control, extensibility, privacy, and
+local-first operation that is too often reserved for large organizations.
+
+This project is not intended to become a corporate product or a vehicle for
+commercial exploitation. Resale, monetized deployment, and especially the use
+of PALADYN by corporations are outside the purpose for which it is being
+developed. Its direction is deliberately personal, independent, and
+user-controlled.
+
+The agent is intended to do more than complete isolated commands. It should
+gradually learn how its user works, retain meaningful experiences, understand
+stable preferences, and adapt the working relationship without inventing
+familiarity that has not been earned. The intended result is something closer
+to a long-term collaborator and source of support: capable of helping with
+work, research, difficult tasks, learning, and everyday problems while
+preserving its own recognizable personality and judgment.
+
+## Current scope and future direction
+
+PALADYN 1.5 is currently a single-user foundation centered on V. This version
+does not yet include a persona creator: V's identity, constitution, and voice
+are part of the framework. The immediate priority is to make V dependable for
+real work, persistent learning, tool use, and increasingly autonomous task
+execution.
+
+Planned later versions will allow a user to:
+
+- create or configure a personal persona after first working with V;
+- connect up to three different models to one agent;
+- let the runtime switch models according to the task—for example coding and
+  analysis, natural conversation, or large-scale document processing;
+- choose local execution wherever the available hardware permits it;
+- retain direct control over models, tools, skills, permissions, and stored
+  relationship data.
+
+The three-model limit is intentional. It is enough to give the agent genuinely
+different strengths without turning a personal system into an unnecessarily
+complex model farm. Multi-model routing and user-created personas are roadmap
+goals, not features claimed by the current release.
 
 ## Requirements
 

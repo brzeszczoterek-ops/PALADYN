@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.5.0 - 2026-08-23
+
 ### Added
 - Full Autonomous execution mode foundation
 - Authorization envelopes with explicit capabilities and budgets

@@ -2,7 +2,7 @@
 
 ## Current Goal
 
-Build on the stable 1.0 foundation toward an autonomous agent capable of
+Build on the stable 1.5 foundation toward an autonomous agent capable of
 completing and verifying real-world tasks.
 
 No new features unless they improve:
@@ -14,7 +14,7 @@ No new features unless they improve:
 
 ---
 
-# After 1.0 (Must Have)
+# After 1.5 (Must Have)
 
 ## Completed foundation
 
