@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import os
+
 from openai import AsyncOpenAI
 
-from .llm_config import CURRENT
+from .llm_config import load_llm_config
 
 
 class LLM:
 
-    def __init__(self, api_key: str = "local"):
+    def __init__(self, api_key: str | None = None):
 
-        self.config = CURRENT
+        self.config = load_llm_config()
 
         self.client = AsyncOpenAI(
             base_url=self.config.base_url,
-            api_key=api_key,
+            api_key=api_key or os.getenv("V_CORE_API_KEY", "local"),
+            timeout=float(os.getenv("V_CORE_TIMEOUT", "120")),
         )
 
     async def ask(

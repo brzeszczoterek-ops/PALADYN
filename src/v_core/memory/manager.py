@@ -38,13 +38,19 @@ class MemoryManager:
         if isinstance(entry, ExperienceEntry):
             if not entry.summary and not entry.lesson:
                 return None
+            if entry.confidence < 0.35:
+                return None
 
         if isinstance(entry, SummaryEntry):
             if not entry.summary and not entry.lessons:
                 return None
+            if entry.confidence < 0.50:
+                return None
 
         if isinstance(entry, KnowledgeEntry):
             if not entry.title and not entry.content:
+                return None
+            if entry.confidence < 0.65:
                 return None
 
         filename = f"{uuid4().hex}.yaml"

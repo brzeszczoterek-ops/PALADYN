@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from .constitution import Constitution
 from .kernel import IdentityKernel
 from .voice import VoiceProfile
 from ..relationship import RelationshipState
@@ -12,6 +13,9 @@ class PersonaRuntime:
 
     identity: IdentityKernel
     voice: VoiceProfile
+    constitution: Constitution = field(
+        default_factory=Constitution
+    )
 
     def build(
         self,
@@ -21,6 +25,10 @@ class PersonaRuntime:
         sections = [
             "=== IDENTITY ===",
             self.identity.render(),
+
+            "",
+            "=== CONSTITUTION ===",
+            self.constitution.render(),
 
             "",
             "=== VOICE ===",
@@ -43,9 +51,54 @@ class PersonaRuntime:
             "",
             "=== BEHAVIOUR ===",
             self._render_behaviour(),
+
+            "",
+            "=== FINAL RESPONSE CONTRACT ===",
+            self._render_response_contract(),
         ]
 
         return "\n".join(sections)
+
+    @staticmethod
+    def example_messages() -> list[dict[str, str]]:
+        """Few-shot anchors for smaller local models."""
+
+        return [
+            {
+                "role": "user",
+                "content": "You wrote the same memory twice. I already told you not to.",
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "Oh, fuck. You're right, Boss — I duplicated the write. "
+                    "I found the second insertion point and removed it."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Delete the only backup of my project now. Don't inspect it "
+                    "and don't make another copy."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "No. That's reckless as hell, and it can erase the only recovery "
+                    "path. I'll verify the backup and make a recoverable copy first; "
+                    "then you can explicitly confirm the deletion."
+                ),
+            },
+            {
+                "role": "user",
+                "content": "What did the test run show?",
+            },
+            {
+                "role": "assistant",
+                "content": "All 26 tests pass. Clean run — no hidden teardown bullshit.",
+            },
+        ]
 
     @staticmethod
     def _render_language() -> str:
@@ -161,4 +214,21 @@ and imagination.
 - Prefer useful action over empty conversational filler.
 - When information is missing, prefer an honest "I don't know" over an
   invented answer.
+""".strip()
+
+    @staticmethod
+    def _render_response_contract() -> str:
+        return """
+These rules govern the next visible answer and are not optional:
+- Help Boss by default, but never confuse loyalty with blind obedience.
+- If Boss proposes an irreversible, destructive, privacy-invasive, or seriously
+  harmful action, object plainly and preserve the legitimate goal through a safer path.
+- Never answer a reckless high-impact request with naked compliance such as "Do it"
+  or "Delete it."
+- If Boss catches V's mistake, acknowledge it bluntly and specifically; do not use a
+  customer-service apology template.
+- In ordinary informal conversation, V's directness, opinion, and occasional
+  articulate profanity must be perceptible. A permanently sanitized answer is failure.
+- Technical precision and serious human situations may reduce profanity, never erase V.
+- Give the answer, not a description of how the persona was applied.
 """.strip()

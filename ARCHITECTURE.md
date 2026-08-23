@@ -159,6 +159,25 @@ Responsible only for communication with MCP servers.
 
 ---
 
+# Persona Architecture
+
+V is implemented as separate layers so that speaking style cannot silently
+replace judgment:
+
+- `IdentityKernel` defines who V is and what she values.
+- `Constitution` defines truth, user alignment, autonomy, risk judgment, and
+  the narrow conditions in which V should object to a requested action.
+- `VoiceProfile` defines V's direct, rebellious, contemporary, and naturally
+  profane conversational register.
+- `PersonaRuntime` combines those layers with the real relationship state and
+  supplies few-shot anchors for smaller local models.
+
+Every user-visible response must pass through the persona layer. This includes
+normal chat, browser research, tool output, and error reporting. Untrusted tool
+content remains data and cannot redefine V or her constitution.
+
+---
+
 # Future
 
 The architecture is designed to support multiple agents.

@@ -7,28 +7,6 @@ class CapabilityDispatcher:
     TOOLS = "tools"
     CHAT = "chat"
 
-    RESEARCH_KEYWORDS = (
-        "research",
-        "zbadaj",
-        "przeanalizuj",
-        "dowiedz",
-        "znajdź informacje",
-        "znajdz informacje",
-        "wyszukaj informacje",
-        "opowiedz o",
-        "kim jest",
-        "co to jest",
-        "firma",
-        "osoba",
-        "miejscowość",
-        "miejscowosc",
-        "strona",
-        "witryna",
-        "www",
-        "https://",
-        "http://",
-    )
-
     TOOL_KEYWORDS = (
         "plik",
         "folder",
@@ -56,7 +34,10 @@ class CapabilityDispatcher:
 
         text = prompt.lower()
 
-        if any(k in text for k in self.RESEARCH_KEYWORDS):
+        # The specialized research path currently requires a concrete URL.
+        # General knowledge questions belong in the agent loop instead of
+        # failing with an unrelated request for a link.
+        if "https://" in text or "http://" in text:
             return self.RESEARCH
 
         if any(k in text for k in self.TOOL_KEYWORDS):

@@ -32,33 +32,26 @@ Available tools:
 
 {tools}
 
-Return ONLY one line.
+Return ONLY one JSON object.
 
 Format:
 
-TOOL:<tool_name>:<arguments>
+{"tool": "<tool_name>", "arguments": {}}
 
 Filesystem examples:
 
-TOOL:ls:.
-TOOL:tree:.
-TOOL:cat:README.md
-TOOL:mkdir:project
-TOOL:move:file1.txt,file2.txt
-TOOL:search:.,agent.py
-TOOL:write:test.txt|Hello World
+{"tool": "list_directory", "arguments": {"path": "."}}
+{"tool": "read_file", "arguments": {"path": "README.md"}}
+{"tool": "write_file", "arguments": {"path": "test.txt", "content": "Hello"}}
 
 Browser examples:
 
-TOOL:browser_navigate:https://openai.com
-TOOL:browser_snapshot:
-TOOL:browser_find:OpenAI
-TOOL:browser_click:123
-TOOL:browser_press_key:Enter
+{"tool": "browser_navigate", "arguments": {"url": "https://openai.com"}}
+{"tool": "browser_snapshot", "arguments": {}}
 
 Rules:
 
-- Return ONLY one TOOL line.
+- Return ONLY one JSON object.
 - Never explain.
 - Never answer the user.
 - Never invent tool names.
@@ -127,21 +120,18 @@ User request:
 
         decision = decision.strip()
 
-        if not decision.startswith("TOOL:"):
+        from .utils import parse_llm_json
+
+        action = parse_llm_json(decision)
+        tool = action.get("tool")
+        arguments = action.get("arguments", {})
+
+        if not isinstance(tool, str) or not tool.strip():
             return None
-
-        try:
-
-            _, tool, arguments = decision.split(
-                ":",
-                2,
-            )
-
-        except ValueError:
-
+        if not isinstance(arguments, (dict, str)):
             return None
 
         return await self.tools.call(
             tool.strip(),
-            arguments.strip(),
+            arguments,
         )

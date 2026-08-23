@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+
+from dotenv import load_dotenv
 
 
 DEFAULT_SYSTEM_PROMPT = """
@@ -97,3 +100,22 @@ MODELS = {
 
 
 CURRENT = MODELS["qwythos"]
+
+
+def load_llm_config() -> LLMConfig:
+    """Load the selected model while allowing documented .env overrides."""
+
+    load_dotenv()
+    selected = MODELS.get(os.getenv("V_CORE_PROFILE", "qwythos"), CURRENT)
+
+    return LLMConfig(
+        provider=os.getenv("V_CORE_PROVIDER", selected.provider),
+        base_url=os.getenv("V_CORE_BASE_URL", selected.base_url),
+        model=os.getenv("V_CORE_MODEL", selected.model),
+        context=int(os.getenv("V_CORE_CONTEXT", str(selected.context))),
+        temperature=float(
+            os.getenv("V_CORE_TEMPERATURE", str(selected.temperature))
+        ),
+        top_p=float(os.getenv("V_CORE_TOP_P", str(selected.top_p))),
+        system_prompt=os.getenv("V_CORE_SYSTEM_PROMPT", selected.system_prompt),
+    )

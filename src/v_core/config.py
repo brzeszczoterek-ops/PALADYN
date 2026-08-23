@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 
 @dataclass(slots=True)
@@ -15,11 +18,14 @@ class Config:
 
 def load_config() -> Config:
 
+    load_dotenv()
+
     project_root = Path.cwd()
 
-    workspace = (
-        project_root / "agent_workspace"
-    )
+    workspace_value = os.getenv("V_CORE_MCP_FILESYSTEM", "agent_workspace")
+    workspace = Path(workspace_value).expanduser()
+    if not workspace.is_absolute():
+        workspace = project_root / workspace
 
     workspace.mkdir(
         parents=True,

@@ -12,11 +12,10 @@ dist/
 
 # Environment
 .env
+.venv/
 
 # Memory data
-memory/experiences/*.yaml
-memory/reflections/*.yaml
+memory/
 
 # Logs
 *.log
-

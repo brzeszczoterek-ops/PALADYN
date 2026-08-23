@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from .config import Config
 from .mcp_client import MCPClient
 from .tools.filesystem import Filesystem
@@ -299,10 +301,18 @@ class MCPTools:
     async def call(
         self,
         tool: str,
-        arguments: str = "",
+        arguments: dict[str, Any] | str = "",
     ):
 
         tool = tool.strip()
+
+        structured = arguments if isinstance(arguments, dict) else None
+
+        def value(name: str, default: str = "") -> str:
+            if structured is not None:
+                item = structured.get(name, default)
+                return str(item) if item is not None else default
+            return arguments or default
 
         #
         # Filesystem aliases + native MCP names
@@ -312,30 +322,36 @@ class MCPTools:
 
             case "ls" | "list_directory":
                 return await self.ls(
-                    arguments or "."
+                    value("path", ".")
                 )
 
             case "tree" | "directory_tree":
                 return await self.tree(
-                    arguments or "."
+                    value("path", ".")
                 )
 
             case "cat" | "read_file":
                 return await self.cat(
-                    arguments
+                    value("path")
                 )
 
             case "mkdir" | "create_directory":
                 return await self.mkdir(
-                    arguments
+                    value("path")
                 )
 
             case "info" | "get_file_info":
                 return await self.info(
-                    arguments
+                    value("path")
                 )
 
             case "search" | "search_files":
+
+                if structured is not None:
+                    return await self.search(
+                        value("path", "."),
+                        value("pattern"),
+                    )
 
                 try:
                     path, pattern = (
@@ -359,6 +375,12 @@ class MCPTools:
 
             case "write" | "write_file":
 
+                if structured is not None:
+                    return await self.write(
+                        value("path"),
+                        value("content"),
+                    )
+
                 try:
                     path, content = (
                         arguments.split(
@@ -381,6 +403,16 @@ class MCPTools:
 
             case "edit" | "edit_file":
 
+                if structured is not None:
+                    edits = structured.get("edits", [])
+                    if not isinstance(edits, list):
+                        return "Invalid edits: expected a list."
+                    return await self.edit(
+                        value("path"),
+                        edits,
+                        bool(structured.get("dry_run", False)),
+                    )
+
                 return (
                     "edit_file requires structured "
                     "arguments and is not supported "
@@ -389,6 +421,12 @@ class MCPTools:
                 )
 
             case "move" | "move_file":
+
+                if structured is not None:
+                    return await self.move(
+                        value("source"),
+                        value("destination"),
+                    )
 
                 try:
                     source, destination = (
@@ -418,7 +456,7 @@ class MCPTools:
                 return await self.browser_call(
                     tool,
                     {
-                        "url": arguments,
+                        "url": value("url"),
                     },
                 )
 
@@ -432,14 +470,14 @@ class MCPTools:
                 return await self.browser_call(
                     tool,
                     {
-                        "text": arguments,
+                        "text": value("text"),
                     },
                 )
 
             case "browser_click":
 
                 try:
-                    element = arguments.strip()
+                    element = value("element").strip()
 
                     if not element:
                         return (
@@ -465,7 +503,7 @@ class MCPTools:
                 return await self.browser_call(
                     tool,
                     {
-                        "key": arguments,
+                        "key": value("key"),
                     },
                 )
 

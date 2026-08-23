@@ -46,14 +46,6 @@ class MemoryEngine:
         result: str,
     ):
 
-        self.session.add(
-            "task",
-            {
-                "task": task,
-                "result": result,
-            },
-        )
-
         try:
 
             reflection = await self.reflection.reflect(
