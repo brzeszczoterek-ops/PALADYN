@@ -20,6 +20,7 @@ from v_core.persona.kernel import IdentityKernel
 from v_core.persona.runtime import PersonaRuntime
 from v_core.persona.voice import VoiceProfile
 from v_core.relationship import RelationshipState
+import v_core.main as main_module
 
 
 def test_public_version_is_1_5_0() -> None:
@@ -127,6 +128,38 @@ def test_voice_contract_makes_profanity_expected_but_contextual() -> None:
     assert "accuracy comes first" in text
     assert "All 26 tests pass. Clean run" in text
     assert "permanently sanitized helpdesk voice" in text
+
+
+@pytest.mark.asyncio
+async def test_chat_treats_eof_as_normal_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed = False
+
+    class CoreStub:
+        def __init__(self, config) -> None:
+            pass
+
+        async def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    async def loader(*args, **kwargs):
+        return None
+
+    config = SimpleNamespace(
+        model_runtime_root=tmp_path / "models",
+        model_loader_mode="off",
+    )
+    monkeypatch.setattr(main_module, "load_config", lambda: config)
+    monkeypatch.setattr(main_module, "bootstrap_interactive_model", loader)
+    monkeypatch.setattr(main_module, "VCore", CoreStub)
+    monkeypatch.setattr("builtins.input", lambda _: (_ for _ in ()).throw(EOFError()))
+
+    await main_module.chat()
+
+    assert closed
 
 
 @pytest.mark.asyncio

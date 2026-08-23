@@ -227,6 +227,50 @@ The latch survives the stopped process and requires an explicit owner reset.
 
 ---
 
+# Evidence-Driven Learning Plane
+
+Learning is implemented outside the LLM as a state machine with six separate
+objects: evidence, lesson, quarantined artifact, validation report, active
+artifact, and retirement record. The separation prevents a model-generated
+reflection from becoming executable authority.
+
+Evidence and lifecycle events use append-only SHA-256 hash-chain journals.
+Artifact records are checked against the journal, while manifests and source
+are checked against their immutable bundle digest. Task artifacts carry a
+workspace-derived scope key; persistent artifacts require a validated lesson
+and double owner approval.
+
+Generated Python tools run through a trusted host in the offline Bubblewrap
+backend. Generated skills remain declarative workflows and are rendered below
+the persona constitution only when their deterministic trigger tests match the
+current request. Neither artifact type can modify its own validator, the
+authorization model, persona, or emergency controls.
+
+Autonomous runtime exceptions are captured as failure evidence. Completion is
+captured as success evidence only when a verifier explicitly marks it verified.
+Learning capture failure is journaled but never allowed to crash or falsely
+complete the primary task.
+
+---
+
+# Local Model Loader
+
+The interactive entry point resolves the model before constructing any LLM,
+memory, or agent component. It discovers local files by extension and GGUF
+header, ignores auxiliary multimodal projections and later split shards, then
+loads a versioned per-path profile from private runtime state.
+
+PALADYN launches `llama-server` as an argument array without a shell. The model
+path, alias, loopback host, and port are controlled fields; remote model flags,
+public binding, server-side tools, model presets, and API-key overrides cannot
+be injected through profile extras. Inherited `LLAMA_ARG_*` variables are
+removed. The loader requires successful `/health` and `/v1/models` responses
+before applying the selected alias and endpoint to V's OpenAI-compatible client.
+The child process owns a private log and is terminated as a process group during
+normal shutdown, cancellation, failed startup, or initialization failure.
+
+---
+
 # EVM Capability Boundary
 
 EVM support is divided by runtime profiles, not by persona promises:
@@ -279,7 +323,8 @@ Generated and third-party code runs through an external Bubblewrap backend:
 - read-only `/usr`, private `/proc`, `/dev`, `/tmp`, and `/home`;
 - one writable task workspace and no visibility of PALADYN memory, `.env`, SSH,
   wallets, or the Docker socket;
-- address-space, CPU, file-size, open-file, wall-clock, and output limits;
+- address-space, CPU, process-count, file-size, open-file, total-workspace,
+  wall-clock, and output limits;
 - process-group termination on timeout, output overflow, STOP, or PANIC.
 
 The initial backend only accepts `OFFLINE`. Local-testnet, fetch-then-offline,

@@ -13,9 +13,17 @@ class Config:
 
     memory_root: Path
 
+    learning_root: Path
+
+    model_runtime_root: Path
+
     autonomy_root: Path
 
     evm_profile: str
+
+    learning_profile: str
+
+    model_loader_mode: str
 
     filesystem_server: list[str]
 
@@ -44,6 +52,20 @@ def load_config() -> Config:
         memory_root = project_root / memory_root
     memory_root.mkdir(parents=True, exist_ok=True)
 
+    learning_root_value = os.getenv("PALADYN_LEARNING_ROOT", "learning")
+    learning_root = Path(learning_root_value).expanduser()
+    if not learning_root.is_absolute():
+        learning_root = project_root / learning_root
+    learning_root.mkdir(parents=True, exist_ok=True)
+
+    model_runtime_root_value = os.getenv(
+        "PALADYN_MODEL_RUNTIME_ROOT", "model_runtime"
+    )
+    model_runtime_root = Path(model_runtime_root_value).expanduser()
+    if not model_runtime_root.is_absolute():
+        model_runtime_root = project_root / model_runtime_root
+    model_runtime_root.mkdir(parents=True, exist_ok=True)
+
     autonomy_root_value = os.getenv("PALADYN_AUTONOMY_ROOT", "autonomy")
     autonomy_root = Path(autonomy_root_value).expanduser()
     if not autonomy_root.is_absolute():
@@ -54,14 +76,38 @@ def load_config() -> Config:
     if evm_profile not in {"client", "owner_lab"}:
         raise ValueError("PALADYN_EVM_PROFILE must be 'client' or 'owner_lab'")
 
+    learning_profile = os.getenv(
+        "PALADYN_LEARNING_PROFILE", "owner_lab"
+    ).strip().lower()
+    if learning_profile not in {"client", "owner_lab"}:
+        raise ValueError(
+            "PALADYN_LEARNING_PROFILE must be 'client' or 'owner_lab'"
+        )
+
+    model_loader_mode = os.getenv(
+        "PALADYN_MODEL_LOADER", "prompt"
+    ).strip().lower()
+    if model_loader_mode not in {"off", "prompt", "required"}:
+        raise ValueError(
+            "PALADYN_MODEL_LOADER must be 'off', 'prompt', or 'required'"
+        )
+
     return Config(
         workspace=workspace,
 
         memory_root=memory_root,
 
+        learning_root=learning_root,
+
+        model_runtime_root=model_runtime_root,
+
         autonomy_root=autonomy_root,
 
         evm_profile=evm_profile,
+
+        learning_profile=learning_profile,
+
+        model_loader_mode=model_loader_mode,
 
         filesystem_server=[
             "npx",

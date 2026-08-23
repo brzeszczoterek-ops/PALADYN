@@ -23,6 +23,10 @@ class _OutputLimitExceeded(RuntimeError):
     pass
 
 
+class _WorkspaceLimitExceeded(RuntimeError):
+    pass
+
+
 _SAFE_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _BLOCKED_ENV = {
     "BASH_ENV",
@@ -85,12 +89,18 @@ class BubblewrapBackend:
 
         timed_out = False
         output_limited = False
+        workspace_limited = False
         stdout = b""
         stderr = b""
         try:
             try:
                 stdout, stderr = await asyncio.wait_for(
-                    self._collect_output(process, spec.limits.max_output_bytes),
+                    self._collect_output(
+                        process,
+                        spec.limits.max_output_bytes,
+                        workspace,
+                        spec.limits.max_workspace_bytes,
+                    ),
                     timeout=spec.limits.timeout_seconds,
                 )
             except TimeoutError:
@@ -99,6 +109,10 @@ class BubblewrapBackend:
                 stdout, stderr = await process.communicate()
             except _OutputLimitExceeded:
                 output_limited = True
+                await self._kill(process)
+                stdout, stderr = await process.communicate()
+            except _WorkspaceLimitExceeded:
+                workspace_limited = True
                 await self._kill(process)
                 stdout, stderr = await process.communicate()
         except asyncio.CancelledError:
@@ -115,6 +129,7 @@ class BubblewrapBackend:
             backend=self.name,
             timed_out=timed_out,
             output_limited=output_limited,
+            workspace_limited=workspace_limited,
         )
 
     def _validate_spec(self, spec: SandboxSpec, workspace: Path) -> None:
@@ -127,6 +142,8 @@ class BubblewrapBackend:
         if not workdir.is_relative_to(workspace):
             raise SandboxPolicyError("working directory escapes the workspace")
         workdir.mkdir(parents=True, exist_ok=True)
+        if self._workspace_size(workspace) > spec.limits.max_workspace_bytes:
+            raise SandboxPolicyError("workspace exceeds configured size limit")
 
         for name, value in spec.environment.items():
             if not _SAFE_ENV_NAME.fullmatch(name) or name in _BLOCKED_ENV:
@@ -149,6 +166,7 @@ class BubblewrapBackend:
             f"--cpu={limits.cpu_seconds}",
             f"--fsize={limits.max_file_bytes}",
             f"--nofile={limits.max_open_files}",
+            f"--nproc={limits.max_processes}",
             "--",
             str(self.executable),
             "--die-with-parent",
@@ -209,6 +227,8 @@ class BubblewrapBackend:
         self,
         process: asyncio.subprocess.Process,
         maximum: int,
+        workspace: Path,
+        maximum_workspace: int,
     ) -> tuple[bytes, bytes]:
         assert process.stdout is not None
         assert process.stderr is not None
@@ -229,20 +249,32 @@ class BubblewrapBackend:
         stdout_task = asyncio.create_task(read(process.stdout))
         stderr_task = asyncio.create_task(read(process.stderr))
         wait_task = asyncio.create_task(process.wait())
+
+        async def monitor_workspace() -> None:
+            while process.returncode is None:
+                if self._workspace_size(workspace) > maximum_workspace:
+                    raise _WorkspaceLimitExceeded
+                await asyncio.sleep(0.05)
+            if self._workspace_size(workspace) > maximum_workspace:
+                raise _WorkspaceLimitExceeded
+
+        workspace_task = asyncio.create_task(monitor_workspace())
         try:
-            stdout, stderr, _ = await asyncio.gather(
+            stdout, stderr, _, _ = await asyncio.gather(
                 stdout_task,
                 stderr_task,
                 wait_task,
+                workspace_task,
             )
             return stdout, stderr
         except BaseException:
-            for task in (stdout_task, stderr_task, wait_task):
+            for task in (stdout_task, stderr_task, wait_task, workspace_task):
                 task.cancel()
             await asyncio.gather(
                 stdout_task,
                 stderr_task,
                 wait_task,
+                workspace_task,
                 return_exceptions=True,
             )
             raise
@@ -260,3 +292,18 @@ class BubblewrapBackend:
     @staticmethod
     def _decode(value: bytes) -> str:
         return value.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _workspace_size(workspace: Path) -> int:
+        total = 0
+        try:
+            for path in workspace.rglob("*"):
+                try:
+                    if path.is_symlink() or not path.is_file():
+                        continue
+                    total += path.stat().st_size
+                except OSError:
+                    continue
+        except OSError:
+            return total
+        return total

@@ -11,6 +11,14 @@ from .autonomy import (
 )
 from .autonomy.runner import StepDriver
 from .config import load_config
+from .config import Config
+from .model_loader import (
+    LlamaServerStartError,
+    LlamaServerUnavailable,
+    ModelLoaderInteractionError,
+    ModelLoaderStorageError,
+    bootstrap_interactive_model,
+)
 
 from .memory.storage import MemoryStorage
 from .memory.session import Session
@@ -31,9 +39,9 @@ from .llm import LLM
 
 class VCore:
 
-    def __init__(self):
+    def __init__(self, config: Config | None = None):
 
-        self.config = load_config()
+        self.config = config or load_config()
 
         llm = LLM()
 
@@ -88,7 +96,12 @@ class VCore:
         )
 
         self.autonomy = AutonomousRunner(
-            self.config.autonomy_root
+            self.config.autonomy_root,
+            learning_sink=(
+                self.agent.tools.learning.capture_runtime_event
+                if self.agent.tools.learning is not None
+                else None
+            ),
         )
 
         self.runtime_registry = RuntimeRegistry(
@@ -142,10 +155,20 @@ class VCore:
 
 async def chat():
 
-    core = VCore()
+    config = load_config()
+    model_session = await bootstrap_interactive_model(
+        config.model_runtime_root,
+        mode=config.model_loader_mode,
+    )
+    try:
+        core = VCore(config)
+    except BaseException:
+        if model_session is not None:
+            await model_session.stop()
+        raise
 
     print("PALADYN Framework powered by V")
-    print("Type 'exit' to quit.\n")
+    print("V is ready. Type 'exit' to quit.\n")
 
     try:
         while True:
@@ -163,20 +186,33 @@ async def chat():
                     await core.ask(prompt)
                 )
 
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, EOFError):
                 break
 
             except Exception as exc:
                 print(f"\n{exc}\n")
     finally:
-        await core.close()
+        try:
+            await core.close()
+        finally:
+            if model_session is not None:
+                await model_session.stop()
 
 
 def main():
-
-    asyncio.run(
-        chat()
-    )
+    try:
+        asyncio.run(chat())
+    except KeyboardInterrupt:
+        print()
+    except (
+        LlamaServerStartError,
+        LlamaServerUnavailable,
+        ModelLoaderInteractionError,
+        ModelLoaderStorageError,
+        ValueError,
+    ) as error:
+        print(f"PALADYN startup failed: {error}")
+        raise SystemExit(1) from error
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, is_dataclass
 from typing import Any
+from uuid import uuid4
 
 from .config import Config
 from .llm import LLM
@@ -20,7 +21,7 @@ from .persona.context import PersonaContext
 
 class Agent:
 
-    MAX_AGENT_STEPS = 6
+    MAX_AGENT_STEPS = 12
 
     def __init__(
         self,
@@ -60,6 +61,10 @@ class Agent:
 
         if not prompt:
             return ""
+
+        begin_interaction = getattr(self.tools, "begin_interaction", None)
+        if callable(begin_interaction):
+            begin_interaction(uuid4().hex, prompt)
 
         capability = self.capabilities.dispatch(
             prompt
@@ -321,6 +326,20 @@ Do not mention the internal step limit.
             self._build_persona_context(prompt).render(),
         ]
 
+        render_skills = getattr(
+            getattr(self, "tools", None),
+            "render_matching_skills",
+            None,
+        )
+        skill_context = render_skills(prompt) if callable(render_skills) else ""
+        if skill_context:
+            sections.extend(
+                [
+                    "=== ACTIVE PALADYN SKILLS ===",
+                    skill_context,
+                ]
+            )
+
         if agent_mode:
             sections.extend(
                 [
@@ -406,10 +425,35 @@ Local tool argument shapes:
 - evm_quote_flash_swap: protocol is v2_same_token, v2_cross_token, or v3.
 - evm_foundry_test_offline: {"project": "relative/project", "fuzz_runs": 256,
   "invariant_runs": 64, "timeout_seconds": 300}
+- learning_record_evidence: source (user_correction, tool_result, test_result,
+  task_runtime, or self_review), outcome, summary, expected, actual, confidence,
+  and optional metadata. The runtime binds the real interaction ID; model calls
+  cannot mark evidence as verified.
+- learning_propose_lesson: title, hypothesis, trigger, action, evidence_ids.
+- learning_create_tool (complete quarantine/test/activation cycle):
+  {"manifest":{"name":"snake_case_name","version":"1.0.0",
+  "description":"...","input_schema":{"type":"object","properties":{},
+  "required":[],"additionalProperties":false},"output_schema":{"type":"object",
+  "properties":{},"required":[],"additionalProperties":false},
+  "tests":[{"name":"...","arguments":{},"expected":{}}],"scope":"task",
+  "lesson_ids":[],"timeout_seconds":10},"source":"def run(arguments):\n    return {}"}
+- learning_create_skill (complete quarantine/test/activation cycle):
+  {"manifest":{"name":"snake_case_name","version":"1.0.0",
+  "description":"...","triggers":["phrase"],"steps":["..."],
+  "required_tools":[],"tests":[{"user_input":"matching phrase",
+  "should_match":true},{"user_input":"unrelated request","should_match":false}],
+  "scope":"task","lesson_ids":[]}}
+- learning_stage_tool / learning_stage_skill use the same formats but stop in quarantine.
+- learning_validate_artifact / learning_activate_artifact: {"artifact_id": "..."}
+- learning_retire_artifact: {"artifact_id": "...", "reason": "..."}
 
 Rules:
 
 - Use tools only when they are genuinely useful.
+- Never claim learning from a task without recording the supporting evidence.
+- Generated tools and skills must pass staging and validation before activation.
+- Prefer learning_create_tool or learning_create_skill when the complete artifact
+  can be specified and tested in one action. Never bypass their internal lifecycle.
 - Never invent tool names.
 - Return no text outside the JSON object when requesting a tool.
 - Use filesystem tools only for local files.

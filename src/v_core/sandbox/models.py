@@ -26,7 +26,9 @@ class SandboxLimits:
     memory_mb: int = 1_024
     max_output_bytes: int = 2_000_000
     max_file_bytes: int = 256 * 1024 * 1024
+    max_workspace_bytes: int = 512 * 1024 * 1024
     max_open_files: int = 256
+    max_processes: int = 64
 
     def __post_init__(self) -> None:
         if self.timeout_seconds <= 0:
@@ -39,8 +41,12 @@ class SandboxLimits:
             raise ValueError("max_output_bytes must be positive")
         if self.max_file_bytes <= 0:
             raise ValueError("max_file_bytes must be positive")
+        if self.max_workspace_bytes <= 0:
+            raise ValueError("max_workspace_bytes must be positive")
         if self.max_open_files <= 2:
             raise ValueError("max_open_files must be greater than 2")
+        if self.max_processes <= 0:
+            raise ValueError("max_processes must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +80,7 @@ class SandboxResult:
     backend: str
     timed_out: bool = False
     output_limited: bool = False
+    workspace_limited: bool = False
 
     @property
     def succeeded(self) -> bool:
@@ -81,4 +88,5 @@ class SandboxResult:
             self.exit_code == 0
             and not self.timed_out
             and not self.output_limited
+            and not self.workspace_limited
         )

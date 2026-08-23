@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Added
+- Evidence-driven learning store with provenance-bearing task outcomes
+- Candidate and validated lesson lifecycle with independent-evidence thresholds
+- Immutable generated-tool and generated-skill bundles in quarantine
+- JSON schema, AST policy, offline Bubblewrap tests, and digest verification
+- Task-bound and owner-approved persistent artifact scopes
+- Active generated-tool dispatch and matching skill injection into V's prompt
+- Automatic generated-tool retirement after repeated runtime failures
+- Hash-chained evidence and artifact audit journals
+- `paladyn-learning` integrity and inspection CLI
+- Bounded schemas, manifests, source, invocation data, workspace growth, and
+  process counts for generated-code execution
+- Cross-process locking for evidence, lesson, artifact, and lifecycle updates
+- Interactive local GGUF discovery and persistent llama.cpp launch profiles
+- Managed `llama-server` startup, health/model verification, private logs, and
+  process-group shutdown before and after V's runtime
+
+### Fixed
+- Unverified task completion can no longer be treated as successful learning
+- Task-scoped generated capabilities cannot leak into another workspace
+
 ## 1.5.0 - 2026-08-23
 
 ### Added

@@ -25,6 +25,11 @@ class CapabilityDispatcher:
         "search",
         "move",
         "filesystem",
+        "narzędzie",
+        "narzedzie",
+        "narzędzia",
+        "narzedzia",
+        "skill",
     )
 
     def dispatch(

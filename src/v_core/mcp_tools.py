@@ -5,6 +5,7 @@ from decimal import Decimal
 import json
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .autonomy import AuthorizationEnvelope, AuthorizationGuard
 from .config import Config
@@ -19,6 +20,14 @@ from .evm import (
     SequencerStatus,
 )
 from .mcp_client import MCPClient
+from .learning import (
+    EvidenceOutcome,
+    EvidenceSource,
+    LearningEvidence,
+    LearningRuntime,
+    SkillManifest,
+    ToolManifest,
+)
 from .sandbox import (
     BubblewrapBackend,
     SandboxExecutor,
@@ -53,6 +62,8 @@ class MCPTools:
 
         self.browser_session = None
         self.browser_ready = False
+        self.interaction_id = ""
+        self.interaction_prompt = ""
 
         #
         # Wrappers
@@ -71,6 +82,13 @@ class MCPTools:
             else EVMAccessProfile.client()
         )
         profile.apply(envelope)
+        if getattr(config, "learning_profile", "client") == "owner_lab":
+            persistent_learning = {
+                "owner:create_persistent_artifacts",
+                "owner:activate_persistent_artifacts",
+            }
+            envelope.capabilities.update(persistent_learning)
+            envelope.owner_approved_capabilities.update(persistent_learning)
         self.authorization = AuthorizationGuard(
             Path.cwd(),
             envelope,
@@ -89,11 +107,22 @@ class MCPTools:
             except FoundryUnavailable as exc:
                 self.foundry = None
                 self.foundry_error = str(exc)
+            learning_root = Path(
+                getattr(config, "learning_root", config.workspace / ".paladyn_learning")
+            )
+            self.learning = LearningRuntime(
+                learning_root,
+                self.authorization,
+                backend,
+            )
+            self.learning_error = ""
         except SandboxUnavailable as exc:
             self.sandbox = None
             self.sandbox_error = str(exc)
             self.foundry = None
             self.foundry_error = str(exc)
+            self.learning = None
+            self.learning_error = str(exc)
 
     async def ensure_browser_session(self) -> None:
 
@@ -171,6 +200,10 @@ class MCPTools:
 
             self.browser_session = None
             self.browser_ready = False
+
+    def begin_interaction(self, interaction_id: str, prompt: str) -> None:
+        self.interaction_id = str(interaction_id)[:128]
+        self.interaction_prompt = str(prompt)[:20_000]
 
     #
     # Filesystem shortcuts
@@ -327,6 +360,16 @@ class MCPTools:
             "evm_validate_oracle",
             "evm_analyze_solidity_security",
             "sandbox_execute_offline",
+            "learning_record_evidence",
+            "learning_propose_lesson",
+            "learning_stage_tool",
+            "learning_stage_skill",
+            "learning_create_tool",
+            "learning_create_skill",
+            "learning_validate_artifact",
+            "learning_activate_artifact",
+            "learning_retire_artifact",
+            "learning_list_artifacts",
         ]
         if self.authorization.envelope.allows(
             EVMCapability.UNISWAP_HOOKS_SIMULATE.value
@@ -338,7 +381,32 @@ class MCPTools:
                     "evm_foundry_test_offline",
                 ]
             )
-        return names
+        if self.learning is not None:
+            names.extend(self.learning.active_tool_names())
+        return list(dict.fromkeys(names))
+
+    def render_matching_skills(self, prompt: str) -> str:
+        if self.learning is None:
+            return ""
+        return self.learning.render_matching_skills(prompt)
+
+    def _known_tool_names(self) -> set[str]:
+        return set(self.local_tool_names()) | {
+            "browser_click",
+            "browser_find",
+            "browser_navigate",
+            "browser_press_key",
+            "browser_snapshot",
+            "create_directory",
+            "directory_tree",
+            "edit_file",
+            "get_file_info",
+            "list_directory",
+            "move_file",
+            "read_file",
+            "search_files",
+            "write_file",
+        }
 
     async def tool_info(
         self,
@@ -379,6 +447,12 @@ class MCPTools:
 
         structured = arguments if isinstance(arguments, dict) else None
 
+        if self.learning is not None and tool in self.learning.active_tool_names():
+            if structured is None:
+                return f"Generated tool {tool} requires structured JSON arguments."
+            result = await self.learning.execute_tool(tool, structured)
+            return self._json(result)
+
         def value(name: str, default: str = "") -> str:
             if structured is not None:
                 item = structured.get(name, default)
@@ -390,6 +464,140 @@ class MCPTools:
         #
 
         match tool:
+
+            case "learning_record_evidence":
+                if self.learning is None:
+                    return f"Learning runtime unavailable: {self.learning_error}"
+                if structured is None:
+                    return "learning_record_evidence requires structured arguments."
+                requested_source = EvidenceSource(value("source", "self_review"))
+                is_correction = (
+                    requested_source is EvidenceSource.USER_CORRECTION
+                    and bool(self.interaction_prompt)
+                )
+                evidence = LearningEvidence(
+                    task_id=(self.interaction_id or f"unbound-{uuid4().hex}"),
+                    source=(
+                        EvidenceSource.USER_CORRECTION
+                        if is_correction
+                        else EvidenceSource.SELF_REVIEW
+                    ),
+                    outcome=(
+                        EvidenceOutcome.CORRECTION
+                        if is_correction
+                        else EvidenceOutcome(value("outcome"))
+                    ),
+                    summary=(
+                        f"Boss's directly supplied correction: {self.interaction_prompt}"
+                        if is_correction
+                        else value("summary")
+                    ),
+                    expected=value("expected"),
+                    actual=(self.interaction_prompt if is_correction else value("actual")),
+                    confidence=min(float(structured.get("confidence", 0.0)), 0.85),
+                    verified=False,
+                    metadata=(
+                        structured.get("metadata", {})
+                        if isinstance(structured.get("metadata", {}), dict)
+                        else {}
+                    ),
+                )
+                return self._json(self.learning.record_evidence(evidence).to_dict())
+
+            case "learning_propose_lesson":
+                if self.learning is None:
+                    return f"Learning runtime unavailable: {self.learning_error}"
+                if structured is None or not isinstance(
+                    structured.get("evidence_ids"), list
+                ):
+                    return "learning_propose_lesson requires an evidence_ids array."
+                lesson = self.learning.propose_lesson(
+                    title=value("title"),
+                    hypothesis=value("hypothesis"),
+                    trigger=value("trigger"),
+                    action=value("action"),
+                    evidence_ids=[str(item) for item in structured["evidence_ids"]],
+                )
+                return self._json(lesson.to_dict())
+
+            case "learning_stage_tool":
+                if self.learning is None:
+                    return f"Learning runtime unavailable: {self.learning_error}"
+                if structured is None or not isinstance(structured.get("manifest"), dict):
+                    return "learning_stage_tool requires manifest and source."
+                record = self.learning.stage_tool(
+                    ToolManifest.from_dict(structured["manifest"]),
+                    value("source"),
+                )
+                return self._json(record.to_dict())
+
+            case "learning_create_tool":
+                if self.learning is None:
+                    return f"Learning runtime unavailable: {self.learning_error}"
+                if structured is None or not isinstance(structured.get("manifest"), dict):
+                    return "learning_create_tool requires manifest and source."
+                record = await self.learning.create_tool(
+                    ToolManifest.from_dict(structured["manifest"]),
+                    value("source"),
+                )
+                return self._json(record.to_dict())
+
+            case "learning_stage_skill":
+                if self.learning is None:
+                    return f"Learning runtime unavailable: {self.learning_error}"
+                if structured is None or not isinstance(structured.get("manifest"), dict):
+                    return "learning_stage_skill requires a manifest."
+                record = self.learning.stage_skill(
+                    SkillManifest.from_dict(structured["manifest"])
+                )
+                return self._json(record.to_dict())
+
+            case "learning_create_skill":
+                if self.learning is None:
+                    return f"Learning runtime unavailable: {self.learning_error}"
+                if structured is None or not isinstance(structured.get("manifest"), dict):
+                    return "learning_create_skill requires a manifest."
+                record = await self.learning.create_skill(
+                    SkillManifest.from_dict(structured["manifest"]),
+                    available_tools=self._known_tool_names(),
+                )
+                return self._json(record.to_dict())
+
+            case "learning_validate_artifact":
+                if self.learning is None:
+                    return f"Learning runtime unavailable: {self.learning_error}"
+                if structured is None:
+                    return "learning_validate_artifact requires artifact_id."
+                record = await self.learning.validate_artifact(
+                    value("artifact_id"),
+                    available_tools=self._known_tool_names(),
+                )
+                return self._json(record.to_dict())
+
+            case "learning_activate_artifact":
+                if self.learning is None:
+                    return f"Learning runtime unavailable: {self.learning_error}"
+                if structured is None:
+                    return "learning_activate_artifact requires artifact_id."
+                return self._json(
+                    self.learning.activate_artifact(value("artifact_id")).to_dict()
+                )
+
+            case "learning_retire_artifact":
+                if self.learning is None:
+                    return f"Learning runtime unavailable: {self.learning_error}"
+                if structured is None:
+                    return "learning_retire_artifact requires artifact_id and reason."
+                return self._json(
+                    self.learning.retire_artifact(
+                        value("artifact_id"), value("reason")
+                    ).to_dict()
+                )
+
+            case "learning_list_artifacts":
+                if self.learning is None:
+                    return f"Learning runtime unavailable: {self.learning_error}"
+                return self._json({"artifacts": self.learning.list_artifacts()})
 
             case "evm_analyze_erc20_abi":
                 if structured is None or not isinstance(structured.get("abi"), list):
@@ -538,6 +746,11 @@ class MCPTools:
                             memory_mb=int(structured.get("memory_mb", 1_024)),
                             max_output_bytes=int(
                                 structured.get("max_output_bytes", 2_000_000)
+                            ),
+                            max_workspace_bytes=int(
+                                structured.get(
+                                    "max_workspace_bytes", 512 * 1024 * 1024
+                                )
                             ),
                         ),
                     )

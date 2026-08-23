@@ -49,6 +49,19 @@ Browser examples:
 {"tool": "browser_navigate", "arguments": {"url": "https://openai.com"}}
 {"tool": "browser_snapshot", "arguments": {}}
 
+Generated capability examples:
+
+Use learning_create_tool for a complete generated-tool lifecycle. Its arguments
+contain `manifest` and Python `source`. The manifest requires name, semantic
+version, description, object input_schema, object output_schema, exact tests,
+scope (`task` or `persistent`), lesson_ids, and timeout_seconds. Source must
+define `run(arguments)` and return a JSON object.
+
+Use learning_create_skill for a complete declarative-skill lifecycle. Its
+manifest requires name, semantic version, description, triggers, ordered steps,
+required_tools, at least one positive and one negative trigger test, scope, and
+lesson_ids.
+
 Rules:
 
 - Return ONLY one JSON object.
@@ -57,6 +70,8 @@ Rules:
 - Never invent tool names.
 - Use browser tools whenever the task involves websites, web pages, searching page content or navigation.
 - Use filesystem tools only for local files.
+- Generated capabilities must use the learning lifecycle; never use write_file
+  to place executable code into PALADYN's source tree.
 
 """.strip()
 

@@ -26,6 +26,10 @@ No new features unless they improve:
 - [x] Offline Foundry unit/fuzz/invariant lab
 - [x] Read-only live RPC observer and transaction simulator
 - [x] Evidence-gated persistent relationship state and persona-stage rendering
+- [x] Evidence-driven lesson validation and immutable artifact registry
+- [x] Offline generated-tool validation, activation, and automatic rollback
+- [x] Declarative generated skills with tested triggers and protected boundaries
+- [x] Interactive local GGUF discovery, llama.cpp profiles, and managed startup
 
 ## Agent
 
@@ -50,6 +54,7 @@ No new features unless they improve:
 - [ ] Store only useful lessons
 - [ ] Knowledge retrieval
 - [ ] Shared JSON parser for all memory modules
+- [x] Verified task outcomes feed the learning plane
 
 ## MCP
 

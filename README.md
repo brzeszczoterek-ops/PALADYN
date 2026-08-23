@@ -57,7 +57,8 @@ goals, not features claimed by the current release.
 
 - Python 3.12+
 - Node.js and `npx` for MCP servers
-- an OpenAI-compatible local model server
+- `llama-server` from llama.cpp and one or more local GGUF models, or another
+  already running OpenAI-compatible model server
 
 ## Quick start
 
@@ -66,12 +67,31 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env
-# Start your configured local model server, then:
+# PALADYN can now discover and start a local GGUF model itself:
 v-core
 ```
 
-The default model endpoint is `http://127.0.0.1:5001/v1`. Change
-`V_CORE_BASE_URL`, `V_CORE_MODEL`, and other values in `.env` when needed.
+On the first interactive launch PALADYN asks for a directory containing GGUF
+models. It scans that directory recursively, presents the local models, lets
+the user configure a llama.cpp profile, starts `llama-server`, verifies
+`/health` and `/v1/models`, and only then declares V ready. The directory,
+profiles, last selection, private logs, and selected binary are kept under
+`model_runtime`.
+
+Set `LLAMA_CPP_SERVER` when `llama-server` is not on `PATH`. Set
+`PALADYN_MODEL_LOADER=off` to keep using the external endpoint from
+`V_CORE_BASE_URL` and `V_CORE_MODEL`; `prompt` provides that external server as
+menu option `0`, while `required` refuses to start without a local model. The
+loader binds only to `127.0.0.1`, uses llama.cpp's offline/API-only modes, and
+stops the process when PALADYN exits.
+
+Profiles currently expose context size, GPU layers, CPU threads, batch and
+micro-batch size, parallel slots, Flash Attention, temperature, top-p, port,
+startup timeout, and additional argument-array entries. The additional entries
+cannot override the selected model, alias, loopback host, port, offline mode,
+API key, model presets, or llama.cpp's own tools. No shell command is built.
+
+The default external model endpoint remains `http://127.0.0.1:5001/v1`.
 The filesystem MCP server is restricted to `V_CORE_MCP_FILESYSTEM`, which
 defaults to the local `agent_workspace` directory.
 
@@ -103,6 +123,32 @@ evidence and a qualitative relationship stage.
 See [ARCHITECTURE.md](ARCHITECTURE.md), [ROADMAP.md](ROADMAP.md), and
 [TEST_PLAN.md](TEST_PLAN.md) for the longer design documents.
 
+## Evidence-driven learning
+
+PALADYN now has a runtime learning lifecycle rather than relying on an LLM to
+declare that it has learned something. Failures, corrections, tests, and
+verified outcomes become provenance-bearing evidence. Lessons remain candidates
+until independently supported. Generated tools and skills then pass through an
+immutable quarantine, policy checks, offline tests, capability-gated activation,
+and automatic rollback on repeated runtime failure.
+
+Task artifacts are restricted to their authorized workspace. Persistent
+artifacts require a validated lesson and two owner-approved capabilities. The
+owner build may pre-authorize that promotion with
+`PALADYN_LEARNING_PROFILE=owner_lab`; the client profile does not.
+
+Inspect the learning store with:
+
+```bash
+paladyn-learning verify
+paladyn-learning artifacts
+paladyn-learning evidence --limit 50
+paladyn-learning lessons
+```
+
+See [LEARNING.md](LEARNING.md) for the artifact formats, validation rules,
+sandbox contract, scopes, and current limitations.
+
 ## Full Autonomous foundation
 
 Autonomous work is controlled by a runtime state machine rather than a prompt.
@@ -121,8 +167,9 @@ paladyn-control panic-all
 ```
 
 `STOP` and `PANIC` cancel an active autonomous step. The control channel is
-implemented outside the LLM, so a model cannot ignore or rewrite it. Generated
-tools will be added on top of this control plane in the next development stage.
+implemented outside the LLM, so a model cannot ignore or rewrite it. Runtime
+outcomes feed the evidence plane, while generated tools and skills remain
+quarantined and tested before the capability gate can activate them.
 
 For a physical Linux emergency chord, first identify the keyboard and start the
 independent watcher in a second terminal:
@@ -149,7 +196,7 @@ sandbox. The current owner build exposes:
 - Uniswap v4 hook-address permission decoding;
 - Uniswap v2/v3 flash-swap repayment and fee calculations;
 - offline command execution with a private PID/network namespace, no host home,
-  a task-only writable workspace, and resource/output/time limits.
+  a task-only writable workspace, and process/resource/output/time limits.
 
 Set `PALADYN_EVM_PROFILE=client` to hide advanced Uniswap and flash-simulation
 tools. `owner_lab` enables them through an owner-approved capability set. Neither

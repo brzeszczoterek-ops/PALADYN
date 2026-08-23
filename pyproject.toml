@@ -36,6 +36,7 @@ pythonpath = ["src"]
 v-core = "v_core.main:main"
 paladyn-control = "v_core.autonomy.cli:main"
 paladyn-live = "v_core.evm.live_cli:main"
+paladyn-learning = "v_core.learning.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

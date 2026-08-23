@@ -86,6 +86,48 @@ async def test_bubblewrap_stops_unbounded_output(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_bubblewrap_stops_total_workspace_growth(tmp_path: Path) -> None:
+    result = await BubblewrapBackend().run(
+        SandboxSpec(
+            command=(
+                "/usr/bin/python3",
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "[Path(f'f{i}').write_bytes(b'x'*4096) for i in range(256)]"
+                ),
+            ),
+            workspace=tmp_path / "workspace",
+            limits=SandboxLimits(
+                max_file_bytes=8 * 1024,
+                max_workspace_bytes=32 * 1024,
+            ),
+        )
+    )
+
+    assert result.workspace_limited
+    assert not result.succeeded
+
+
+@pytest.mark.asyncio
+async def test_bubblewrap_applies_process_limit(tmp_path: Path) -> None:
+    result = await BubblewrapBackend().run(
+        SandboxSpec(
+            command=(
+                "/usr/bin/python3",
+                "-c",
+                "import resource; print(resource.getrlimit(resource.RLIMIT_NPROC)[0])",
+            ),
+            workspace=tmp_path / "workspace",
+            limits=SandboxLimits(max_processes=17),
+        )
+    )
+
+    assert result.succeeded
+    assert result.stdout.strip() == "17"
+
+
+@pytest.mark.asyncio
 async def test_backend_fails_closed_for_unimplemented_network_mode(
     tmp_path: Path,
 ) -> None:

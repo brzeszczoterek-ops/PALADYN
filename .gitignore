@@ -17,6 +17,8 @@ dist/
 # Memory data
 memory/
 /autonomy/
+/learning/
+/model_runtime/
 /agent_workspace/
 /evm_lab/cache/
 /evm_lab/out/

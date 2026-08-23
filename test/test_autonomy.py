@@ -87,11 +87,15 @@ def test_autonomy_root_can_be_configured(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PALADYN_AUTONOMY_ROOT", "state/tasks")
+    monkeypatch.setenv("PALADYN_MODEL_RUNTIME_ROOT", "state/models")
+    monkeypatch.setenv("PALADYN_MODEL_LOADER", "required")
     monkeypatch.setenv("V_CORE_MCP_FILESYSTEM", "workspace")
 
     config = load_config()
 
     assert config.autonomy_root == (tmp_path / "state/tasks").resolve()
+    assert config.model_runtime_root == (tmp_path / "state/models").resolve()
+    assert config.model_loader_mode == "required"
     assert config.workspace == (tmp_path / "workspace").resolve()
 
 

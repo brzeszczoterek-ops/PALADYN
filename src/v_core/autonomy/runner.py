@@ -22,6 +22,7 @@ StepDriver = Callable[
     [AutonomousTask, AuthorizationEnvelope],
     Awaitable[StepResult],
 ]
+LearningSink = Callable[[str, str, dict], object]
 
 
 class AutonomousRunner:
@@ -30,6 +31,7 @@ class AutonomousRunner:
         root: Path,
         *,
         poll_interval: float = 0.25,
+        learning_sink: LearningSink | None = None,
     ) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -37,6 +39,7 @@ class AutonomousRunner:
         self.checkpoints = CheckpointStore(self.root / "checkpoints")
         self.control_root = self.root / "control"
         self.poll_interval = poll_interval
+        self.learning_sink = learning_sink
 
     async def run(
         self,
@@ -115,6 +118,16 @@ class AutonomousRunner:
                             "error": str(exc),
                         },
                     )
+                    self._capture_learning(
+                        task,
+                        "step_failed",
+                        {
+                            "action_number": task.action_count,
+                            "failure_number": task.failure_count,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        },
+                    )
                     self._save(task, envelope)
 
                     if task.failure_count > envelope.budget.max_failures:
@@ -153,6 +166,16 @@ class AutonomousRunner:
                         "task_completed",
                         {"result": task.result},
                     )
+                    self._capture_learning(
+                        task,
+                        "task_completed",
+                        {
+                            "result": task.result,
+                            "verified": bool(result.metadata.get("verified", False)),
+                            "expected": result.metadata.get("expected", ""),
+                            "actual": result.metadata.get("actual", task.result),
+                        },
+                    )
                     self._save(task, envelope)
                     return task
 
@@ -161,6 +184,11 @@ class AutonomousRunner:
                     task.transition(TaskStatus.BLOCKED)
                     self.journal.append(
                         task.task_id,
+                        "task_blocked",
+                        {"reason": task.blocked_reason},
+                    )
+                    self._capture_learning(
+                        task,
                         "task_blocked",
                         {"reason": task.blocked_reason},
                     )
@@ -265,6 +293,27 @@ class AutonomousRunner:
         task.checkpoint_sequence += 1
         task.touch()
         self.checkpoints.save(task, envelope)
+
+    def _capture_learning(
+        self,
+        task: AutonomousTask,
+        event: str,
+        data: dict,
+    ) -> None:
+        if self.learning_sink is None:
+            return
+        try:
+            self.learning_sink(task.task_id, event, data)
+        except Exception as exc:
+            self.journal.append(
+                task.task_id,
+                "learning_capture_failed",
+                {
+                    "event": event,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
 
     @staticmethod
     def _budget_error(

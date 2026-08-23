@@ -85,12 +85,61 @@ Every item should pass before creating a new release.
 
 ---
 
+# Learning, Generated Tools, and Skills
+
+- [x] Unsupported success does not become learning evidence.
+- [x] Model-authored JSON cannot mark its own evidence as verified.
+- [x] User corrections retain framework task identity and the raw user message.
+- [x] Autonomous failures and explicitly verified results are recorded.
+- [x] Lessons require independent tasks, fingerprints, and verified evidence.
+- [x] Evidence and artifact-journal tampering is detected.
+- [x] Artifact source and manifest tampering is detected before activation.
+- [x] Artifact versions are immutable within a scope.
+- [x] Task artifacts are invisible outside their authorized workspace.
+- [x] Persistent artifacts require a validated lesson and double owner approval.
+- [x] Generated code with forbidden imports or calls is rejected.
+- [x] Generated tools execute offline with time, memory, and output limits.
+- [x] Sandbox process-count limits are enforced for generated code.
+- [x] Generated manifests, schemas, source, metadata, and arguments are bounded.
+- [x] Generated tools cannot exceed the total workspace disk limit.
+- [x] Infinite generated code is terminated by the sandbox.
+- [x] Input and output JSON schemas are enforced.
+- [x] Failed tool tests prevent activation.
+- [x] Active generated tools survive a runtime restart.
+- [x] Three runtime failures automatically retire an active generated tool.
+- [x] A regressing replacement rolls back to its previously active version.
+- [x] Invalid caller input does not count as a generated-tool failure.
+- [x] A new active version retires the previous version.
+- [x] Skills require available tools and passing trigger cases.
+- [x] Skills cannot override persona, policy, permissions, or kill switch.
+- [x] Matching skills reach the agent prompt as lower-authority workflow data.
+- [x] The owner audit verifies every journal, record, manifest, and source digest.
+- [x] Parallel generated-tool runs update lifecycle counters transactionally.
+- [x] Independent runtime instances serialize lifecycle updates without loss.
+
+---
+
 # Reliability
 
 - [ ] No uncaught exceptions.
 - [ ] No hallucinated filesystem data.
 - [ ] No hallucinated tool results.
 - [ ] No fabricated web search results.
+
+---
+
+# Local Model Loader
+
+- [x] Recursive GGUF discovery rejects empty/fake files and auxiliary shards.
+- [x] Model directory, profiles, binary, and last selection persist privately.
+- [x] Profile parameters are range-checked and bounded.
+- [x] Extra arguments cannot override the local loader boundary.
+- [x] `llama-server` launches without a shell and only on loopback.
+- [x] Inherited `LLAMA_ARG_*` overrides are removed from the child environment.
+- [x] V is not initialized before both `/health` and `/v1/models` pass.
+- [x] Early server failure reports the private log tail.
+- [x] A managed server is terminated during shutdown and failed startup.
+- [x] Noninteractive runs never hang waiting for input.
 
 ---
 

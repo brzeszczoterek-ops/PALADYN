@@ -75,6 +75,8 @@ class AuthorizationEnvelope:
             "write_task_workspace",
             "browse_public_sources",
             "create_task_tools",
+            "record_learning_evidence",
+            "activate_task_artifacts",
             "run_task_tests",
             "run_sandboxed_code",
             "restart_local_models",
@@ -83,8 +85,13 @@ class AuthorizationEnvelope:
     owner_approved_capabilities: set[str] = field(default_factory=set)
     protected_paths: tuple[str, ...] = (
         "src/v_core/persona",
+        "src/v_core/learning/policy.py",
+        "src/v_core/learning/tool_host.py",
+        "src/v_core/model_loader",
         "src/v_core/autonomy/control.py",
         "src/v_core/autonomy/models.py",
+        "learning",
+        "model_runtime",
         "memory",
         ".env",
     )
