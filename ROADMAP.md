@@ -16,6 +16,17 @@ No new features unless they improve:
 
 # After 1.0 (Must Have)
 
+## Completed foundation
+
+- [x] Full Autonomous task state machine, checkpoints, budgets, and PANIC
+- [x] External simultaneous-key emergency stop
+- [x] Offline Bubblewrap execution backend
+- [x] Client/owner EVM capability boundary
+- [x] ERC-20, oracle, security, Uniswap hook, and flash-swap analysis tools
+- [x] Offline Foundry unit/fuzz/invariant lab
+- [x] Read-only live RPC observer and transaction simulator
+- [x] Evidence-gated persistent relationship state and persona-stage rendering
+
 ## Agent
 
 - [ ] Improve ToolDispatcher

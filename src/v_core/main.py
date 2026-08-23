@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 
 from .agent import Agent
+from .autonomy import (
+    AuthorizationEnvelope,
+    AutonomousRunner,
+    AutonomousTask,
+    RuntimeRegistry,
+)
+from .autonomy.runner import StepDriver
 from .config import load_config
 
 from .memory.storage import MemoryStorage
@@ -32,7 +38,7 @@ class VCore:
         llm = LLM()
 
         storage = MemoryStorage(
-            Path("memory")
+            self.config.memory_root
         )
 
         manager = MemoryManager(
@@ -58,7 +64,7 @@ class VCore:
         )
 
         relationship_storage = RelationshipStorage(
-            "memory/relationship"
+            self.config.memory_root / "relationship"
         )
 
         relationship_updater = RelationshipUpdater(
@@ -81,6 +87,15 @@ class VCore:
             memory=memory,
         )
 
+        self.autonomy = AutonomousRunner(
+            self.config.autonomy_root
+        )
+
+        self.runtime_registry = RuntimeRegistry(
+            self.config.autonomy_root / "runtime"
+        )
+        self.runtime_registry.register("v-core")
+
     async def ask(
         self,
         prompt: str,
@@ -88,6 +103,40 @@ class VCore:
 
         return await self.agent.run(
             prompt
+        )
+
+    async def close(self) -> None:
+        try:
+            await self.agent.close()
+        finally:
+            self.runtime_registry.unregister()
+
+    async def run_autonomous(
+        self,
+        objective: str,
+        driver: StepDriver,
+        envelope: AuthorizationEnvelope | None = None,
+        *,
+        task_id: str | None = None,
+    ) -> AutonomousTask:
+        task = AutonomousTask(
+            objective=objective,
+            **({"task_id": task_id} if task_id else {}),
+        )
+
+        if envelope is None:
+            envelope = AuthorizationEnvelope(
+                workspace=str(
+                    self.config.workspace
+                    / "autonomous"
+                    / task.task_id
+                )
+            )
+
+        return await self.autonomy.run(
+            task,
+            envelope,
+            driver,
         )
 
 
@@ -98,27 +147,29 @@ async def chat():
     print("PALADYN Framework powered by V")
     print("Type 'exit' to quit.\n")
 
-    while True:
+    try:
+        while True:
+            try:
 
-        try:
+                prompt = input("V > ").strip()
 
-            prompt = input("V > ").strip()
+                if prompt.lower() in {
+                    "exit",
+                    "quit",
+                }:
+                    break
 
-            if prompt.lower() in {
-                "exit",
-                "quit",
-            }:
+                print(
+                    await core.ask(prompt)
+                )
+
+            except KeyboardInterrupt:
                 break
 
-            print(
-                await core.ask(prompt)
-            )
-
-        except KeyboardInterrupt:
-            break
-
-        except Exception as exc:
-            print(f"\n{exc}\n")
+            except Exception as exc:
+                print(f"\n{exc}\n")
+    finally:
+        await core.close()
 
 
 def main():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from uuid import uuid4
 
 from .models import (
@@ -38,19 +39,19 @@ class MemoryManager:
         if isinstance(entry, ExperienceEntry):
             if not entry.summary and not entry.lesson:
                 return None
-            if entry.confidence < 0.35:
+            if not self._reliable(entry.confidence, 0.35):
                 return None
 
         if isinstance(entry, SummaryEntry):
             if not entry.summary and not entry.lessons:
                 return None
-            if entry.confidence < 0.50:
+            if not self._reliable(entry.confidence, 0.50):
                 return None
 
         if isinstance(entry, KnowledgeEntry):
             if not entry.title and not entry.content:
                 return None
-            if entry.confidence < 0.65:
+            if not self._reliable(entry.confidence, 0.65):
                 return None
 
         filename = f"{uuid4().hex}.yaml"
@@ -102,3 +103,11 @@ class MemoryManager:
         return len(
             self.storage.list(category)
         )
+
+    @staticmethod
+    def _reliable(value: object, minimum: float) -> bool:
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(confidence) and confidence >= minimum

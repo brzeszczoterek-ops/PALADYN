@@ -86,7 +86,7 @@ class MemoryEngine:
                 current_knowledge,
             )
 
-            self.manager.remember(
+            stored_experience = self.manager.remember(
                 "experiences",
                 experience,
             )
@@ -99,18 +99,21 @@ class MemoryEngine:
 
             return None
 
+        # A rejected or unreliable experience must not affect the persistent
+        # relationship, summaries, or long-term knowledge.
+        if stored_experience is None:
+            return experience
+
         try:
 
-            self.relationship_state = (
-                await self.relationship_updater.update(
-                    self.relationship_state,
-                    experience,
-                )
+            candidate_relationship = await self.relationship_updater.update(
+                self.relationship_state,
+                experience,
             )
 
-            self.relationship_storage.save(
-                self.relationship_state,
-            )
+            if candidate_relationship is not self.relationship_state:
+                self.relationship_storage.save(candidate_relationship)
+                self.relationship_state = candidate_relationship
 
         except Exception as e:
 

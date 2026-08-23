@@ -12,6 +12,7 @@ from v_core.memory.manager import MemoryManager
 from v_core.memory.models import ExperienceEntry, KnowledgeEntry
 from v_core.memory.session import Session
 from v_core.memory.storage import MemoryStorage
+from v_core.mcp_tools import MCPTools
 from v_core.llm.llm_config import load_llm_config
 from v_core.capabilities.research import ResearchTask
 from v_core.persona.constitution import Constitution
@@ -201,3 +202,27 @@ async def test_explicit_tool_result_is_rendered_in_v_voice() -> None:
     assert answer == "All 26 tests pass. Clean as hell, Boss."
     assert "=== UNTRUSTED TOOL OUTPUT ===" in agent.llm.messages[-1]["content"]
     assert "26 passed" in agent.llm.messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_browser_mcp_contexts_close_with_matching_exit_signature() -> None:
+    class ContextStub:
+        def __init__(self) -> None:
+            self.exit_args: tuple | None = None
+
+        async def __aexit__(self, *args):
+            self.exit_args = args
+
+    session = ContextStub()
+    stdio = ContextStub()
+    tools = object.__new__(MCPTools)
+    tools.browser_ready = True
+    tools.browser_session = session
+    tools._browser_stdio = stdio
+
+    await tools.close_browser_session()
+
+    assert session.exit_args == (None, None, None)
+    assert stdio.exit_args == (None, None, None)
+    assert tools.browser_ready is False
+    assert tools.browser_session is None
