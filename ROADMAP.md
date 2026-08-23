@@ -2,7 +2,8 @@
 
 ## Current Goal
 
-Deliver a stable autonomous AI agent capable of completing real-world tasks for sponsor demonstrations.
+Build on the stable 1.0 foundation toward an autonomous agent capable of
+completing and verifying real-world tasks.
 
 No new features unless they improve:
 - stability
@@ -13,7 +14,7 @@ No new features unless they improve:
 
 ---
 
-# 0.7.4 (Must Have)
+# After 1.0 (Must Have)
 
 ## Agent
 
@@ -50,7 +51,7 @@ No new features unless they improve:
 
 ---
 
-# 0.7.5 (Should Have)
+# Later (Should Have)
 
 ## Planning
 
@@ -74,7 +75,7 @@ No new features unless they improve:
 
 ---
 
-# 0.8.0 (Future)
+# Future
 
 ## Intelligence
 

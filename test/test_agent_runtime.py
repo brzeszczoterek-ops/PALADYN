@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import v_core
 from v_core.agent import Agent
 from v_core.capability_dispatcher import CapabilityDispatcher
 from v_core.memory.manager import MemoryManager
@@ -18,6 +19,10 @@ from v_core.persona.kernel import IdentityKernel
 from v_core.persona.runtime import PersonaRuntime
 from v_core.persona.voice import VoiceProfile
 from v_core.relationship import RelationshipState
+
+
+def test_public_version_is_1_0_0() -> None:
+    assert v_core.__version__ == "1.0.0"
 
 
 def test_tool_request_accepts_structured_json() -> None:

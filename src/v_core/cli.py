@@ -5,6 +5,7 @@ import asyncio
 import typer
 from rich.console import Console
 
+from . import __version__
 from .agent import Agent
 from .config import load_config
 
@@ -18,7 +19,7 @@ def chat():
 
     agent = Agent(load_config())
 
-    console.print("[bold green]V-Core 0.5[/bold green]")
+    console.print(f"[bold green]PALADYN / V-Core {__version__}[/bold green]")
     console.print("Type 'exit' to quit.\n")
 
     while True:
