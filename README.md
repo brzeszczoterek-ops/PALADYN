@@ -10,6 +10,13 @@ provides reasoning, but the framework owns permissions, validation, memory,
 execution, and emergency control. V is therefore meant to become an agent with
 continuity—not merely another temporary chat assistant wrapped around an LLM.
 
+## Persona attribution
+
+The V persona used in PALADYN is based on the original V persona created by
+**Daedalus**. PALADYN adapts and develops that foundation for a local agent with
+persistent memory, tools, relationship development, and autonomous execution,
+while preserving clear credit for the persona's original creator.
+
 ## Vision and intended audience
 
 PALADYN is being created first and foremost for private individuals. The goal
