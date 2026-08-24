@@ -25,7 +25,8 @@ class TaskJournal:
 
     def __post_init__(self) -> None:
         self.root = Path(self.root)
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.root, 0o700)
 
     def append(
         self,
@@ -43,6 +44,7 @@ class TaskJournal:
         }
 
         with path.open("a", encoding="utf-8") as handle:
+            os.chmod(path, 0o600)
             handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -70,7 +72,8 @@ class CheckpointStore:
 
     def __post_init__(self) -> None:
         self.root = Path(self.root)
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.root, 0o700)
 
     def save(
         self,
@@ -87,11 +90,13 @@ class CheckpointStore:
         }
 
         with temporary.open("w", encoding="utf-8") as handle:
+            os.chmod(temporary, 0o600)
             json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
             handle.flush()
             os.fsync(handle.fileno())
 
         os.replace(temporary, path)
+        os.chmod(path, 0o600)
         return path
 
     def load(

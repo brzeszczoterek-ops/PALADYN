@@ -31,7 +31,17 @@ Every item should pass before creating a new release.
 
 # Internet
 
-- [ ] Uses web tools when information is unavailable.
+- [x] Full URLs and bare domains with browsing intent use deterministic web tools.
+- [x] Website inspection requires successful navigation and snapshot evidence.
+- [x] Browser MCP errors cannot satisfy the website evidence requirement.
+- [x] Oversized snapshots are bounded to the active model context.
+- [x] A one-page snapshot cannot be described as a completed whole-site scrape;
+  overclaims are replaced with exact visible link labels and URLs.
+- [x] Website UI controls cannot be classified as extracted tools or skills.
+- [x] Explicit extraction visits a bounded set of ranked internal detail pages,
+  records every navigation and snapshot, and preserves evidence from every page.
+- [x] Unsupported extraction metrics and concrete capability claims are replaced
+  with a deterministic report parsed from verified detail-page records.
 - [ ] Does not invent search results.
 - [ ] Distinguishes current knowledge from retrieved knowledge.
 
@@ -41,7 +51,11 @@ Every item should pass before creating a new release.
 
 - [ ] Correctly decides when a tool is required.
 - [ ] Does not call tools unnecessarily.
-- [ ] Correctly parses tool arguments.
+- [x] Correctly parses exact JSON, trailing prose-plus-JSON, and fenced tool actions.
+- [x] Rejects multiple tool objects as ambiguous.
+- [x] Never exposes an internal tool action in the visible answer.
+- [x] Rejects model claims of future or background work until a real tool executes.
+- [x] Explicitly unfinished work is checkpointed as blocked instead of completed.
 - [ ] Handles tool failures gracefully.
 - [ ] Continues after recoverable errors.
 
@@ -54,6 +68,8 @@ Every item should pass before creating a new release.
 - [ ] Detects successful tasks.
 - [ ] Detects failed tasks.
 - [ ] Produces useful lessons.
+- [x] Runtime evidence, not model text, determines whether tool work was observed.
+- [x] `observed` and `verified` are downgraded without successful checkpoints.
 
 ## Experience
 
@@ -125,6 +141,11 @@ Every item should pass before creating a new release.
 - [ ] No hallucinated filesystem data.
 - [ ] No hallucinated tool results.
 - [ ] No fabricated web search results.
+- [x] Interactive tasks persist private checkpoints and append-only action journals.
+- [x] Cancellation changes the durable interactive checkpoint from `running` to
+  `stopped`.
+- [x] Real Gemma integration executes one deterministic tool and preserves its
+  exact result in the final answer and memory evidence.
 
 ---
 
@@ -133,6 +154,12 @@ Every item should pass before creating a new release.
 - [x] Recursive GGUF discovery rejects empty/fake files and auxiliary shards.
 - [x] Model directory, profiles, binary, and last selection persist privately.
 - [x] Profile parameters are range-checked and bounded.
+- [x] K and V cache quantization are validated, persisted, migrated, and passed
+  to `llama-server` as controlled arguments.
+- [x] Reasoning mode is a validated `off`, `on`, or `auto` profile parameter and
+  defaults to `off` for ordinary local use.
+- [x] Anti-repetition is a validated `off`, `balanced`, or `strong` profile and
+  maps to controlled llama.cpp repeat-penalty and DRY arguments.
 - [x] Extra arguments cannot override the local loader boundary.
 - [x] `llama-server` launches without a shell and only on loopback.
 - [x] Inherited `LLAMA_ARG_*` overrides are removed from the child environment.
@@ -143,9 +170,62 @@ Every item should pass before creating a new release.
 
 ---
 
+# Local Speech
+
+- [x] The selected Piper profile resolves model and config paths under the
+  private voice root.
+- [x] The selected Kokoro profile resolves its full model, voice bank, isolated
+  Python runtime, voice id, language, speed, and Piper fallback.
+- [x] Kokoro loads once per speech session and returns bounded private WAV chunks
+  through a local JSON-lines worker protocol.
+- [x] Real full-model Kokoro Emma -> PipeWire playback succeeds without using
+  the Piper fallback.
+- [x] Missing STT/TTS binaries or models fail with a readable configuration
+  error without disabling keyboard chat.
+- [x] PCM voice activity does not start on sub-threshold room noise.
+- [x] Recording stops only after minimum speech followed by bounded silence.
+- [x] Whisper receives 16 kHz mono WAV input with automatic language detection.
+- [x] Whisper language, thread count, and bounded vocabulary prompt are explicit
+  configuration rather than hard-coded decoder behavior.
+- [x] Owner STT uses checksum-verified multilingual Large V3 Turbo Q5 on CUDA,
+  with Polish selected for short utterances and the same model retained on CPU
+  as fallback.
+- [x] Piper output passes through the selected argument-array SoX effects.
+- [x] Playback completes before continuous mode opens the microphone again.
+- [x] The terminal-local F8 binding submits `/ptt` without Enter or global
+  keyboard-device access.
+- [x] Toggle push-to-talk starts one recorder, stops it on the second action,
+  transcribes the bounded WAV, and cleans temporary state.
+- [x] Spoken stop phrases return to keyboard input.
+- [x] Code blocks and Markdown-only syntax are not read aloud mechanically.
+- [x] Real local Piper -> SoX -> PipeWire playback succeeds.
+- [x] Real local Whisper transcription succeeds on a generated voice sample.
+- [ ] Live microphone recognition is confirmed interactively on the target
+  headset.
+
+---
+
 # Performance
 
-- [ ] LLM response time acceptable.
+- [x] Owner monitor is disabled unless explicitly enabled by runtime config.
+- [x] Managed model metrics and slots remain bound to loopback.
+- [x] Prometheus metrics with labels are parsed without executing input.
+- [x] Latest completed prompt/generation timing is parsed from private logs.
+- [x] Monitor launch arguments contain the selected model profile and PID.
+- [x] Monitor exits when the managed model process stops.
+- [x] Real llama.cpp log timing and Jetson `tegrastats` formats are recognized.
+- [x] Each launch derives a unique session journal from its log timestamp and PID.
+- [x] Monitor telemetry is append-only JSONL with private file and directory modes.
+- [x] A new monitor targets only its current log, PID, and journal path.
+
+- [x] Short chat, explicit tool-result, and research output use guarded streaming;
+  multi-step agent candidates buffer until tool/final-answer classification.
+- [x] Routine greetings skip persistent reflection and return without memory work.
+- [x] Repeated-generation spans stop without treating a normal two-use short
+  phrase as a loop.
+- [x] Recent session history stays inside a context-derived character budget.
+- [x] Substantive memory processing runs outside the visible response path and
+  yields to the next user request.
 - [ ] MCP communication stable.
 - [ ] Memory pipeline completes successfully.
 - [ ] No unnecessary LLM calls.

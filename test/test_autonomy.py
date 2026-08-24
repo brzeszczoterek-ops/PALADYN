@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
 
 from v_core.autonomy import (
     AuthorizationEnvelope,
+    AgentTaskTrace,
     AutonomousRunner,
     AutonomousTask,
     CheckpointStore,
@@ -55,6 +57,39 @@ def test_journal_is_append_only_jsonl(tmp_path: Path) -> None:
     records = journal.read("task-1")
     assert [record["event"] for record in records] == ["started", "completed"]
     assert records[1]["data"]["value"] == 2
+    assert (tmp_path / "journal").stat().st_mode & 0o777 == 0o700
+    assert (tmp_path / "journal" / "task-1.jsonl").stat().st_mode & 0o777 == 0o600
+
+
+def test_interactive_agent_trace_records_runtime_evidence(tmp_path: Path) -> None:
+    trace = AgentTaskTrace(tmp_path / "interactive", "Inspect a page")
+    sequence = trace.tool_started(
+        "browser_navigate",
+        {"url": "https://example.com"},
+    )
+    trace.tool_finished(sequence, "Example Domain")
+    trace.complete("The page title is Example Domain.")
+
+    checkpoint = (
+        tmp_path
+        / "interactive"
+        / "checkpoints"
+        / f"{trace.task_id}.json"
+    )
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    records = trace._journal.read(trace.task_id)
+
+    assert payload["status"] == "completed"
+    assert payload["tool_calls"][0]["status"] == "succeeded"
+    assert payload["tool_calls"][0]["result_sha256"]
+    assert [record["event"] for record in records] == [
+        "task_started",
+        "tool_started",
+        "tool_completed",
+        "task_completed",
+    ]
+    assert trace.evidence()["successful_tool_count"] == 1
+    assert checkpoint.stat().st_mode & 0o777 == 0o600
 
 
 def test_authorization_guard_prevents_workspace_escape(tmp_path: Path) -> None:
@@ -88,6 +123,7 @@ def test_autonomy_root_can_be_configured(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PALADYN_AUTONOMY_ROOT", "state/tasks")
     monkeypatch.setenv("PALADYN_MODEL_RUNTIME_ROOT", "state/models")
+    monkeypatch.setenv("PALADYN_VOICE_ROOT", "state/voice")
     monkeypatch.setenv("PALADYN_MODEL_LOADER", "required")
     monkeypatch.setenv("V_CORE_MCP_FILESYSTEM", "workspace")
 
@@ -95,6 +131,7 @@ def test_autonomy_root_can_be_configured(
 
     assert config.autonomy_root == (tmp_path / "state/tasks").resolve()
     assert config.model_runtime_root == (tmp_path / "state/models").resolve()
+    assert config.voice_root == (tmp_path / "state/voice").resolve()
     assert config.model_loader_mode == "required"
     assert config.workspace == (tmp_path / "workspace").resolve()
 

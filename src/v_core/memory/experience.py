@@ -95,7 +95,7 @@ Schema:
 Output ONLY JSON.
 """.strip()
 
-        response = await self.llm.ask(prompt)
+        response = await self.llm.ask(prompt, max_tokens=192)
 
         data = parse_llm_json(
             response,

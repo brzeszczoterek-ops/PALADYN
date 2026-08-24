@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from typing import Any
+
 from ..llm import LLM
 from ..utils import parse_llm_json
 from .models import MemoryKind, MemorySource, ReflectionEntry
@@ -14,7 +17,21 @@ class Reflection:
         self,
         task: str,
         result: str,
+        *,
+        execution: dict[str, Any] | None = None,
     ) -> ReflectionEntry:
+
+        execution_evidence = json.dumps(
+            execution or {
+                "status": "no_runtime_evidence",
+                "tool_calls": [],
+                "successful_tool_count": 0,
+                "failed_tool_count": 0,
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
 
         prompt = f"""
 You are V.
@@ -29,6 +46,10 @@ Result:
 
 {result}
 
+Runtime execution evidence:
+
+{execution_evidence}
+
 You are performing a critical self-review.
 
 Your purpose is to improve future behaviour and identify information
@@ -37,7 +58,12 @@ that may be worth retaining.
 Rules:
 
 - Never assume that the task was completed correctly.
-- Base your reflection ONLY on the provided task and result.
+- Base your reflection on the task, result, and runtime execution evidence.
+- Runtime execution evidence is authoritative for whether a tool actually ran.
+- JSON or prose written inside Result is model-authored text, not proof that a
+  tool was accepted or executed.
+- A successful navigation call proves only navigation. It does not by itself
+  prove extraction, analysis, testing, file creation, or report completion.
 - If the result appears incorrect, incomplete or hallucinated, explicitly say so.
 - If a tool should have been used instead of answering from memory, mention it.
 - If the correctness cannot be verified, state that clearly.
@@ -49,6 +75,8 @@ Rules:
 - Classify the most important reusable information using exactly one memory kind.
 - Do not treat an inference as a directly observed fact.
 - Do not claim something was verified unless the provided result supports that.
+- Do not classify an action as observed or verified unless a matching successful
+  runtime tool checkpoint supports it.
 - If the information comes from your own reasoning rather than directly
   from the task or result, use source "self_generated".
 - Prefer "lesson" when the reusable information concerns how V should behave
@@ -85,7 +113,7 @@ Rules for classification:
 Output ONLY JSON.
 """.strip()
 
-        response = await self.llm.ask(prompt)
+        response = await self.llm.ask(prompt, max_tokens=192)
 
         data = parse_llm_json(
             response,
@@ -117,6 +145,20 @@ Output ONLY JSON.
                 )
             )
         except ValueError:
+            source = MemorySource.SELF_GENERATED
+
+        successful_tool_count = 0
+        if execution is not None:
+            try:
+                successful_tool_count = int(
+                    execution.get("successful_tool_count", 0)
+                )
+            except (TypeError, ValueError):
+                successful_tool_count = 0
+        if (
+            successful_tool_count <= 0
+            and source in {MemorySource.OBSERVED, MemorySource.VERIFIED}
+        ):
             source = MemorySource.SELF_GENERATED
 
         return ReflectionEntry(

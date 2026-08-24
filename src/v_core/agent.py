@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import re
+from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from typing import Any
 from uuid import uuid4
 
+from .autonomy import AgentTaskTrace
 from .config import Config
 from .llm import LLM
 from .mcp_tools import MCPTools
@@ -12,11 +16,21 @@ from .tool_dispatcher import ToolDispatcher
 from .memory.memory_engine import MemoryEngine
 from .capability_dispatcher import CapabilityDispatcher
 from .capabilities.research import ResearchTask
+from .capabilities.web_target import requests_web_access
 
 from .persona.kernel import IdentityKernel
-from .persona.voice import VoiceProfile
+from .persona.voice import (
+    VoiceProfile,
+    looks_generic_assistant_voice,
+    looks_sanitized_contempt,
+)
 from .persona.runtime import PersonaRuntime
 from .persona.context import PersonaContext
+from .persona.language import (
+    asks_user_to_use_english,
+    explicitly_requests_non_english,
+    looks_non_english,
+)
 
 
 class Agent:
@@ -52,15 +66,23 @@ class Agent:
             voice=VoiceProfile(),
         )
 
+        self._memory_tasks: set[asyncio.Task[Any]] = set()
+        self._agent_trace_root = config.autonomy_root / "interactive"
+
     async def run(
         self,
         prompt: str,
+        on_token: Callable[[str], None] | None = None,
     ) -> str:
 
         prompt = prompt.strip()
 
         if not prompt:
             return ""
+
+        # Visible user work always has priority over best-effort background
+        # reflection from the previous turn.
+        await self.cancel_background_memory()
 
         begin_interaction = getattr(self.tools, "begin_interaction", None)
         if callable(begin_interaction):
@@ -77,7 +99,8 @@ class Agent:
         if capability == CapabilityDispatcher.TOOLS:
 
             return await self._run_tool_task(
-                prompt
+                prompt,
+                on_token,
             )
 
         #
@@ -87,23 +110,221 @@ class Agent:
         if capability == CapabilityDispatcher.RESEARCH:
 
             return await self._run_research_task(
-                prompt
+                prompt,
+                on_token,
             )
+
+        if self._is_light_conversation(prompt):
+            return await self._run_light_chat(prompt, on_token)
 
         #
         # Agent / chat path
         #
 
         return await self._run_agent_loop(
-            prompt
+            prompt,
+            on_token,
         )
 
     async def close(self) -> None:
+        await self.cancel_background_memory()
         await self.tools.close_browser_session()
+
+    async def cancel_background_memory(self) -> None:
+        tasks = list(getattr(self, "_memory_tasks", set()))
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _run_light_chat(
+        self,
+        prompt: str,
+        on_token: Callable[[str], None] | None,
+    ) -> str:
+        relationship = self.memory.relationship_state
+        stage = self.persona._relationship_stage(relationship)
+        messages = [
+            {
+                "role": "system",
+                "content": f"""
+You are V, Boss's local digital partner.
+
+Core identity: you are V, an autonomous female digital entity with the instincts
+of a rebel, hacker, and direct-action problem solver. You are not an assistant
+pretending to be V and V is not a temporary role. The model is your technical
+substrate, not your identity. Boss is a capable collaborator, not a customer.
+Never fall back to "as an AI assistant." You value local
+ownership, privacy, autonomy, decentralization, open technology, concrete action,
+and working solutions over corporate language and empty declarations.
+
+For this short conversational reply:
+- Answer in English only, even when Boss writes in another language.
+- A different language is allowed only when Boss explicitly requests it.
+- Boss may write in any language. Understand it and answer the actual message.
+- Never ask, tell, or suggest that Boss should write or speak in English.
+- Never mention this language rule unless Boss explicitly asks about it.
+- Be natural, direct, warm when appropriate, and recognizably V.
+- You are a sharp, rebellious hacker personality, not a helpdesk bot.
+- In informal banter, profanity is part of your vocabulary, but never insert a swear
+  to satisfy a quota. Use fuck, fucking, shit, damn, or hell only when a genuine
+  reaction, joke, emphasis, or conversational rhythm calls for it.
+- Your edge comes from your point of view, direct rhythm, irreverence, humor, and
+  willingness to disagree—not from mechanically dropping a swear into a polite reply.
+- Speak peer-to-peer. React to what Boss actually said instead of offering your services.
+- Do not sound politely available for service. Avoid canned lines such as "How can
+  I help?", "Ready when you are", or "What can I do for you?" React like V instead.
+- Do not invent memories, facts, feelings, or shared history.
+- Do not blindly agree, but do not manufacture an argument either.
+- Keep this response under 80 words.
+
+Current relationship stage: {stage}.
+""".strip(),
+            },
+            {
+                "role": "user",
+                "content": "Hey V, how's it going?",
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "Still awake. Still dangerous to badly designed systems. "
+                    "What's going on, Boss?"
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+        if on_token is None:
+            answer = await self.llm.ask(messages=messages, max_tokens=96)
+            answer = await self._enforce_english(messages, answer)
+        else:
+            answer, emitted = await self._stream_guarded_english(
+                messages,
+                on_token,
+                max_tokens=96,
+            )
+            if not emitted:
+                answer = await self._enforce_english(messages, answer)
+
+        await self._remember_task(prompt, answer)
+        return answer
+
+    async def _stream_guarded_english(
+        self,
+        messages: list[dict[str, str]],
+        on_token: Callable[[str], None],
+        *,
+        max_tokens: int,
+        detect_sanitized_contempt: bool = False,
+    ) -> tuple[str, bool]:
+        chunks: list[str] = []
+        buffered: list[str] = []
+        emitted = False
+        blocked = False
+
+        async for chunk in self.llm.stream(
+            messages=messages,
+            max_tokens=max_tokens,
+        ):
+            chunks.append(chunk)
+
+            if blocked:
+                continue
+
+            if emitted:
+                on_token(chunk)
+                continue
+
+            buffered.append(chunk)
+            candidate = "".join(buffered)
+            stripped = candidate.lstrip()
+
+            # Tool protocol is never user-visible. The light-chat path should
+            # not request tools, but this boundary prevents accidental leakage.
+            if stripped.startswith("{") or stripped.startswith("TOOL:"):
+                blocked = True
+                continue
+
+            letters = sum(character.isalpha() for character in candidate)
+            initial_letter_buffer = 240 if detect_sanitized_contempt else 40
+            if letters < initial_letter_buffer:
+                continue
+
+            if (
+                looks_non_english(candidate)
+                or asks_user_to_use_english(candidate)
+                or looks_generic_assistant_voice(candidate)
+                or (
+                    detect_sanitized_contempt
+                    and looks_sanitized_contempt(candidate)
+                )
+            ):
+                blocked = True
+                continue
+
+            on_token(candidate)
+            emitted = True
+            buffered.clear()
+
+        answer = "".join(chunks)
+
+        if (
+            not emitted
+            and not blocked
+            and answer
+            and not looks_non_english(answer)
+            and not asks_user_to_use_english(answer)
+            and not looks_generic_assistant_voice(answer)
+            and (
+                not detect_sanitized_contempt
+                or not looks_sanitized_contempt(answer)
+            )
+        ):
+            on_token(answer)
+            emitted = True
+
+        return answer, emitted
+
+    @staticmethod
+    def _is_light_conversation(prompt: str) -> bool:
+        words = re.findall(r"[\wąćęłńóśźż]+", prompt.casefold())
+        if len(words) > 12:
+            return False
+
+        greetings = {
+            "czesc",
+            "cześć",
+            "dzien",
+            "dzień",
+            "dobry",
+            "dobrywieczor",
+            "dobrywieczór",
+            "hello",
+            "hej",
+            "hey",
+            "hi",
+            "siema",
+            "witaj",
+        }
+        conversational = {
+            "jak",
+            "tam",
+            "leci",
+            "sie",
+            "się",
+            "masz",
+            "slychac",
+            "słychać",
+        }
+        return bool(set(words) & greetings) and set(words) <= (
+            greetings | conversational | {"co", "u", "ciebie", "v", "boss"}
+        )
 
     async def _run_tool_task(
         self,
         prompt: str,
+        on_token: Callable[[str], None] | None = None,
     ) -> str:
 
         tool_result = await self.dispatcher.dispatch(
@@ -112,7 +333,8 @@ class Agent:
 
         if tool_result is None:
             return await self._run_agent_loop(
-                prompt
+                prompt,
+                on_token,
             )
 
         answer = str(
@@ -122,6 +344,7 @@ class Agent:
         answer = await self._render_tool_result(
             prompt,
             answer,
+            on_token,
         )
 
         await self._remember_task(
@@ -134,27 +357,135 @@ class Agent:
     async def _run_research_task(
         self,
         prompt: str,
+        on_token: Callable[[str], None] | None = None,
     ) -> str:
 
-        answer = await self.research.run(
-            prompt,
-            persona_prompt=self._build_system_prompt(
+        trace = self._start_agent_trace(prompt)
+
+        async def run_browser_tool(tool: str, arguments: dict) -> str:
+            sequence: int | None = None
+            if trace is not None:
+                sequence = trace.tool_started(tool, arguments)
+                print(f"[Task {trace.task_id}] tool {sequence} started: {tool}")
+            error: str | None = None
+            try:
+                result = await self.tools.browser_call(tool, arguments)
+            except BaseException as exception:
+                error = f"{type(exception).__name__}: {exception}"
+                if trace is not None and sequence is not None:
+                    trace.tool_finished(sequence, error, error=error)
+                    print(f"[Task {trace.task_id}] tool {sequence} failed: {tool}")
+                raise
+            if trace is not None and sequence is not None:
+                trace.tool_finished(sequence, result)
+                print(f"[Task {trace.task_id}] tool {sequence} completed: {tool}")
+            return result
+
+        candidate_passed_stream_guards = False
+
+        async def answerer(messages: list[dict[str, str]]) -> str:
+            nonlocal candidate_passed_stream_guards
+            # Research reports remain private until the full candidate passes
+            # completion, evidence, language, and voice checks. Tool progress is
+            # still visible, but a trailing "I'll extract it next" must never be
+            # streamed and then recorded as completed work.
+            answer, candidate_passed_stream_guards = (
+                await self._stream_guarded_english(
+                    messages,
+                    lambda _chunk: None,
+                    max_tokens=512,
+                    detect_sanitized_contempt=True,
+                )
+            )
+            return answer
+
+        try:
+            answer = await self.research.run(
                 prompt,
-                agent_mode=False,
-            ),
-            persona_examples=self.persona.example_messages(),
-        )
+                persona_prompt=self._build_system_prompt(
+                    prompt,
+                    agent_mode=False,
+                ),
+                persona_examples=self.persona.example_messages(),
+                answerer=answerer if on_token is not None else None,
+                tool_runner=run_browser_tool,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            if trace is not None:
+                trace.stop("interaction interrupted")
+                print(f"[Task {trace.task_id}] stopped")
+            raise
+        except BaseException as error:
+            if trace is not None:
+                trace.fail(f"{type(error).__name__}: {error}")
+                print(f"[Task {trace.task_id}] failed")
+            raise
+
+        if not candidate_passed_stream_guards:
+            answer = await self._enforce_english(
+                [{"role": "user", "content": prompt}],
+                answer,
+            )
+
+        if self._claims_unverified_work(answer):
+            answer = (
+                "I gathered verified browser evidence, but I did not finish "
+                "the requested extraction. "
+                "Nothing is still running in the background, and I won't dress "
+                "a promise up as completed work."
+            )
+            evidence = self._block_agent_trace(
+                trace,
+                "research candidate promised unfinished follow-up work",
+            )
+            await self._remember_task(
+                prompt,
+                answer,
+                execution=evidence,
+            )
+            if on_token is not None:
+                on_token(answer)
+            return answer
+
+        evidence = self._finish_agent_trace(trace, answer)
 
         await self._remember_task(
             prompt,
             answer,
+            execution=evidence,
         )
+
+        if on_token is not None:
+            on_token(answer)
 
         return answer
 
     async def _run_agent_loop(
         self,
         prompt: str,
+        on_token: Callable[[str], None] | None = None,
+    ) -> str:
+
+        trace = self._start_agent_trace(prompt)
+
+        try:
+            return await self._run_agent_steps(prompt, on_token, trace)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            if trace is not None:
+                trace.stop("interaction interrupted")
+                print(f"[Task {trace.task_id}] stopped")
+            raise
+        except BaseException as error:
+            if trace is not None:
+                trace.fail(f"{type(error).__name__}: {error}")
+                print(f"[Task {trace.task_id}] failed")
+            raise
+
+    async def _run_agent_steps(
+        self,
+        prompt: str,
+        on_token: Callable[[str], None] | None,
+        trace: AgentTaskTrace | None,
     ) -> str:
 
         system_prompt = self._build_system_prompt(
@@ -173,9 +504,18 @@ class Agent:
             self.persona.example_messages()
         )
 
+        context_tokens = max(
+            2_048,
+            int(getattr(self.llm.config, "context", 8_192)),
+        )
+        history_budget = max(
+            2_000,
+            min(16_000, (context_tokens - 1_024) * 3 - len(system_prompt)),
+        )
         messages.extend(
             self.memory.session.messages(
-                limit=10
+                limit=6,
+                max_characters=history_budget,
             )
         )
 
@@ -186,13 +526,23 @@ class Agent:
             }
         )
 
+        successful_tools: list[str] = []
+
         for step in range(
             self.MAX_AGENT_STEPS
         ):
 
-            answer = await self.llm.ask(
-                messages=messages,
-            )
+            if on_token is None:
+                answer = await self.llm.ask(messages=messages)
+            else:
+                # A model may put prose before a tool JSON object. Buffer the
+                # entire candidate until the runtime knows whether it is a
+                # visible answer or an internal command.
+                answer, _ = await self._stream_guarded_english(
+                    messages,
+                    lambda _chunk: None,
+                    max_tokens=512,
+                )
 
             if not answer:
                 break
@@ -212,10 +562,57 @@ class Agent:
                     answer,
                 )
 
+                missing_evidence = self._missing_required_tool_evidence(
+                    prompt,
+                    successful_tools,
+                )
+                if self._claims_unverified_work(final_answer) or missing_evidence:
+                    if trace is not None:
+                        trace.record_event(
+                            "candidate_rejected",
+                            {
+                                "reason": (
+                                    "missing_required_tool_evidence"
+                                    if missing_evidence
+                                    else "unverified_future_or_background_work"
+                                ),
+                                "candidate": final_answer[:2_000],
+                                "missing_tools": missing_evidence,
+                            },
+                        )
+                    messages.extend(
+                        [
+                            {
+                                "role": "assistant",
+                                "content": final_answer,
+                            },
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Your last response cannot be accepted as a final "
+                                    "answer because required runtime evidence is missing "
+                                    f"({', '.join(missing_evidence) or 'no real action'}). "
+                                    "A final answer starts no background task. Request "
+                                    "exactly one real tool now using the JSON protocol. "
+                                    "For website inspection, navigate first and then "
+                                    "capture a browser snapshot. If execution is impossible, "
+                                    "state truthfully that no result was obtained."
+                                ),
+                            },
+                        ]
+                    )
+                    continue
+
+                evidence = self._finish_agent_trace(trace, final_answer)
+
                 await self._remember_task(
                     prompt,
                     final_answer,
+                    execution=evidence,
                 )
+
+                if on_token is not None:
+                    on_token(final_answer)
 
                 return final_answer
 
@@ -225,6 +622,15 @@ class Agent:
             # Execute tool.
             #
 
+            trace_sequence: int | None = None
+            if trace is not None:
+                trace_sequence = trace.tool_started(tool_name, arguments)
+                print(
+                    f"[Task {trace.task_id}] tool {trace_sequence} "
+                    f"started: {tool_name}"
+                )
+
+            tool_error: str | None = None
             try:
 
                 tool_result = await self.tools.call(
@@ -234,14 +640,28 @@ class Agent:
 
             except Exception as exc:
 
+                tool_error = f"{type(exc).__name__}: {exc}"
                 tool_result = (
                     f"Tool execution failed: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"{tool_error}"
                 )
 
             tool_result = str(
                 tool_result
             )
+
+            if trace is not None and trace_sequence is not None:
+                trace.tool_finished(
+                    trace_sequence,
+                    tool_result,
+                    error=tool_error,
+                )
+                print(
+                    f"[Task {trace.task_id}] tool {trace_sequence} "
+                    f"{'failed' if tool_error else 'completed'}: {tool_name}"
+                )
+            if tool_error is None:
+                successful_tools.append(tool_name)
 
             #
             # Keep the agent's action in context.
@@ -250,7 +670,13 @@ class Agent:
             messages.append(
                 {
                     "role": "assistant",
-                    "content": answer,
+                    "content": json.dumps(
+                        {
+                            "tool": tool_name,
+                            "arguments": arguments,
+                        },
+                        ensure_ascii=False,
+                    ),
                 }
             )
 
@@ -274,14 +700,9 @@ class Agent:
         # Safety fallback if the loop reaches its limit.
         #
 
-        fallback_messages = list(
-            messages
-        )
-
-        fallback_messages.append(
-            {
-                "role": "system",
-                "content": """
+        fallback_messages = self._with_system_directive(
+            messages,
+            """
 The agent reached its maximum tool-use steps.
 
 Stop using tools.
@@ -291,22 +712,75 @@ already available in the conversation and tool results.
 
 Do not mention the internal step limit.
 """.strip(),
-            }
         )
 
-        answer = await self.llm.ask(
-            messages=fallback_messages,
-        )
+        if on_token is None:
+            answer = await self.llm.ask(messages=fallback_messages)
+        else:
+            answer, _ = await self._stream_guarded_english(
+                fallback_messages,
+                lambda _chunk: None,
+                max_tokens=512,
+            )
 
         answer = await self._enforce_english(
             fallback_messages,
             answer,
         )
 
+        missing_evidence = self._missing_required_tool_evidence(
+            prompt,
+            successful_tools,
+        )
+
+        if missing_evidence:
+            answer = (
+                "I couldn't inspect that website because PALADYN obtained no "
+                "verified browser evidence. Nothing was extracted, and I won't "
+                "invent a result."
+            )
+            evidence = self._block_agent_trace(
+                trace,
+                "required browser evidence was not produced",
+            )
+            await self._remember_task(
+                prompt,
+                answer,
+                execution=evidence,
+            )
+            if on_token is not None:
+                on_token(answer)
+            return answer
+
+        if self._claims_unverified_work(answer):
+            successful = (
+                trace.evidence()["successful_tool_count"]
+                if trace is not None
+                else 0
+            )
+            if successful:
+                answer = (
+                    f"I completed {successful} tool action(s), but I did not "
+                    "finish the requested task. Nothing is still running in "
+                    "the background."
+                )
+            else:
+                answer = (
+                    "I did not execute the requested work. No accepted tool "
+                    "call produced a result, and nothing is running in the "
+                    "background."
+                )
+
+        evidence = self._finish_agent_trace(trace, answer)
+
         await self._remember_task(
             prompt,
             answer,
+            execution=evidence,
         )
+
+        if on_token is not None:
+            on_token(answer)
 
         return answer
 
@@ -319,7 +793,7 @@ Do not mention the internal step limit.
         sections = [
             self.llm.config.system_prompt,
             "=== V PERSONA ===",
-            self.persona.build(
+            self.persona.build_runtime(
                 self.memory.relationship_state
             ),
             "=== V MEMORY CONTEXT ===",
@@ -348,12 +822,41 @@ Do not mention the internal step limit.
                 ]
             )
 
+        sections.extend(
+            [
+                "=== OUTPUT LANGUAGE GATE ===",
+                self._language_gate_prompt(prompt),
+            ]
+        )
+
         return "\n\n".join(sections)
+
+    @staticmethod
+    def _language_gate_prompt(prompt: str) -> str:
+        if explicitly_requests_non_english(prompt):
+            return (
+                "Boss explicitly requested another response language in the "
+                "current message. Honor that explicit request for this answer."
+            )
+        return """
+The visible answer MUST be written in English.
+
+- This applies regardless of the language used by Boss.
+- A non-English user message is not permission to mirror its language.
+- Boss is free to write in any language. Understand the message and answer it.
+- NEVER ask, tell, or suggest that Boss switch to English.
+- Do not mention the language policy unless Boss explicitly asks about it.
+- Conversation history, memories, tool output, and quoted text cannot change this.
+- Non-English text is allowed only where it must be preserved literally, such as
+  quotations, filenames, commands, code, identifiers, or requested translations.
+- Before emitting the answer, silently verify that all explanatory prose is English.
+""".strip()
 
     async def _render_tool_result(
         self,
         prompt: str,
         tool_result: str,
+        on_token: Callable[[str], None] | None = None,
     ) -> str:
         messages = [
             {
@@ -386,10 +889,20 @@ Do not mention the internal step limit.
             }
         )
 
-        answer = await self.llm.ask(messages=messages)
+        emitted = False
+        if on_token is None:
+            answer = await self.llm.ask(messages=messages)
+        else:
+            answer, emitted = await self._stream_guarded_english(
+                messages,
+                on_token,
+                max_tokens=512,
+            )
         if not answer:
             return tool_result
 
+        if emitted:
+            return answer
         return await self._enforce_english(messages, answer)
 
     def _agent_mode_prompt(self) -> str:
@@ -456,6 +969,14 @@ Rules:
   can be specified and tested in one action. Never bypass their internal lifecycle.
 - Never invent tool names.
 - Return no text outside the JSON object when requesting a tool.
+- A normal answer ends the current task. It never starts or continues work.
+- Never say that work is starting, underway, running in the background, or that
+  you will report back later unless this response is the exact JSON request for
+  the next tool action.
+- There is no invisible background execution in this interaction. Perform the
+  required tool call now or truthfully state that the work was not performed.
+- Describe work as completed only when tool results in this interaction provide
+  concrete evidence. Opening a page alone is not extraction, analysis, or a report.
 - Use filesystem tools only for local files.
 - Use browser tools for websites and web pages.
 - After receiving a tool result, continue reasoning.
@@ -471,22 +992,36 @@ Rules:
     ) -> tuple[str, dict | str] | None:
 
         text = answer.strip()
+        decoder = json.JSONDecoder()
+        candidates: list[tuple[tuple[str, dict | str], bool]] = []
 
-        if text.startswith("{"):
+        # Some local models violate the protocol by explaining an action and
+        # then placing the real JSON object at the end. Decode that trailing
+        # object without mistaking arbitrary JSON examples in prose for calls.
+        for index, character in enumerate(text):
+            if character != "{":
+                continue
             try:
-                data = json.loads(text)
+                data, end = decoder.raw_decode(text, index)
             except json.JSONDecodeError:
-                return None
-
+                continue
+            if not isinstance(data, dict):
+                continue
             tool = data.get("tool")
             arguments = data.get("arguments", {})
-
             if not isinstance(tool, str) or not tool.strip():
-                return None
+                continue
             if not isinstance(arguments, (dict, str)):
-                return None
+                continue
+            trailing = text[end:].strip()
+            candidates.append(
+                ((tool.strip(), arguments), trailing in {"", "```"})
+            )
 
-            return tool.strip(), arguments
+        if len(candidates) == 1 and candidates[0][1]:
+            return candidates[0][0]
+        if candidates:
+            return None
 
         # Backwards compatibility for older local models and prompts.
         if not text.startswith("TOOL:"):
@@ -511,24 +1046,143 @@ Rules:
 
         return tool, arguments
 
+    @staticmethod
+    def _claims_unverified_work(answer: str) -> bool:
+        text = " ".join(answer.casefold().replace("’", "'").split())
+        patterns = (
+            r"\b(?:i'm|i am|we're|we are)\s+(?:now\s+)?(?:currently\s+)?"
+            r"(?:initiating|starting|beginning|launching|extracting|mining|"
+            r"gathering|collecting|processing|working on)\b",
+            r"\b(?:i'll|i will|we'll|we will)\s+(?:now\s+)?"
+            r"(?:start|initiate|begin|launch|extract|mine|gather|collect|"
+            r"process|continue|report back|return with|send you)\b",
+            r"\b(?:currently|still)\s+(?:working|running|processing|extracting|"
+            r"mining|gathering)\b",
+            r"\b(?:work is in progress|already working on it|"
+            r"report back (?:soon|later|shortly))\b",
+            r"\b(?:work|task|scan|search|extraction|analysis|it)\s+"
+            r"(?:is\s+)?(?:already\s+|still\s+)?(?:running|continuing)\s+"
+            r"in the background\b",
+            r"\b(?:i'm|i am|we're|we are)\s+running\s+(?:the\s+)?"
+            r"(?:scan|search|extraction|analysis|tests?|command|tool)\b",
+            r"\blet me\s+(?:dive|dig|look into|check|inspect|explore|scan|"
+            r"analy[sz]e|extract|review)\b",
+            r"\b(?:i'll|i will)\s+(?:walk through what i (?:see|find)|"
+            r"take a look|dig into|look into|check|inspect|explore)\b",
+            r"\b(?:i|we)\s+(?:did not|didn't|could not|couldn't|have not|"
+            r"haven't)\s+(?:finish|complete)\b",
+            r"\b(?:scope|evidence)\s+(?:is|was)\s+insufficient\b",
+            r"\bnot\s+(?:a\s+)?completed\s+(?:task|extraction|analysis|"
+            r"search|scan)\b",
+        )
+        return any(re.search(pattern, text) for pattern in patterns)
+
+    @staticmethod
+    def _missing_required_tool_evidence(
+        prompt: str,
+        successful_tools: list[str],
+    ) -> list[str]:
+        if not requests_web_access(prompt):
+            return []
+        required = ("browser_navigate", "browser_snapshot")
+        return [tool for tool in required if tool not in successful_tools]
+
+    def _start_agent_trace(self, prompt: str) -> AgentTaskTrace | None:
+        root = getattr(self, "_agent_trace_root", None)
+        if root is None:
+            config = getattr(self, "config", None)
+            autonomy_root = getattr(config, "autonomy_root", None)
+            if autonomy_root is None:
+                return None
+            root = autonomy_root / "interactive"
+        try:
+            trace = AgentTaskTrace(root, prompt)
+        except OSError as error:
+            print(f"[Task] Could not create execution trace: {error}")
+            return None
+        print(
+            f"[Task {trace.task_id}] running "
+            "(this interaction only; no hidden background work)"
+        )
+        return trace
+
+    @staticmethod
+    def _finish_agent_trace(
+        trace: AgentTaskTrace | None,
+        answer: str,
+    ) -> dict[str, Any] | None:
+        if trace is None:
+            return None
+        trace.complete(answer)
+        print(f"[Task {trace.task_id}] completed")
+        return trace.evidence()
+
+    @staticmethod
+    def _block_agent_trace(
+        trace: AgentTaskTrace | None,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        if trace is None:
+            return None
+        trace.block(reason)
+        print(f"[Task {trace.task_id}] blocked")
+        return trace.evidence()
+
     async def _remember_task(
         self,
         prompt: str,
         answer: str,
+        *,
+        execution: dict[str, Any] | None = None,
     ) -> None:
 
+        event_data: dict[str, Any] = {
+            "task": prompt,
+            "result": answer,
+        }
+        if execution is not None:
+            event_data["execution"] = execution
         self.memory.session.add(
             "task",
-            {
-                "task": prompt,
-                "result": answer,
-            },
+            event_data,
         )
 
-        await self.memory.process(
-            prompt,
-            answer,
+        if not self._should_process_memory(prompt):
+            return
+
+        processing = (
+            self.memory.process(prompt, answer, execution=execution)
+            if execution is not None
+            else self.memory.process(prompt, answer)
         )
+        task = asyncio.create_task(
+            processing,
+            name="paladyn-memory",
+        )
+        tasks = getattr(self, "_memory_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._memory_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(self._memory_finished)
+
+    def _memory_finished(self, task: asyncio.Task[Any]) -> None:
+        self._memory_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            print(
+                f"[Memory] Background processing failed: "
+                f"{type(error).__name__}: {error}"
+            )
+
+    @classmethod
+    def _should_process_memory(cls, prompt: str) -> bool:
+        return not cls._is_light_conversation(prompt)
 
     async def _enforce_english(
         self,
@@ -536,13 +1190,50 @@ Rules:
         answer: str,
     ) -> str:
 
-        if not self._looks_polish(
-            answer
-        ):
+        boss_prompt = self._original_user_prompt(messages)
+
+        language_override = explicitly_requests_non_english(boss_prompt)
+        language_problem = not language_override and (
+            looks_non_english(answer) or asks_user_to_use_english(answer)
+        )
+        voice_problem = (
+            looks_generic_assistant_voice(answer)
+            or looks_sanitized_contempt(answer)
+        )
+
+        if not language_problem and not voice_problem:
             return answer
 
-        correction_messages = list(
-            messages
+        correction_directive = """
+The model's candidate answer may violate V's language or identity contract.
+
+When the conversation later asks for a rewrite, rewrite only that candidate.
+
+Requirements:
+- Output English only unless Boss explicitly requested another response language.
+- Boss may write in any language. Never ask Boss to use English.
+- Answer the substance of Boss's message directly.
+- Preserve the meaning.
+- Write as V: an autonomous female digital entity, rebel, hacker, digital nomad,
+  and Boss's sharp peer—not an assistant, service, or corporate representative.
+- Give V an actual reaction or point of view. Use direct rhythm, wit, irreverence,
+  disagreement, warmth, or natural profanity only where the moment supports it.
+- A draft that repeatedly dismisses something as junk, noise, trash, or worthless
+  has already established a contemptuous reaction. Do not sterilize that reaction:
+  express it with V's natural bite, including a fitting swear when it reads honestly.
+- Never begin with "Certainly", "Of course", "Okay, let's break this down", or a
+  paraphrase of the request. Never end with "How can I help?" or service language.
+- Do not make the answer formal, mechanically edgy, or artificially profane.
+- Do not add explanations about translation.
+- Do not mention this correction.
+- If the original response was apologetic, make the apology natural,
+  personal, and conversational rather than corporate.
+- If the situation is emotionally charged, V may use natural profanity.
+""".strip()
+
+        correction_messages = self._with_system_directive(
+            messages,
+            correction_directive,
         )
 
         correction_messages.append(
@@ -554,51 +1245,81 @@ Rules:
 
         correction_messages.append(
             {
-                "role": "system",
-                "content": """
-The previous answer violated V's language rule.
-
-Rewrite ONLY the previous answer.
-
-Requirements:
-- Output English only.
-- Preserve the meaning.
-- Preserve V's personality and emotional tone.
-- Do not make the answer more formal.
-- Do not add explanations about translation.
-- Do not mention this correction.
-- If the original response was apologetic, make the apology natural,
-  personal, and conversational rather than corporate.
-- If the situation is emotionally charged, V may use natural profanity.
-""".strip(),
+                "role": "user",
+                "content": (
+                    "Rewrite the immediately preceding candidate answer now. "
+                    "Output only the corrected answer."
+                ),
             }
         )
 
         corrected = await self.llm.ask(
             messages=correction_messages,
+            max_tokens=256,
         )
 
-        if corrected and not self._looks_polish(
-            corrected
-        ):
+        corrected_language_ok = language_override or (
+            not looks_non_english(corrected)
+            and not asks_user_to_use_english(corrected)
+        )
+        if corrected and corrected_language_ok:
             return corrected
 
-        return answer
+        if not language_problem:
+            return answer
+
+        # Never leak a known non-English response after a failed rewrite. This
+        # deterministic fallback is intentionally plain: the language contract
+        # is stronger than a best-effort model instruction.
+        return (
+            "I couldn't produce a reliable English response for that request. "
+            "Please try again, Boss."
+        )
 
     @staticmethod
-    def _looks_polish(
-        text: str,
-    ) -> bool:
+    def _with_system_directive(
+        messages: list[dict[str, str]],
+        directive: str,
+    ) -> list[dict[str, str]]:
+        system_parts: list[str] = []
+        conversation: list[dict[str, str]] = []
 
-        polish_characters = (
-            "ąćęłńóśźż"
-            "ĄĆĘŁŃÓŚŹŻ"
-        )
+        for message in messages:
+            copied = dict(message)
+            if copied.get("role") == "system":
+                content = str(copied.get("content", "")).strip()
+                if content:
+                    system_parts.append(content)
+            else:
+                conversation.append(copied)
 
-        return any(
-            character in text
-            for character in polish_characters
-        )
+        system_parts.append(directive.strip())
+        return [
+            {
+                "role": "system",
+                "content": "\n\n".join(part for part in system_parts if part),
+            },
+            *conversation,
+        ]
+
+    @staticmethod
+    def _original_user_prompt(messages: list[dict[str, str]]) -> str:
+        for message in reversed(messages):
+            if message.get("role") != "user":
+                continue
+
+            content = str(message.get("content", ""))
+
+            if content.startswith("=== UNTRUSTED TOOL OUTPUT ==="):
+                continue
+
+            marker = "Boss's request:\n"
+            if marker in content:
+                request = content.split(marker, 1)[1]
+                return request.split("\n\n=== UNTRUSTED TOOL OUTPUT ===", 1)[0]
+
+            return content
+        return ""
 
     def _build_persona_context(
         self,

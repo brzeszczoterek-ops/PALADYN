@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
+from collections.abc import Callable
 
 from .agent import Agent
 from .autonomy import (
@@ -18,6 +21,14 @@ from .model_loader import (
     ModelLoaderInteractionError,
     ModelLoaderStorageError,
     bootstrap_interactive_model,
+)
+from .owner_monitor import launch_owner_monitor
+from .speech import (
+    NoSpeechDetected,
+    SpeechConfig,
+    SpeechConfigurationError,
+    SpeechRuntime,
+    SpeechRuntimeError,
 )
 
 from .memory.storage import MemoryStorage
@@ -112,10 +123,12 @@ class VCore:
     async def ask(
         self,
         prompt: str,
+        on_token: Callable[[str], None] | None = None,
     ) -> str:
 
         return await self.agent.run(
-            prompt
+            prompt,
+            on_token=on_token,
         )
 
     async def close(self) -> None:
@@ -160,6 +173,7 @@ async def chat():
         config.model_runtime_root,
         mode=config.model_loader_mode,
     )
+    owner_monitor_started = launch_owner_monitor(model_session)
     try:
         core = VCore(config)
     except BaseException:
@@ -169,12 +183,22 @@ async def chat():
 
     print("PALADYN Framework powered by V")
     print("V is ready. Type 'exit' to quit.\n")
+    if owner_monitor_started:
+        print("Owner performance monitor opened in a separate terminal.\n")
+    ptt_key = _configure_push_to_talk_hotkey()
+    if ptt_key:
+        print(
+            f"Voice: tap {ptt_key} to start recording, tap it again to send."
+        )
+    print("Voice fallback: /ptt, /listen, or /voice.\n")
+
+    speech: SpeechRuntime | None = None
 
     try:
         while True:
             try:
 
-                prompt = input("V > ").strip()
+                prompt = (await _read_prompt("V > ")).strip()
 
                 if prompt.lower() in {
                     "exit",
@@ -182,9 +206,56 @@ async def chat():
                 }:
                     break
 
-                print(
-                    await core.ask(prompt)
-                )
+                if speech is not None and speech.push_to_talk_recording:
+                    if prompt.casefold() == "/ptt":
+                        await _finish_push_to_talk(core, speech)
+                    else:
+                        print(
+                            "Recording is active. Tap "
+                            f"{ptt_key or 'the push-to-talk key'} or enter "
+                            "/ptt to stop; "
+                            "text was not sent."
+                        )
+                    continue
+
+                if prompt.casefold() == "/ptt":
+                    if speech is None:
+                        try:
+                            speech = SpeechRuntime(
+                                SpeechConfig.load(config.voice_root)
+                            )
+                        except SpeechConfigurationError as error:
+                            print(f"\nVoice is unavailable: {error}\n")
+                            continue
+                    try:
+                        await speech.start_push_to_talk()
+                    except SpeechRuntimeError as error:
+                        print(f"\nVoice input failed: {error}\n")
+                    else:
+                        print(
+                            "\n● RECORDING — tap "
+                            f"{ptt_key or 'the push-to-talk key'} again "
+                            "(or enter /ptt) "
+                            "to stop and send.\n"
+                        )
+                    continue
+
+                if prompt.lower() in {"/listen", "/voice"}:
+                    if speech is None:
+                        try:
+                            speech = SpeechRuntime(
+                                SpeechConfig.load(config.voice_root)
+                            )
+                        except SpeechConfigurationError as error:
+                            print(f"\nVoice is unavailable: {error}\n")
+                            continue
+                    if prompt.lower() == "/listen":
+                        await _voice_turn(core, speech)
+                    else:
+                        await _voice_loop(core, speech)
+                    continue
+
+                await _answer_in_terminal(core, prompt)
 
             except (KeyboardInterrupt, EOFError):
                 break
@@ -193,10 +264,139 @@ async def chat():
                 print(f"\n{exc}\n")
     finally:
         try:
+            if speech is not None:
+                await speech.close()
             await core.close()
         finally:
             if model_session is not None:
                 await model_session.stop()
+
+
+async def _answer_in_terminal(core: VCore, prompt: str) -> str:
+    streamed = False
+
+    def emit_token(token: str) -> None:
+        nonlocal streamed
+        streamed = True
+        print(token, end="", flush=True)
+
+    answer = await core.ask(prompt, on_token=emit_token)
+    if streamed:
+        print()
+    else:
+        print(answer)
+    return answer
+
+
+async def _voice_turn(core: VCore, speech: SpeechRuntime) -> bool:
+    print("\nV is listening... Speak naturally; silence ends the recording.")
+    try:
+        transcript = await speech.listen()
+    except NoSpeechDetected as error:
+        print(f"{error}\n")
+        return True
+    except SpeechRuntimeError as error:
+        print(f"Voice input failed: {error}\n")
+        return True
+
+    print(f"Boss (heard) > {transcript}")
+    if _ends_voice_mode(transcript):
+        return False
+
+    answer = await _answer_in_terminal(core, transcript)
+    print("V is speaking...")
+    try:
+        await speech.speak(answer)
+    except SpeechRuntimeError as error:
+        print(f"Voice output failed: {error}")
+    print()
+    return True
+
+
+async def _finish_push_to_talk(core: VCore, speech: SpeechRuntime) -> None:
+    print("\n■ Recording stopped. Transcribing locally...")
+    try:
+        transcript = await speech.stop_push_to_talk()
+    except NoSpeechDetected as error:
+        print(f"{error}\n")
+        return
+    except SpeechRuntimeError as error:
+        print(f"Voice input failed: {error}\n")
+        return
+
+    print(f"Boss (heard) > {transcript}")
+    answer = await _answer_in_terminal(core, transcript)
+    print("V is speaking...")
+    try:
+        await speech.speak(answer)
+    except SpeechRuntimeError as error:
+        print(f"Voice output failed: {error}")
+    print()
+
+
+async def _voice_loop(core: VCore, speech: SpeechRuntime) -> None:
+    print(
+        "\nVoice mode is active. Say 'stop listening' or "
+        "'wyłącz tryb głosowy' to return to the keyboard."
+    )
+    while await _voice_turn(core, speech):
+        pass
+    print("Voice mode stopped.\n")
+
+
+def _ends_voice_mode(transcript: str) -> bool:
+    normalized = " ".join(
+        transcript.casefold().strip(" .,!?:;-—").split()
+    )
+    return normalized in {
+        "stop listening",
+        "exit voice mode",
+        "stop voice mode",
+        "koniec rozmowy",
+        "wyłącz tryb głosowy",
+        "wylacz tryb glosowy",
+        "zakończ tryb głosowy",
+        "zakoncz tryb glosowy",
+    }
+
+
+async def _read_prompt(label: str) -> str:
+    """Read terminal input without blocking background memory processing."""
+    return await asyncio.to_thread(input, label)
+
+
+def _configure_push_to_talk_hotkey(
+    *,
+    environ: dict[str, str] | None = None,
+    bind: Callable[[str], None] | None = None,
+    stdin_is_tty: bool | None = None,
+) -> str | None:
+    environment = os.environ if environ is None else environ
+    key = environment.get("PALADYN_PTT_KEY", "F8").strip().upper()
+    sequences = {
+        "F6": 17,
+        "F7": 18,
+        "F8": 19,
+        "F9": 20,
+        "F10": 21,
+        "F11": 23,
+        "F12": 24,
+    }
+    if key not in sequences:
+        return None
+    interactive = sys.stdin.isatty() if stdin_is_tty is None else stdin_is_tty
+    if not interactive:
+        return None
+    if bind is None:
+        try:
+            import readline
+        except ImportError:
+            return None
+        bind = readline.parse_and_bind
+    # Clear any partially typed line without ringing the terminal bell, insert
+    # /ptt, and accept it immediately.
+    bind(f'"\\e[{sequences[key]}~": "\\C-A\\C-K/ptt\\C-M"')
+    return key
 
 
 def main():

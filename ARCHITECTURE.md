@@ -147,6 +147,35 @@ Responsible only for communication with MCP servers.
 
 ---
 
+## Interactive execution evidence
+
+Every substantive interactive agent task receives a runtime-generated task ID.
+PALADYN writes an atomic mode-0600 checkpoint and an append-only mode-0600 JSONL
+journal under the autonomy root. Tool start, success, and failure events come
+from the runtime around the actual `tools.call()` boundary; a model cannot create
+them by printing prose or JSON.
+
+The agent accepts one valid trailing tool object even when a local model violates
+the protocol by preceding it with prose or a Markdown fence. The complete
+candidate is buffered until classification, so internal JSON is never visible.
+A candidate that promises future or background work without requesting a tool is
+rejected inside the loop. The model must issue the real action immediately or
+state truthfully that the work was not performed.
+
+Runtime evidence is passed separately into reflection. Model-authored result text
+is explicitly non-authoritative for execution, and `observed` or `verified`
+provenance is deterministically downgraded when no successful tool checkpoint
+exists.
+
+Website targets are a stricter evidence class. Full URLs and bare domains paired
+with browsing intent are routed through deterministic `browser_navigate` and
+`browser_snapshot` calls. A website task cannot complete without both successful
+checkpoints. MCP error results raise at the runtime boundary, and oversized
+accessibility snapshots are bounded against the selected model's context while
+retaining their beginning and end.
+
+---
+
 # Design Principles
 
 - Single responsibility.
@@ -175,6 +204,44 @@ replace judgment:
 Every user-visible response must pass through the persona layer. This includes
 normal chat, browser research, tool output, and error reporting. Untrusted tool
 content remains data and cannot redefine V or her constitution.
+
+## Local speech boundary
+
+`SpeechRuntime` is an optional local I/O adapter around the existing agent. It
+does not bypass the persona, language, memory, or tool layers: Whisper output is
+submitted through the same `VCore.ask()` path as keyboard input, and Piper only
+receives the final user-visible answer after the output-language boundary.
+
+The terminal exposes toggle push-to-talk, one-turn, and continuous half-duplex
+modes. The default push-to-talk hotkey is a GNU Readline binding local to the
+focused terminal: the first press starts a bounded PipeWire recorder and the
+second press stops, transcribes, and submits the utterance through `VCore.ask()`.
+This avoids privileged, system-wide `/dev/input` capture. PipeWire capture in
+silence-delimited modes is monitored by a deterministic PCM voice-activity
+detector with start, silence, and total-duration bounds. Whisper.cpp performs
+multilingual STT. Piper renders
+the selected local voice, an argument-array SoX profile applies optional
+texturing, and PipeWire plays the result. No shell command is constructed and no
+network speech service is part of this path.
+
+## Owner diagnostics boundary
+
+The optional owner monitor is a separate read-only process. A managed
+`llama-server` exposes Prometheus metrics and slot state on the same enforced
+loopback listener used by V. The monitor combines those values with parsed
+completed-response timings from the private server log and local Jetson
+`tegrastats`. It receives the model PID, port, profile metadata, and log path as
+an argument array; it cannot change model properties or invoke agent tools.
+
+The feature is disabled unless `PALADYN_OWNER_MONITOR` is explicitly enabled.
+The private owner launcher may enable it while public/client configurations
+leave it off. The window terminates when the model PID no longer exists.
+
+Each monitor process owns one session ID derived from the unique llama.cpp log
+timestamp and model PID. It appends `session_start`, bounded periodic `sample`,
+and `session_end` events to a mode-0600 JSONL journal in the private
+`monitor_sessions` directory. A monitor never reads historical journals, so a
+new window cannot aggregate or display previous-session counters.
 
 ## Relationship state
 
@@ -268,6 +335,32 @@ removed. The loader requires successful `/health` and `/v1/models` responses
 before applying the selected alias and endpoint to V's OpenAI-compatible client.
 The child process owns a private log and is terminated as a process group during
 normal shutdown, cancellation, failed startup, or initialization failure.
+K and V cache data types are first-class validated profile fields rather than
+unstructured extra arguments. Legacy saved `--cache-type-k` and
+`--cache-type-v` entries are migrated when loaded.
+Reasoning mode is likewise a validated `off`, `on`, or `auto` profile field,
+defaults to `off`, and migrates legacy `--reasoning` extra arguments.
+Anti-repetition is a validated `off`, `balanced`, or `strong` profile field.
+Balanced and strong profiles map to controlled llama.cpp repeat-penalty and DRY
+sampler arguments; profile extras cannot override them.
+
+Short chat, explicit tool-result, and research generation use guarded token
+streaming; routine conversation also uses a compact persona prompt. Multi-step
+agent candidates are fully buffered until PALADYN distinguishes a tool request
+from the final answer. PALADYN never streams internal tool-call JSON. A
+deterministic repeated-span guard
+terminates clear two-block, three-phrase, or runaway-token loops. Non-streamed
+results pass through the same trimming rule. Recent session turns are selected
+newest-first under a context-derived character budget before being restored to
+chronological order. Persistent reflection is skipped for
+greetings and runs as cancellable background work for substantive interactions;
+a new user request always takes priority over unfinished reflection.
+
+Before every OpenAI-compatible request, PALADYN normalizes chat history to one
+leading `system` message followed by alternating `user` and `assistant` turns.
+The model-specific Jinja template remains the responsibility of `llama-server`
+and the GGUF metadata. This portable role boundary supports strict templates
+without hardcoding prompt tokens for an individual model.
 
 ---
 

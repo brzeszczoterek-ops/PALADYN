@@ -4,6 +4,7 @@ from .control import (
     PanicRequested,
     StopRequested,
 )
+from .agent_trace import AgentTaskTrace
 from .hotkey import ChordDetector, LinuxHotkeyWatcher, input_devices, parse_chord
 from .journal import CheckpointStore, TaskJournal
 from .models import (
@@ -21,6 +22,7 @@ from .runner import AutonomousRunner, StepDriver
 from .runtime import RuntimeRegistry
 
 __all__ = [
+    "AgentTaskTrace",
     "AuthorizationEnvelope",
     "AuthorizationDenied",
     "AuthorizationGuard",

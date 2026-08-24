@@ -200,6 +200,41 @@ def edit_profile(
         profile.flash_attention,
         {"auto", "on", "off"},
     )
+    values["reasoning"] = _prompt_choice(
+        input_fn,
+        "Reasoning mode",
+        profile.reasoning,
+        {"auto", "on", "off"},
+    )
+    values["anti_repetition"] = _prompt_choice(
+        input_fn,
+        "Anti-repetition",
+        profile.anti_repetition,
+        {"off", "balanced", "strong"},
+    )
+    kv_cache_types = {
+        "f32",
+        "f16",
+        "bf16",
+        "q8_0",
+        "q5_0",
+        "q5_1",
+        "q4_0",
+        "q4_1",
+        "iq4_nl",
+    }
+    values["cache_type_k"] = _prompt_choice(
+        input_fn,
+        "KV cache K type",
+        profile.cache_type_k,
+        kv_cache_types,
+    )
+    values["cache_type_v"] = _prompt_choice(
+        input_fn,
+        "KV cache V type",
+        profile.cache_type_v,
+        kv_cache_types,
+    )
     values["temperature"] = _prompt_float(
         input_fn, "Temperature", profile.temperature, 0.0, 5.0
     )
@@ -237,6 +272,10 @@ def render_profile(profile: ModelProfile) -> str:
         f"threads={profile.threads or 'auto'}\n"
         f"  batch={profile.batch_size}, ubatch={profile.ubatch_size}, "
         f"parallel={profile.parallel}, flash_attn={profile.flash_attention}\n"
+        f"  reasoning={profile.reasoning}, "
+        f"anti_repetition={profile.anti_repetition}\n"
+        f"  kv_cache_k={profile.cache_type_k}, "
+        f"kv_cache_v={profile.cache_type_v}\n"
         f"  temperature={profile.temperature:g}, top_p={profile.top_p:g}, "
         f"port={profile.port}\n"
         f"  extra_args={shlex.join(profile.extra_args) or '(none)'}"

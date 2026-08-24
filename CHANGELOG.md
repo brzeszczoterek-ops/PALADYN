@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### Added
+- Bare website domains such as `onehack.st` are normalized to HTTPS and routed
+  through deterministic browser navigation plus snapshot capture
+- Private per-interaction agent checkpoints and append-only JSONL journals with
+  runtime-authored tool arguments, result excerpts, and SHA-256 evidence
 - Evidence-driven learning store with provenance-bearing task outcomes
 - Candidate and validated lesson lifecycle with independent-evidence thresholds
 - Immutable generated-tool and generated-skill bundles in quarantine
@@ -18,10 +22,78 @@
 - Interactive local GGUF discovery and persistent llama.cpp launch profiles
 - Managed `llama-server` startup, health/model verification, private logs, and
   process-group shutdown before and after V's runtime
+- Guarded token streaming and a compact prompt for short conversation
+- First-class K and V cache quantization in local model profiles
+- First-class `off`, `on`, and `auto` reasoning mode, defaulting to `off`
+- Per-model `off`, `balanced`, and `strong` anti-repetition profiles backed by
+  llama.cpp repeat penalties and DRY sampling
+- Fully local half-duplex voice conversation with PipeWire capture/playback,
+  multilingual Whisper.cpp STT, Piper TTS, and configurable SoX texturing
+- Full-quality Kokoro ONNX TTS with the British Emma voice, an isolated local
+  runtime, persistent chunk-producing worker, and automatic Piper fallback
+- CUDA-accelerated multilingual Whisper Large V3 Turbo Q5 STT with configurable
+  source language, thread count, vocabulary prompt, and same-model CPU fallback
+- `/listen` one-turn speech and `/voice` continuous conversation modes
+- Terminal-local toggle push-to-talk: tap F8 to record and tap it again to
+  transcribe and send, with `/ptt` as a typed fallback
+- Bounded PCM silence detection and spoken Polish/English voice-mode exit phrases
+- Owner-only model performance terminal with llama.cpp metrics, slot/context
+  state, exact completed-response timings, and Jetson hardware telemetry
+- Managed llama.cpp metrics and slots exposed only through the enforced
+  loopback listener
+- Private per-session JSONL monitor journals with start/sample/end events and no
+  cross-session aggregation in the live owner window
+- Bounded multi-page website extraction that inspects up to three ranked internal
+  detail pages after the entry-page snapshot
 
 ### Fixed
+- Tool requests remain executable when a local model incorrectly puts prose or a
+  Markdown fence before one trailing JSON action
+- Model promises such as "I'm starting" or "running in the background" cannot end
+  an interaction as if work had begun; V must request a real tool or report no work
+- Internal tool protocol is buffered until classification and never leaks into the
+  visible agent answer
+- Interrupted and crashed interactive tasks persist `stopped` or `failed` instead
+  of leaving a misleading `running` checkpoint
+- Reflection can no longer classify model-authored action text as observed or
+  verified without a matching successful runtime checkpoint
+- Website inspection cannot complete without successful `browser_navigate` and
+  `browser_snapshot` evidence; missing evidence produces a blocked truthful result
+- MCP results marked as errors are no longer counted as successful tool execution
+- Browser snapshots are bounded against the active local model context instead of
+  silently displacing the persona or evidence prompt
+- Whole-site claims from a one-page browser snapshot are discarded and replaced
+  with a runtime-grounded list of exact visible link labels and URLs
+- Navigation controls, search buttons, sidebars, and user dialogs cannot be
+  misreported as tools or skills extracted from a website
 - Unverified task completion can no longer be treated as successful learning
 - Task-scoped generated capabilities cannot leak into another workspace
+- English is now enforced at the output boundary for chat, tool, and research
+  responses unless Boss explicitly requests another language
+- V no longer asks Boss to switch input to English; Boss may write in any language
+- Chat histories are normalized for strict GGUF templates that require a single
+  leading system message and alternating conversation roles
+- Visible replies no longer wait for the multi-stage persistent-memory pipeline
+- Routine greetings no longer trigger expensive reflection and consolidation
+- Short casual conversation now carries an explicit V voice anchor so local
+  models do not drift into sanitized assistant phrasing
+- V's informal register rejects both canned service tone and mechanical profanity;
+  edge comes from point of view, rhythm, irreverence, and genuine reactions
+- A compact rebel/hacker/direct-action core anchor now precedes the detailed persona
+  so smaller and differently tuned local models retain V's identity more reliably
+- V is anchored as an autonomous digital entity rather than an assistant role;
+  model and runtime are truthfully described as substrate, not identity
+- Clear repeated-generation loops are stopped in streamed and non-streamed output
+- Session history is bounded against the active model context instead of growing
+  until llama.cpp truncates the prompt
+- The full persona specification is compiled into a compact runtime contract so
+  V's entity identity and voice no longer drown in thousands of redundant tokens
+- Generic assistant openings and service-language closings are held back and
+  rewritten through a concentrated V identity gate before becoming visible
+- Research promises and explicitly unfinished reports are blocked before they can
+  be streamed or checkpointed as completed work
+- Unsupported extraction metrics and concrete capability claims trigger a
+  deterministic report built from verified page records instead of model prose
 
 ## 1.5.0 - 2026-08-23
 

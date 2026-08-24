@@ -89,6 +89,10 @@ def profile_for(model: Path, *, port: int | None = None) -> ModelProfile:
         ubatch_size=128,
         parallel=2,
         flash_attention="on",
+        reasoning="off",
+        anti_repetition="balanced",
+        cache_type_k="q8_0",
+        cache_type_v="q4_0",
         temperature=0.3,
         top_p=0.9,
         startup_timeout_seconds=5,
@@ -129,6 +133,56 @@ def test_profile_rejects_boundary_overrides(tmp_path: Path) -> None:
             batch_size=16,
             ubatch_size=32,
         )
+    with pytest.raises(ValueError, match="cache_type_k"):
+        ModelProfile(
+            model_path=str(model),
+            alias="test",
+            cache_type_k="q2_bogus",
+        )
+    with pytest.raises(ValueError, match="reasoning"):
+        ModelProfile(
+            model_path=str(model),
+            alias="test",
+            reasoning="sometimes",
+        )
+    with pytest.raises(ValueError, match="anti_repetition"):
+        ModelProfile(
+            model_path=str(model),
+            alias="test",
+            anti_repetition="maximum",
+        )
+    with pytest.raises(ValueError, match="loader boundary"):
+        ModelProfile(
+            model_path=str(model),
+            alias="test",
+            extra_args=("--cache-type-v", "q4_0"),
+        )
+
+
+def test_old_extra_kv_cache_arguments_migrate_to_profile_fields(
+    tmp_path: Path,
+) -> None:
+    model = model_file(tmp_path / "model.gguf")
+    profile = ModelProfile.from_dict(
+        {
+            "model_path": str(model),
+            "alias": "test",
+            "extra_args": [
+                "--poll",
+                "100",
+                "--cache-type-k",
+                "q8_0",
+                "--cache-type-v=q4_0",
+                "--reasoning",
+                "off",
+            ],
+        }
+    )
+
+    assert profile.cache_type_k == "q8_0"
+    assert profile.cache_type_v == "q4_0"
+    assert profile.reasoning == "off"
+    assert profile.extra_args == ("--poll", "100")
 
 
 def test_loader_state_round_trips_atomically_with_private_permissions(
@@ -161,8 +215,21 @@ def test_server_command_is_argument_array_with_enforced_local_boundary(
 
     assert command[0] == "/usr/bin/true"
     assert command[command.index("--model") + 1] == str(model.resolve())
-    assert command[-4:] == ("--offline", "--no-webui", "--host", "127.0.0.1")
+    assert command[-6:] == (
+        "--metrics",
+        "--slots",
+        "--offline",
+        "--no-webui",
+        "--host",
+        "127.0.0.1",
+    )
     assert "--mlock" in command
+    assert command[command.index("--cache-type-k") + 1] == "q8_0"
+    assert command[command.index("--cache-type-v") + 1] == "q4_0"
+    assert command[command.index("--reasoning") + 1] == "off"
+    assert command[command.index("--repeat-last-n") + 1] == "256"
+    assert command[command.index("--repeat-penalty") + 1] == "1.08"
+    assert command[command.index("--dry-multiplier") + 1] == "0.8"
 
 
 def test_find_llama_server_honors_explicit_executable(tmp_path: Path) -> None:

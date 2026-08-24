@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from .session import Session
 from .reflection import Reflection
 from .experience import Experience
@@ -44,14 +46,20 @@ class MemoryEngine:
         self,
         task: str,
         result: str,
+        *,
+        execution: dict[str, Any] | None = None,
     ):
 
         try:
 
-            reflection = await self.reflection.reflect(
-                task,
-                result,
-            )
+            if execution is None:
+                reflection = await self.reflection.reflect(task, result)
+            else:
+                reflection = await self.reflection.reflect(
+                    task,
+                    result,
+                    execution=execution,
+                )
 
             self.manager.remember(
                 "reflections",

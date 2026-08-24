@@ -19,6 +19,8 @@ class Config:
 
     autonomy_root: Path
 
+    voice_root: Path
+
     evm_profile: str
 
     learning_profile: str
@@ -72,6 +74,12 @@ def load_config() -> Config:
         autonomy_root = project_root / autonomy_root
     autonomy_root.mkdir(parents=True, exist_ok=True)
 
+    voice_root_value = os.getenv("PALADYN_VOICE_ROOT", "voice")
+    voice_root = Path(voice_root_value).expanduser()
+    if not voice_root.is_absolute():
+        voice_root = project_root / voice_root
+    voice_root.mkdir(parents=True, exist_ok=True)
+
     evm_profile = os.getenv("PALADYN_EVM_PROFILE", "owner_lab").strip().lower()
     if evm_profile not in {"client", "owner_lab"}:
         raise ValueError("PALADYN_EVM_PROFILE must be 'client' or 'owner_lab'")
@@ -102,6 +110,8 @@ def load_config() -> Config:
         model_runtime_root=model_runtime_root,
 
         autonomy_root=autonomy_root,
+
+        voice_root=voice_root,
 
         evm_profile=evm_profile,
 

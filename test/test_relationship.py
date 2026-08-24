@@ -30,7 +30,7 @@ class LLMStub:
         self.response = response
         self.prompts: list[str] = []
 
-    async def ask(self, prompt: str) -> str:
+    async def ask(self, prompt: str, **kwargs) -> str:
         self.prompts.append(prompt)
         return self.response
 

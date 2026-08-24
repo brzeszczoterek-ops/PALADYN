@@ -80,8 +80,6 @@ def build_server_command(binary: Path, profile: ModelProfile) -> tuple[str, ...]
         str(model),
         "--alias",
         profile.alias,
-        "--host",
-        "127.0.0.1",
         "--port",
         str(profile.port),
         "--ctx-size",
@@ -96,13 +94,60 @@ def build_server_command(binary: Path, profile: ModelProfile) -> tuple[str, ...]
         str(profile.parallel),
         "--flash-attn",
         profile.flash_attention,
+        "--reasoning",
+        profile.reasoning,
+        "--cache-type-k",
+        profile.cache_type_k,
+        "--cache-type-v",
+        profile.cache_type_v,
     ]
+    anti_repetition = {
+        "off": (),
+        "balanced": (
+            "--repeat-last-n",
+            "256",
+            "--repeat-penalty",
+            "1.08",
+            "--dry-multiplier",
+            "0.8",
+            "--dry-base",
+            "1.75",
+            "--dry-allowed-length",
+            "2",
+            "--dry-penalty-last-n",
+            "2048",
+        ),
+        "strong": (
+            "--repeat-last-n",
+            "512",
+            "--repeat-penalty",
+            "1.12",
+            "--dry-multiplier",
+            "1.1",
+            "--dry-base",
+            "1.75",
+            "--dry-allowed-length",
+            "2",
+            "--dry-penalty-last-n",
+            "4096",
+        ),
+    }[profile.anti_repetition]
+    command.extend(anti_repetition)
     if profile.threads:
         command.extend(("--threads", str(profile.threads)))
     command.extend(profile.extra_args)
     # Enforced arguments are deliberately last so a profile cannot enable
     # downloads, llama.cpp's own filesystem tools, or a public listener.
-    command.extend(("--offline", "--no-webui", "--host", "127.0.0.1"))
+    command.extend(
+        (
+            "--metrics",
+            "--slots",
+            "--offline",
+            "--no-webui",
+            "--host",
+            "127.0.0.1",
+        )
+    )
     return tuple(command)
 
 

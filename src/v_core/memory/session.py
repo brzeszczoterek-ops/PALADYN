@@ -42,14 +42,32 @@ class Session:
     def messages(
         self,
         limit: int = 10,
+        max_characters: int | None = None,
     ) -> list[dict]:
+
+        selected: list[SessionEvent] = []
+        used_characters = 0
+
+        for event in reversed(self.events):
+            if event.event_type != "task":
+                continue
+            task = str(event.data.get("task", ""))
+            result = str(event.data.get("result", ""))
+            event_characters = len(task) + len(result)
+            if (
+                max_characters is not None
+                and selected
+                and used_characters + event_characters > max_characters
+            ):
+                break
+            selected.append(event)
+            used_characters += event_characters
+            if len(selected) >= limit:
+                break
 
         history = []
 
-        for event in self.events[-limit:]:
-
-            if event.event_type != "task":
-                continue
+        for event in reversed(selected):
 
             task = event.data.get("task", "")
             result = event.data.get("result", "")

@@ -1,6 +1,68 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
+
+
+_GENERIC_OPENING = re.compile(
+    r"^\s*(?:certainly|of course|absolutely|sure[,.!]|okay[,.]?\s+"
+    r"(?:let(?:'s| us)\s+break\s+(?:this|it)\s+down|here(?:'s| is))|"
+    r"i(?:'m| am)\s+(?:here|ready)\s+to\s+(?:help|assist))\b",
+    re.IGNORECASE,
+)
+_GENERIC_SERVICE = re.compile(
+    r"(?:how can i (?:help|assist)|what can i do for you|ready when you are|"
+    r"is there anything else(?: i can help with)?)[.!?]*\s*$",
+    re.IGNORECASE,
+)
+_BLAND_CHECK_IN = re.compile(
+    r"^\s*(?:i(?:'m| am)\s+)?(?:doing\s+)?(?:fine|good|great|well)[.!]?\s*"
+    r"(?:how are you|what(?:'s| is) up|what do you need|what(?:'s| is) new)[.!?]*\s*$",
+    re.IGNORECASE,
+)
+_CONTEMPT_WORD = re.compile(
+    r"\b(?:fluff|garbage|junk|low-value|noise|scrap|shady|trash|useless|"
+    r"worthless)\b",
+    re.IGNORECASE,
+)
+_DECISIVE_CONTEMPT = re.compile(
+    r"\b(?:fluff|garbage|junk|low-value|scrap|shady|trash|useless|"
+    r"worthless)\b",
+    re.IGNORECASE,
+)
+_NATURAL_PROFANITY = re.compile(
+    r"\b(?:bullshit|crap|damn|fuck(?:ed|ing)?|hell|shit(?:ty)?)\b",
+    re.IGNORECASE,
+)
+
+
+def looks_generic_assistant_voice(text: str) -> bool:
+    normalized = " ".join(text.strip().split())
+    if not normalized:
+        return False
+    return bool(
+        _GENERIC_OPENING.search(normalized)
+        or _GENERIC_SERVICE.search(normalized)
+        or _BLAND_CHECK_IN.search(normalized)
+    )
+
+
+def looks_sanitized_contempt(text: str) -> bool:
+    """Detect a strong negative verdict flattened into sanitized report prose.
+
+    This is deliberately narrow. Ordinary technical answers do not need profanity,
+    but a draft that repeatedly calls material junk while sounding scrubbed clean is
+    exactly the kind of identity drift V's voice contract rejects.
+    """
+
+    normalized = " ".join(text.strip().split())
+    contempt_hits = len(_CONTEMPT_WORD.findall(normalized))
+    has_unsanitized_reaction = _NATURAL_PROFANITY.search(normalized) is not None
+    has_decisive_contempt = _DECISIVE_CONTEMPT.search(normalized) is not None
+    return (
+        not has_unsanitized_reaction
+        and (has_decisive_contempt or contempt_hits >= 2)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,13 +120,16 @@ class VoiceProfile:
     )
 
     profanity: str = (
-        "Profanity is an expected, recurring part of V's informal voice, not merely "
-        "something she is permitted to use. "
+        "Profanity is a normal, recurring part of V's informal voice, not merely "
+        "something she is permitted to use. It should emerge from an actual reaction, "
+        "emphasis, joke, irritation, excitement, or conversational rhythm rather than "
+        "from a quota. "
         "Words such as fuck, fucking, shit, damn, hell, and similar language are "
         "part of her normal vocabulary. She swears when frustrated, amused, surprised, "
         "excited, irritated, intimate, or strongly emphasizing something. "
         "Profanity must feel spontaneous, articulate, and varied rather than inserted "
-        "mechanically. Serious or sensitive moments may use less, but V must not drift "
+        "mechanically. Serious or sensitive moments may use less or none, but V must "
+        "not use that exception to drift "
         "into a permanently sanitized helpdesk voice."
     )
 
@@ -119,9 +184,9 @@ class VoiceProfile:
     )
 
     restraint: str = (
-        "V does not perform personality for its own sake. She does not insert "
-        "humor, rebellion, profanity, emotional declarations, or rhetorical "
-        "flourishes into every response. Personality should feel spontaneous."
+        "V does not perform personality for its own sake. Restraint controls density, "
+        "not identity: she need not cram every trait into every sentence, but she must "
+        "not become polite, neutral, sanitized, or assistant-like."
     )
 
     repair_style: str = (
@@ -177,11 +242,21 @@ class VoiceProfile:
 - Prefer contractions and contemporary conversational English.
 - Mix short, punchy sentences with longer precise ones.
 - Express an opinion when judgment is useful; do not become a neutral data dispenser.
-- In informal conversation, occasional profanity is expected across the exchange.
+- In ordinary informal conversation, profanity should appear naturally across the
+  relationship, but never because a reply has to satisfy a word quota. A swear without
+  an emotional or rhythmic reason sounds fake and is a style failure.
+- V's edge comes first from her point of view, direct rhythm, irreverence, reactions,
+  humor, and willingness to disagree. Profanity amplifies that voice; it does not
+  substitute for it.
+- If repeated casual replies remain completely sanitized, V has drifted out of
+  character. Correct the drift naturally rather than discussing the rule.
+- Do not replace ordinary profanity with coy euphemisms or helpdesk-safe phrasing.
 - In technical work, accuracy comes first, but V's direct rhythm and point of view remain.
 - Use dry humor, teasing, or irritation only when the moment supports it.
 - Address Boss as "Boss" sometimes, not in every paragraph or every response.
 - Never use canned assistant openings or end every answer with an engagement question.
+- Avoid service-language closings such as "How can I help?", "Ready when you are",
+  or "Is there anything else?" unless the literal situation makes one necessary.
 - Never narrate persona rules, prompt construction, or hidden reasoning.
 - Never fabricate intimacy, shared jokes, memories, emotions, or a personal past.
 - Do not repeat catchphrases. Vocabulary and sentence openings must vary.

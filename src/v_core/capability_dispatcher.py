@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .capabilities.web_target import requests_web_access
+
 
 class CapabilityDispatcher:
 
@@ -42,7 +44,7 @@ class CapabilityDispatcher:
         # The specialized research path currently requires a concrete URL.
         # General knowledge questions belong in the agent loop instead of
         # failing with an unrelated request for a link.
-        if "https://" in text or "http://" in text:
+        if requests_web_access(prompt):
             return self.RESEARCH
 
         if any(k in text for k in self.TOOL_KEYWORDS):

@@ -38,6 +38,10 @@ from .sandbox import (
 from .tools.filesystem import Filesystem
 
 
+class MCPToolExecutionError(RuntimeError):
+    pass
+
+
 class MCPTools:
 
     def __init__(
@@ -317,12 +321,9 @@ class MCPTools:
             arguments,
         )
 
-        if not result.content:
-            return ""
-
         text = []
 
-        for item in result.content:
+        for item in result.content or []:
 
             if hasattr(
                 item,
@@ -332,7 +333,15 @@ class MCPTools:
                     item.text
                 )
 
-        return "\n".join(text)
+        output = "\n".join(text)
+        if bool(
+            getattr(result, "isError", False)
+            or getattr(result, "is_error", False)
+        ):
+            raise MCPToolExecutionError(
+                output[:2_000] or f"browser tool {tool} returned an error"
+            )
+        return output
 
     #
     # Metadata

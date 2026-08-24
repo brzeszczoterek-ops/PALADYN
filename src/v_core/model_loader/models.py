@@ -9,6 +9,19 @@ from typing import Any
 _ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _GPU_LAYERS = re.compile(r"^(auto|all|[0-9]{1,4})$")
 _FLASH_ATTENTION = {"auto", "on", "off"}
+_REASONING = {"auto", "on", "off"}
+_ANTI_REPETITION = {"off", "balanced", "strong"}
+_KV_CACHE_TYPES = {
+    "f32",
+    "f16",
+    "bf16",
+    "q8_0",
+    "q5_0",
+    "q5_1",
+    "q4_0",
+    "q4_1",
+    "iq4_nl",
+}
 _BLOCKED_EXTRA_FLAGS = {
     "-m",
     "-mu",
@@ -27,6 +40,21 @@ _BLOCKED_EXTRA_FLAGS = {
     "--models-preset",
     "--tools",
     "--webui",
+    "-ctk",
+    "-ctv",
+    "--cache-type-k",
+    "--cache-type-v",
+    "--reasoning",
+    "--repeat-last-n",
+    "--repeat-penalty",
+    "--dry-multiplier",
+    "--dry-base",
+    "--dry-allowed-length",
+    "--dry-penalty-last-n",
+    "--metrics",
+    "--no-metrics",
+    "--slots",
+    "--no-slots",
 }
 
 
@@ -64,6 +92,10 @@ class ModelProfile:
     ubatch_size: int = 512
     parallel: int = 1
     flash_attention: str = "auto"
+    reasoning: str = "off"
+    anti_repetition: str = "balanced"
+    cache_type_k: str = "q8_0"
+    cache_type_v: str = "q8_0"
     temperature: float = 0.2
     top_p: float = 0.95
     startup_timeout_seconds: float = 600.0
@@ -75,6 +107,10 @@ class ModelProfile:
         alias = self.alias.strip()
         gpu_layers = str(self.gpu_layers).strip().casefold()
         flash_attention = self.flash_attention.strip().casefold()
+        reasoning = self.reasoning.strip().casefold()
+        anti_repetition = self.anti_repetition.strip().casefold()
+        cache_type_k = self.cache_type_k.strip().casefold()
+        cache_type_v = self.cache_type_v.strip().casefold()
         if not _ALIAS.fullmatch(alias):
             raise ValueError("model alias contains unsupported characters")
         if not _GPU_LAYERS.fullmatch(gpu_layers):
@@ -91,6 +127,14 @@ class ModelProfile:
             raise ValueError("parallel is outside the supported range")
         if flash_attention not in _FLASH_ATTENTION:
             raise ValueError("flash_attention must be auto, on, or off")
+        if reasoning not in _REASONING:
+            raise ValueError("reasoning must be auto, on, or off")
+        if anti_repetition not in _ANTI_REPETITION:
+            raise ValueError("anti_repetition must be off, balanced, or strong")
+        if cache_type_k not in _KV_CACHE_TYPES:
+            raise ValueError("cache_type_k is not supported")
+        if cache_type_v not in _KV_CACHE_TYPES:
+            raise ValueError("cache_type_v is not supported")
         if not 0.0 <= float(self.temperature) <= 5.0:
             raise ValueError("temperature must be between 0 and 5")
         if not 0.0 < float(self.top_p) <= 1.0:
@@ -117,6 +161,10 @@ class ModelProfile:
         object.__setattr__(self, "alias", alias)
         object.__setattr__(self, "gpu_layers", gpu_layers)
         object.__setattr__(self, "flash_attention", flash_attention)
+        object.__setattr__(self, "reasoning", reasoning)
+        object.__setattr__(self, "anti_repetition", anti_repetition)
+        object.__setattr__(self, "cache_type_k", cache_type_k)
+        object.__setattr__(self, "cache_type_v", cache_type_v)
         object.__setattr__(self, "extra_args", extras)
 
     def to_dict(self) -> dict[str, Any]:
@@ -125,7 +173,33 @@ class ModelProfile:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ModelProfile":
         copied = dict(data)
-        copied["extra_args"] = tuple(copied.get("extra_args", ()))
+        extras = list(copied.get("extra_args", ()))
+        migrated: list[str] = []
+        index = 0
+        while index < len(extras):
+            item = str(extras[index])
+            flag, separator, inline_value = item.partition("=")
+            target = {
+                "-ctk": "cache_type_k",
+                "--cache-type-k": "cache_type_k",
+                "-ctv": "cache_type_v",
+                "--cache-type-v": "cache_type_v",
+                "--reasoning": "reasoning",
+            }.get(flag)
+            if target is None:
+                migrated.append(item)
+                index += 1
+                continue
+            if separator:
+                value = inline_value
+                index += 1
+            elif index + 1 < len(extras):
+                value = str(extras[index + 1])
+                index += 2
+            else:
+                raise ValueError(f"missing value for {flag}")
+            copied.setdefault(target, value)
+        copied["extra_args"] = tuple(migrated)
         return cls(**copied)
 
 

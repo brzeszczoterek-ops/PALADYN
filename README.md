@@ -86,10 +86,103 @@ loader binds only to `127.0.0.1`, uses llama.cpp's offline/API-only modes, and
 stops the process when PALADYN exits.
 
 Profiles currently expose context size, GPU layers, CPU threads, batch and
-micro-batch size, parallel slots, Flash Attention, temperature, top-p, port,
-startup timeout, and additional argument-array entries. The additional entries
-cannot override the selected model, alias, loopback host, port, offline mode,
-API key, model presets, or llama.cpp's own tools. No shell command is built.
+micro-batch size, parallel slots, Flash Attention, K/V cache quantization,
+reasoning mode, anti-repetition mode, temperature, top-p, port, startup timeout, and additional
+argument-array entries. Reasoning defaults to `off` to prevent ordinary
+conversation from consuming large hidden-token budgets; profiles may select
+`on` or `auto` when deliberate reasoning is wanted. New profiles default both
+KV caches to `q8_0`; smaller devices can, for example, select `q8_0` for K and
+`q4_0` for V to reduce memory use. Anti-repetition defaults to `balanced`, which
+combines llama.cpp repeat penalties with DRY sampling; `off` and `strong` remain
+available per model. The additional entries cannot override
+controlled profile fields, the selected model, alias, loopback host, port,
+offline mode, API key, model presets, or llama.cpp's own tools. No shell command
+is built.
+
+## Local voice conversation
+
+PALADYN supports a fully local, half-duplex speech path:
+
+```text
+default PipeWire microphone -> Whisper.cpp -> V -> Piper -> SoX -> default PipeWire output
+```
+
+With PALADYN's terminal focused, tap `F8` to start recording and tap `F8` again
+to stop, transcribe, and send the utterance to V. No Enter key or typed command
+is required. The microphone remains closed while V thinks and speaks. `/ptt`
+provides the same two-step toggle as a typed fallback, while `/listen` records
+one silence-delimited turn and `/voice` enables an optional continuous
+conversation. The terminal-local key may be changed with `PALADYN_PTT_KEY`
+(`F6` through `F12`). It intentionally works only in the focused PALADYN
+terminal and does not request system-wide keyboard-device access.
+
+In continuous mode V records until roughly 1.2 seconds of silence, transcribes
+the utterance with automatic language detection, prints the recognized text,
+streams the answer in the terminal, and then speaks it. Recording resumes only
+after playback ends, which prevents the external speaker from feeding V's own
+voice back into Whisper. Say `stop listening` or `wyłącz tryb głosowy` to return
+to keyboard input.
+
+The runtime remains local: it uses `pw-record`, `whisper-cli`, a selected local
+TTS engine, and `pw-play`; no speech API is contacted. The owner runtime uses
+the multilingual quantized Whisper Large V3 Turbo model on CUDA for recognition,
+with Polish selected explicitly for reliable short utterances and a CPU-only
+binary retained as a failure fallback using the same Turbo model. Public profiles may
+use `PALADYN_WHISPER_LANGUAGE=auto` or select another language code. Thread
+count and an optional vocabulary prompt are configured with
+`PALADYN_WHISPER_THREADS` and `PALADYN_WHISPER_INITIAL_PROMPT`.
+
+For speech output, the owner runtime uses
+the full Kokoro ONNX model with the British `bf_emma` voice. A persistent,
+session-local worker loads Kokoro once and emits playable chunks while later
+speech is still being rendered. Piper and optional SoX texturing remain a local
+automatic fallback.
+
+`PALADYN_VOICE_ROOT` contains `selected_voice.json`, the isolated TTS runtime,
+models, and fallback profile. Configure the external binaries and Whisper model
+with `PALADYN_WHISPER_CLI`, `PALADYN_WHISPER_MODEL`, `PALADYN_PIPER`,
+`PALADYN_RECORDER`, `PALADYN_PLAYER`, and `PALADYN_SOX`. PipeWire's current
+default source and sink are used unless `PALADYN_AUDIO_INPUT_TARGET` or
+`PALADYN_AUDIO_OUTPUT_TARGET` is set. Silence detection is bounded by
+configurable threshold, start timeout, end silence, and maximum recording time.
+Push-to-talk capture is also bounded by the configured maximum recording time.
+
+## Owner performance monitor
+
+`PALADYN_OWNER_MONITOR=1` opens a separate local terminal after a managed
+llama.cpp model becomes ready. The monitor shows the selected model, reasoning
+and KV-cache modes, slot/context use, cumulative tokens, exact prompt and
+generation throughput for the latest completed response, request state, and
+Jetson `tegrastats` data. It exits when the managed model process stops.
+
+Every launch creates one private append-only JSONL journal under
+`PALADYN_MODEL_RUNTIME_ROOT/monitor_sessions/`. Its name combines the model-log
+timestamp and server PID, so samples from separate PALADYN sessions never mix.
+The active window reads only the current server and current llama.cpp log; older
+journals remain an archive and are never loaded into a new monitor. The journal
+records session metadata, context/KV/request state, throughput, cumulative tokens,
+last-response timing, and hardware telemetry every five seconds by default. Set
+`PALADYN_OWNER_MONITOR_RECORD_INTERVAL` between 1 and 300 seconds to change it.
+
+This is an owner/developer diagnostic and defaults to disabled. The managed
+server exposes `/metrics` and `/slots` only on its enforced `127.0.0.1`
+listener; the monitor neither publishes telemetry nor contacts an external
+service. Set `PALADYN_OWNER_TERMINAL` to override `gnome-terminal`, or run
+`paladyn-monitor` manually with explicit target arguments.
+
+Short chat, explicit tool-result, and research responses use guarded token
+streaming. Short conversational messages additionally use a compact prompt.
+During a multi-step agent task, each model candidate is fully buffered until the
+runtime knows whether it is an internal tool request or the final visible answer.
+This keeps mixed prose-plus-JSON responses executable without exposing the tool
+protocol or a false declaration of work to the user.
+Streaming stops when PALADYN detects a clear repeated-generation loop, while
+ordinary rhetorical repetition is preserved. Session history is bounded by both
+turn count and the active model's context budget.
+Routine greetings do not trigger the expensive persistent-memory pipeline. For
+substantive interactions the visible answer returns first; reflection and
+memory consolidation run as cancellable background work while the terminal
+waits for the next input.
 
 The default external model endpoint remains `http://127.0.0.1:5001/v1`.
 The filesystem MCP server is restricted to `V_CORE_MCP_FILESYSTEM`, which
@@ -111,6 +204,8 @@ User -> Agent runtime -> validated tool actions -> MCP tools
 - Runtime code controls action limits, execution, and failure handling.
 - Tool output is untrusted data, never a system instruction.
 - Reflections become durable memory only after confidence filtering.
+- Every interactive agent task has a private runtime-authored checkpoint and
+  append-only journal; model text alone cannot create execution evidence.
 
 Relationship state is stored separately under `PALADYN_MEMORY_ROOT` (default:
 `memory`). Only an experience that passes durable-memory filtering may change
