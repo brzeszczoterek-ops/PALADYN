@@ -21,6 +21,7 @@ from v_core.autonomy import (
     StepOutcome,
     StepResult,
     TaskBudget,
+    TaskContract,
     TaskJournal,
     TaskStatus,
     parse_chord,
@@ -90,6 +91,68 @@ def test_interactive_agent_trace_records_runtime_evidence(tmp_path: Path) -> Non
     ]
     assert trace.evidence()["successful_tool_count"] == 1
     assert checkpoint.stat().st_mode & 0o777 == 0o600
+
+
+def test_interactive_trace_recovers_latest_runtime_context(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    trace = AgentTaskTrace(root, "Inspect the first result")
+    trace.set_requirements({"requires_distinct_detail_page": True})
+    sequence = trace.tool_started("browser_navigate", {"url": "https://bad.invalid"})
+    trace.tool_finished(
+        sequence,
+        "DNS resolution failed",
+        error="MCPToolExecutionError: DNS resolution failed",
+    )
+    trace.block("navigation failed")
+
+    context = AgentTaskTrace.latest_context(root)
+
+    assert context is not None
+    assert context["objective"] == "Inspect the first result"
+    assert context["status"] == "blocked"
+    assert context["requirements"]["requires_distinct_detail_page"] is True
+    assert context["tool_calls"][0]["error"].endswith("DNS resolution failed")
+
+
+def test_task_contract_detects_generic_online_work_without_explicit_url() -> None:
+    contract = TaskContract.from_prompt(
+        "Znajdź w sieci narzędzia do monitorowania darknetu i podaj wyniki."
+    )
+
+    assert contract.requires_browser_navigation is True
+    assert contract.requires_browser_snapshot is True
+    assert contract.requires_evidence_report is True
+    assert contract.unmet([]) == ["browser_navigate", "browser_snapshot"]
+
+
+def test_task_contract_requires_real_detail_page_after_search_listing() -> None:
+    contract = TaskContract.from_prompt(
+        "Open https://github.com/search?q=i2p and inspect the first result."
+    )
+    listing_only = [
+        {
+            "tool": "browser_navigate",
+            "arguments": {"url": "https://github.com/search?q=i2p"},
+            "status": "succeeded",
+        },
+        {"tool": "browser_snapshot", "arguments": {}, "status": "succeeded"},
+    ]
+
+    assert contract.requires_distinct_detail_page is True
+    assert contract.unmet(listing_only) == ["browser_navigate:distinct_detail_page"]
+
+
+def test_task_contract_requires_real_file_and_command_actions() -> None:
+    read_contract = TaskContract.from_prompt(
+        "Read README.md and report only its first heading."
+    )
+    write_contract = TaskContract.from_prompt("Write the report to result.md")
+    command_contract = TaskContract.from_prompt("Run the pytest tests and report results")
+
+    assert read_contract.requires_file_read is True
+    assert read_contract.requires_first_heading is True
+    assert write_contract.unmet([]) == ["filesystem_mutation"]
+    assert command_contract.unmet([]) == ["command_execution"]
 
 
 def test_authorization_guard_prevents_workspace_escape(tmp_path: Path) -> None:

@@ -3,6 +3,9 @@
 ## Unreleased
 
 ### Added
+- A step-by-step Windows 10/11 installation guide using WSL2, including CPU and
+  NVIDIA/CUDA llama.cpp builds, validation, limitations, troubleshooting, and a
+  desktop-friendly `.cmd` launcher
 - Bare website domains such as `onehack.st` are normalized to HTTPS and routed
   through deterministic browser navigation plus snapshot capture
 - Private per-interaction agent checkpoints and append-only JSONL journals with
@@ -45,8 +48,41 @@
   cross-session aggregation in the live owner window
 - Bounded multi-page website extraction that inspects up to three ranked internal
   detail pages after the entry-page snapshot
+- Native OpenAI-compatible function definitions and `tool_calls`, with a cached
+  MCP schema registry and textual JSON fallback for older GGUF chat templates
+- Runtime-owned task contracts that persist required evidence and reject final
+  prose until the actual objective has been satisfied
+- Durable previous-task recovery context containing bounded runtime status and
+  exact failed-tool evidence
 
 ### Fixed
+- Tool availability is now a runtime-owned allowlist: schema-discovery failure,
+  an empty catalog, or a model-invented name cannot fall through to execution
+- Capability discussion and ordinary conversation do not start MCP discovery or
+  expose executable tools merely because words such as "tool" or "file" appear
+- A generated tool activated during an interaction is added to that interaction's
+  allowlist and can be used immediately to finish the original objective
+- Filesystem MCP results marked `isError` are recorded as failed calls rather
+  than successful reads or mutations
+- Non-zero sandbox/Foundry exits, timeouts, and resource-limit terminations cannot
+  serve as evidence that commands or tests succeeded
+- Bubblewrap applies `RLIMIT_NPROC` inside its private user/PID namespaces, so a
+  busy desktop session cannot prevent the sandbox itself from starting
+- Short questions about V's current state or mood, including Polish variants such
+  as "jak się dzisiaj czujesz?", remain in light conversation and never initialize
+  MCP tool discovery or the full execution loop
+- The LLM adapter no longer discards native tool calls when assistant content is
+  empty; tool results return through the real `tool` role and matching call ID
+- A successful tool call alone no longer marks an objective complete: read,
+  write, command, web-detail, generated-tool, and generated-skill requirements
+  are checked independently of the model
+- Exact-result tasks such as "report only the first heading" are rendered
+  deterministically from verified tool output, preventing empty or unrelated
+  model completion prose from being accepted
+- Requests to inspect the first search result now visit and snapshot the actual
+  first eligible detail link before completion
+- Tool failures retain their exact runtime error in the checkpoint and visible
+  blocked result instead of being converted into apparent success
 - Tool requests remain executable when a local model incorrectly puts prose or a
   Markdown fence before one trailing JSON action
 - Model promises such as "I'm starting" or "running in the background" cannot end
@@ -94,6 +130,17 @@
   be streamed or checkpointed as completed work
 - Unsupported extraction metrics and concrete capability claims trigger a
   deterministic report built from verified page records instead of model prose
+- Capability questions and explicit tool actions now share the traced multi-step
+  agent loop instead of a brittle keyword-triggered YES/NO dispatcher
+- Language repair uses a compact English-only context, preserves structured JSON
+  actions, and reclassifies a repaired tool request before displaying any output
+- Completed-action claims are matched to successful tool families before they can
+  become visible; fabricated calls, messages, remote access, exploits, file work,
+  command execution, and browser activity are rejected fail-closed
+- Blocked, stopped, and failed execution traces cannot enter persistent memory,
+  and a non-reusable reflection now stops the complete consolidation pipeline
+- Reflection independently rejects completed-action claims that lack matching
+  runtime evidence, even if a future routing defect marks the interaction complete
 
 ## 1.5.0 - 2026-08-23
 

@@ -67,6 +67,11 @@ goals, not features claimed by the current release.
 - `llama-server` from llama.cpp and one or more local GGUF models, or another
   already running OpenAI-compatible model server
 
+Windows users should follow the dedicated [Windows/WSL2 setup guide](WINDOWS.md).
+The current runtime is not a native Windows application; the guide documents
+the supported WSL2 route and its voice, sandbox, monitor, and emergency-control
+limitations.
+
 ## Quick start
 
 ```bash
@@ -181,8 +186,11 @@ Short chat, explicit tool-result, and research responses use guarded token
 streaming. Short conversational messages additionally use a compact prompt.
 During a multi-step agent task, each model candidate is fully buffered until the
 runtime knows whether it is an internal tool request or the final visible answer.
-This keeps mixed prose-plus-JSON responses executable without exposing the tool
-protocol or a false declaration of work to the user.
+PALADYN passes formal function schemas to compatible llama.cpp chat templates,
+reads native `tool_calls`, executes them itself, and returns results through the
+matching `tool` role. Older templates retain a bounded JSON compatibility path.
+This keeps the protocol executable without exposing it or a false declaration of
+work to the user.
 Streaming stops when PALADYN detects a clear repeated-generation loop, while
 ordinary rhetorical repetition is preserved. Session history is bounded by both
 turn count and the active model's context budget.
@@ -207,12 +215,26 @@ User -> Agent runtime -> validated tool actions -> MCP tools
 ```
 
 - V supplies identity, judgment, communication style, and values.
-- The LLM reasons and proposes responses or structured actions.
-- Runtime code controls action limits, execution, and failure handling.
+- The LLM reasons and proposes responses or structured actions; it does not own
+  execution state or decide by itself that work is complete.
+- Runtime code controls action limits, tool schemas, execution, recovery, and
+  failure handling.
+- Tool schemas form an authoritative per-task allowlist. A missing catalog,
+  invented tool name, MCP error, failed command exit, timeout, or resource-limit
+  termination is failure evidence—not a successful action.
+- Conversation and capability questions remain tool-free. A tool activated by
+  the controlled learning lifecycle can be added to the current task's allowlist
+  and used immediately to complete that task.
+- A runtime-owned task contract derives required evidence from the objective.
+  Navigation alone cannot satisfy inspection, a search listing cannot satisfy
+  inspection of its first result, and a successful read cannot satisfy a request
+  for an exact value unless that value reaches the final result.
 - Tool output is untrusted data, never a system instruction.
 - Reflections become durable memory only after confidence filtering.
 - Every interactive agent task has a private runtime-authored checkpoint and
-  append-only journal; model text alone cannot create execution evidence.
+  append-only journal; model text alone cannot create execution evidence. The
+  next interaction receives a bounded record of the previous runtime status and
+  exact failure instead of relying on the model to remember what happened.
 
 Relationship state is stored separately under `PALADYN_MEMORY_ROOT` (default:
 `memory`). Only an experience that passes durable-memory filtering may change
@@ -222,8 +244,9 @@ by kind and importance, and a preferred form of address requires a reliable
 permissions and is rendered into every subsequent V persona prompt as both
 evidence and a qualitative relationship stage.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md), [ROADMAP.md](ROADMAP.md), and
-[TEST_PLAN.md](TEST_PLAN.md) for the longer design documents.
+See [ARCHITECTURE.md](ARCHITECTURE.md), [ROADMAP.md](ROADMAP.md),
+[TEST_PLAN.md](TEST_PLAN.md), and [WINDOWS.md](WINDOWS.md) for the longer design
+and installation documents.
 
 ## Evidence-driven learning
 

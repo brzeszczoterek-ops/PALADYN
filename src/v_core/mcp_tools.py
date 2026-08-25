@@ -68,6 +68,7 @@ class MCPTools:
         self.browser_ready = False
         self.interaction_id = ""
         self.interaction_prompt = ""
+        self._tool_definitions_cache: list[dict[str, Any]] | None = None
 
         #
         # Wrappers
@@ -363,6 +364,259 @@ class MCPTools:
 
         return self.local_tool_names() + filesystem_names + browser_names
 
+    async def openai_tool_definitions(self) -> list[dict[str, Any]]:
+        """Return executable tool metadata in the OpenAI function format.
+
+        The MCP servers own their schemas. PALADYN only supplies local schemas
+        for capabilities implemented directly in this process. The result is
+        cached because spawning MCP discovery processes on every reasoning step
+        is both slow and a source of noisy shutdown failures.
+        """
+
+        if self._tool_definitions_cache is not None:
+            return self._tool_definitions_cache
+
+        definitions = self._local_tool_definitions()
+        discovered_names = {item["function"]["name"] for item in definitions}
+        callable_names = self._known_tool_names()
+        for client in (self.filesystem_client, self.browser_client):
+            try:
+                result = await client.list_tools()
+            except Exception as error:
+                print(f"[MCP] Tool schema discovery failed: {type(error).__name__}: {error}")
+                continue
+            for tool in result.tools:
+                name = str(getattr(tool, "name", "") or "").strip()
+                if (
+                    not name
+                    or name in discovered_names
+                    or name not in callable_names
+                ):
+                    continue
+                schema = getattr(tool, "inputSchema", None)
+                if schema is None:
+                    schema = getattr(tool, "input_schema", None)
+                if not isinstance(schema, dict):
+                    schema = {"type": "object", "properties": {}}
+                definitions.append(
+                    self._tool_definition(
+                        name,
+                        str(getattr(tool, "description", "") or f"Execute {name}."),
+                        schema,
+                    )
+                )
+                discovered_names.add(name)
+
+        # Keep the central protocol available even when an MCP discovery
+        # subprocess is temporarily unavailable.
+        for item in self._fallback_mcp_tool_definitions():
+            name = item["function"]["name"]
+            if name not in discovered_names:
+                definitions.append(item)
+                discovered_names.add(name)
+
+        self._tool_definitions_cache = definitions
+        return definitions
+
+    @staticmethod
+    def _tool_definition(
+        name: str,
+        description: str,
+        parameters: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": parameters,
+            },
+        }
+
+    def _local_tool_definitions(self) -> list[dict[str, Any]]:
+        object_schema = {"type": "object", "properties": {}}
+        schemas: dict[str, tuple[str, dict[str, Any]]] = {
+            "evm_analyze_erc20_abi": (
+                "Analyze an ERC-20 ABI locally.",
+                {
+                    "type": "object",
+                    "properties": {"abi": {"type": "array", "items": {}}},
+                    "required": ["abi"],
+                    "additionalProperties": False,
+                },
+            ),
+            "evm_analyze_solidity_security": (
+                "Run local static security checks over Solidity source.",
+                {
+                    "type": "object",
+                    "properties": {"source": {"type": "string"}},
+                    "required": ["source"],
+                    "additionalProperties": False,
+                },
+            ),
+            "sandbox_execute_offline": (
+                "Execute a command in PALADYN's isolated offline sandbox.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "array", "items": {"type": "string"}},
+                        "workspace": {"type": "string"},
+                        "working_directory": {"type": "string"},
+                        "environment": {"type": "object"},
+                        "timeout_seconds": {"type": "number", "minimum": 1},
+                    },
+                    "required": ["command", "workspace"],
+                    "additionalProperties": True,
+                },
+            ),
+            "learning_create_tool": (
+                "Create, quarantine, test, and activate a missing generated tool.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "manifest": {"type": "object"},
+                        "source": {"type": "string"},
+                    },
+                    "required": ["manifest", "source"],
+                    "additionalProperties": False,
+                },
+            ),
+            "learning_create_skill": (
+                "Create, validate, and activate a reusable skill manifest.",
+                {
+                    "type": "object",
+                    "properties": {"manifest": {"type": "object"}},
+                    "required": ["manifest"],
+                    "additionalProperties": False,
+                },
+            ),
+            "learning_validate_artifact": (
+                "Validate a quarantined generated artifact.",
+                {
+                    "type": "object",
+                    "properties": {"artifact_id": {"type": "string"}},
+                    "required": ["artifact_id"],
+                    "additionalProperties": False,
+                },
+            ),
+            "learning_activate_artifact": (
+                "Activate a generated artifact that passed validation.",
+                {
+                    "type": "object",
+                    "properties": {"artifact_id": {"type": "string"}},
+                    "required": ["artifact_id"],
+                    "additionalProperties": False,
+                },
+            ),
+            "learning_retire_artifact": (
+                "Retire an active generated artifact.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "artifact_id": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["artifact_id", "reason"],
+                    "additionalProperties": False,
+                },
+            ),
+        }
+        descriptions = {
+            "learning_record_evidence": "Record bounded evidence for later learning.",
+            "learning_propose_lesson": "Propose a lesson grounded in recorded evidence.",
+            "learning_stage_tool": "Stage generated tool code in quarantine.",
+            "learning_stage_skill": "Stage a generated skill in quarantine.",
+            "learning_list_artifacts": "List generated artifact lifecycle records.",
+            "evm_validate_oracle": "Validate oracle round data against a local policy.",
+            "evm_decode_uniswap_v4_hook": "Decode Uniswap v4 hook address flags.",
+            "evm_quote_flash_swap": "Calculate a local flash-swap repayment quote.",
+            "evm_foundry_test_offline": "Run Foundry tests inside the offline sandbox.",
+        }
+        definitions: list[dict[str, Any]] = []
+        for name in self.local_tool_names():
+            description, schema = schemas.get(
+                name,
+                (descriptions.get(name, f"Execute PALADYN local tool {name}."), object_schema),
+            )
+            definitions.append(self._tool_definition(name, description, schema))
+        return definitions
+
+    def _fallback_mcp_tool_definitions(self) -> list[dict[str, Any]]:
+        properties = lambda **items: {
+            "type": "object",
+            "properties": items,
+            "required": list(items),
+            "additionalProperties": False,
+        }
+        specs = {
+            "browser_navigate": (
+                "Navigate the controlled browser to a URL.",
+                properties(url={"type": "string"}),
+            ),
+            "browser_snapshot": (
+                "Capture the current page as grounded textual evidence.",
+                {"type": "object", "properties": {}, "additionalProperties": False},
+            ),
+            "browser_click": (
+                "Click an element from the current browser snapshot.",
+                properties(element={"type": "string"}),
+            ),
+            "browser_find": (
+                "Find text in the current browser page.",
+                properties(text={"type": "string"}),
+            ),
+            "browser_press_key": (
+                "Press a key in the controlled browser.",
+                properties(key={"type": "string"}),
+            ),
+            "read_file": (
+                "Read a local workspace file.",
+                properties(path={"type": "string"}),
+            ),
+            "write_file": (
+                "Write a local workspace file.",
+                properties(path={"type": "string"}, content={"type": "string"}),
+            ),
+            "list_directory": (
+                "List a local workspace directory.",
+                properties(path={"type": "string"}),
+            ),
+            "directory_tree": (
+                "Return a local workspace directory tree.",
+                properties(path={"type": "string"}),
+            ),
+            "search_files": (
+                "Search for files under a local workspace path.",
+                properties(path={"type": "string"}, pattern={"type": "string"}),
+            ),
+            "get_file_info": (
+                "Read local workspace file metadata.",
+                properties(path={"type": "string"}),
+            ),
+            "create_directory": (
+                "Create a local workspace directory.",
+                properties(path={"type": "string"}),
+            ),
+            "move_file": (
+                "Move a local workspace file.",
+                properties(source={"type": "string"}, destination={"type": "string"}),
+            ),
+            "edit_file": (
+                "Apply structured edits to a local workspace file.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "edits": {"type": "array", "items": {"type": "object"}},
+                        "dry_run": {"type": "boolean"},
+                    },
+                    "required": ["path", "edits"],
+                    "additionalProperties": False,
+                },
+            ),
+        }
+        return [self._tool_definition(name, *spec) for name, spec in specs.items()]
+
     def local_tool_names(self) -> list[str]:
         names = [
             "evm_analyze_erc20_abi",
@@ -549,6 +803,7 @@ class MCPTools:
                     ToolManifest.from_dict(structured["manifest"]),
                     value("source"),
                 )
+                self._tool_definitions_cache = None
                 return self._json(record.to_dict())
 
             case "learning_stage_skill":
@@ -588,9 +843,9 @@ class MCPTools:
                     return f"Learning runtime unavailable: {self.learning_error}"
                 if structured is None:
                     return "learning_activate_artifact requires artifact_id."
-                return self._json(
-                    self.learning.activate_artifact(value("artifact_id")).to_dict()
-                )
+                record = self.learning.activate_artifact(value("artifact_id"))
+                self._tool_definitions_cache = None
+                return self._json(record.to_dict())
 
             case "learning_retire_artifact":
                 if self.learning is None:

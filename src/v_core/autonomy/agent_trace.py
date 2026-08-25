@@ -40,6 +40,7 @@ class AgentTaskTrace:
     started_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     finished_at: str | None = None
+    requirements: dict[str, bool] = field(default_factory=dict)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     _journal: TaskJournal = field(init=False, repr=False)
     _checkpoint_root: Path = field(init=False, repr=False)
@@ -63,6 +64,10 @@ class AgentTaskTrace:
         self.updated_at = utc_now()
         self._journal.append(self.task_id, event, data)
         self._save()
+
+    def set_requirements(self, requirements: dict[str, bool]) -> None:
+        self.requirements = dict(requirements)
+        self.record_event("task_contract_created", {"requirements": self.requirements})
 
     def tool_started(self, name: str, arguments: dict | str) -> int:
         index = len(self.tool_calls) + 1
@@ -151,6 +156,7 @@ class AgentTaskTrace:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "tool_calls": calls,
+            "requirements": self.requirements,
             "successful_tool_count": sum(
                 call.get("status") == "succeeded" for call in self.tool_calls
             ),
@@ -159,17 +165,54 @@ class AgentTaskTrace:
             ),
         }
 
+    @staticmethod
+    def latest_context(root: Path) -> dict[str, Any] | None:
+        """Load a bounded runtime-authored summary for follow-up recovery."""
+
+        checkpoints = Path(root) / "checkpoints"
+        try:
+            candidates = sorted(
+                checkpoints.glob("interactive-*.json"),
+                key=lambda path: path.stat().st_mtime_ns,
+                reverse=True,
+            )
+        except OSError:
+            return None
+        for path in candidates:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            calls = []
+            for call in payload.get("tool_calls", [])[-6:]:
+                calls.append(
+                    {
+                        "tool": str(call.get("tool", ""))[:128],
+                        "status": str(call.get("status", ""))[:32],
+                        "error": str(call.get("error", ""))[:500],
+                    }
+                )
+            return {
+                "task_id": str(payload.get("task_id", ""))[:128],
+                "objective": str(payload.get("objective", ""))[:2_000],
+                "status": str(payload.get("status", ""))[:32],
+                "requirements": payload.get("requirements", {}),
+                "tool_calls": calls,
+            }
+        return None
+
     def _save(self, *, result: dict[str, Any] | None = None) -> None:
         path = self._checkpoint_root / f"{self.task_id}.json"
         temporary = self._checkpoint_root / f".{self.task_id}.tmp"
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "task_id": self.task_id,
             "objective": self.objective,
             "status": self.status,
             "started_at": self.started_at,
             "updated_at": self.updated_at,
             "finished_at": self.finished_at,
+            "requirements": self.requirements,
             "tool_calls": self.tool_calls,
         }
         if result is not None:

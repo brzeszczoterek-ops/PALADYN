@@ -3,10 +3,30 @@ from __future__ import annotations
 from ..mcp_client import MCPClient
 
 
+class FilesystemToolError(RuntimeError):
+    """The filesystem MCP server completed the call with an error result."""
+
+
 class Filesystem:
 
     def __init__(self, client: MCPClient):
         self.client = client
+
+    @staticmethod
+    def _raise_if_error(result: object, tool: str) -> None:
+        if not bool(
+            getattr(result, "isError", False)
+            or getattr(result, "is_error", False)
+        ):
+            return
+        output = "\n".join(
+            str(item.text)
+            for item in (getattr(result, "content", None) or [])
+            if hasattr(item, "text")
+        ).strip()
+        raise FilesystemToolError(
+            output[:2_000] or f"filesystem tool {tool} returned an error"
+        )
 
     async def list_directory(
         self,
@@ -21,6 +41,8 @@ class Filesystem:
                     "path": path,
                 },
             )
+
+        self._raise_if_error(result, "list_directory")
 
         if not result.content:
             return []
@@ -46,6 +68,8 @@ class Filesystem:
                     "path": path,
                 },
             )
+
+        self._raise_if_error(result, "read_file")
 
         if not result.content:
             return ""
@@ -73,6 +97,8 @@ class Filesystem:
                     "content": content,
                 },
             )
+
+        self._raise_if_error(result, "write_file")
 
         if not result.content:
             return "OK"
@@ -103,6 +129,8 @@ class Filesystem:
                 },
             )
 
+        self._raise_if_error(result, "edit_file")
+
         if not result.content:
             return "OK"
 
@@ -129,6 +157,8 @@ class Filesystem:
                     "destination": destination,
                 },
             )
+
+        self._raise_if_error(result, "move_file")
 
         if not result.content:
             return "OK"
@@ -157,6 +187,8 @@ class Filesystem:
                 },
             )
 
+        self._raise_if_error(result, "search_files")
+
         if not result.content:
             return ""
 
@@ -181,6 +213,8 @@ class Filesystem:
                     "path": path,
                 },
             )
+
+        self._raise_if_error(result, "directory_tree")
 
         if not result.content:
             return ""
@@ -207,6 +241,8 @@ class Filesystem:
                 },
             )
 
+        self._raise_if_error(result, "get_file_info")
+
         if not result.content:
             return ""
 
@@ -231,6 +267,8 @@ class Filesystem:
                     "path": path,
                 },
             )
+
+        self._raise_if_error(result, "create_directory")
 
         if not result.content:
             return "OK"

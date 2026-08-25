@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable
 import re
 from urllib.parse import urljoin, urlparse
 
+from ..autonomy.task_contract import TaskContract
 from ..tool_dispatcher import ToolDispatcher
 from .web_target import extract_web_target
 
@@ -60,12 +61,16 @@ class ResearchTask:
         )
 
         pages = [(url, entry_snapshot)]
-        if self._requests_multi_page_extraction(prompt):
+        contract = TaskContract.from_prompt(prompt)
+        if (
+            self._requests_multi_page_extraction(prompt)
+            or contract.requires_distinct_detail_page
+        ):
             detail_urls = self._detail_page_candidates(
                 entry_snapshot,
                 url,
                 prompt,
-                limit=self.MAX_DETAIL_PAGES,
+                limit=(1 if contract.requires_distinct_detail_page else self.MAX_DETAIL_PAGES),
             )
             for detail_url in detail_urls:
                 try:
@@ -275,7 +280,11 @@ result available now, or state plainly that the visited-page scope was insuffici
 
         ordered = sorted(
             ranked,
-            key=lambda candidate_url: (*ranked[candidate_url], candidate_url),
+            key=(
+                (lambda candidate_url: (ranked[candidate_url][1], candidate_url))
+                if TaskContract.from_prompt(prompt).requires_distinct_detail_page
+                else (lambda candidate_url: (*ranked[candidate_url], candidate_url))
+            ),
         )
         return ordered[:limit]
 

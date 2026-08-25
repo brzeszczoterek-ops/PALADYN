@@ -166,7 +166,7 @@ async def test_directly_told_form_of_address_is_accepted() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rejected_experience_cannot_change_relationship() -> None:
+async def test_non_reusable_reflection_stops_complete_memory_pipeline() -> None:
     class ReflectionStub:
         async def reflect(self, task: str, result: str) -> ReflectionEntry:
             return ReflectionEntry(summary="uncertain", remember=False)
@@ -210,8 +210,47 @@ async def test_rejected_experience_cannot_change_relationship() -> None:
 
     result = await engine.process("task", "result")
 
-    assert result.confidence == 0.2
+    assert result is None
+    assert engine.manager.calls == 1
     assert engine.relationship_state.familiarity == 0.0
+
+
+@pytest.mark.asyncio
+async def test_blocked_execution_never_enters_persistent_memory() -> None:
+    class ReflectionStub:
+        async def reflect(self, *args, **kwargs):
+            raise AssertionError("blocked execution reached reflection")
+
+    class ManagerStub:
+        def remember(self, *args, **kwargs):
+            raise AssertionError("blocked execution reached storage")
+
+    class StorageStub:
+        def load(self) -> RelationshipState:
+            return RelationshipState()
+
+    engine = MemoryEngine(
+        session=object(),
+        reflection=ReflectionStub(),
+        experience=object(),
+        summary=object(),
+        knowledge=object(),
+        manager=ManagerStub(),
+        relationship_updater=object(),
+        relationship_storage=StorageStub(),
+    )
+
+    result = await engine.process(
+        "Call someone",
+        "I called him.",
+        execution={
+            "status": "blocked",
+            "tool_calls": [],
+            "successful_tool_count": 0,
+        },
+    )
+
+    assert result is None
 
 
 @pytest.mark.asyncio

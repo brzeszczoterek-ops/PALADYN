@@ -50,6 +50,12 @@ class MemoryEngine:
         execution: dict[str, Any] | None = None,
     ):
 
+        # Stopped, failed, or blocked work remains available in the current
+        # session and execution journal, but must never become durable memory.
+        # Otherwise a rejected model claim can return later as an alleged fact.
+        if execution is not None and execution.get("status") != "completed":
+            return None
+
         try:
 
             if execution is None:
@@ -61,10 +67,15 @@ class MemoryEngine:
                     execution=execution,
                 )
 
-            self.manager.remember(
+            stored_reflection = self.manager.remember(
                 "reflections",
                 reflection,
             )
+
+            # `remember=False` is a hard stop for the complete persistence
+            # pipeline, not merely a request to omit the reflection file.
+            if stored_reflection is None:
+                return None
 
         except Exception as e:
 

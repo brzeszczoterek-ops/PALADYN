@@ -140,6 +140,7 @@ def build_server_command(binary: Path, profile: ModelProfile) -> tuple[str, ...]
     # downloads, llama.cpp's own filesystem tools, or a public listener.
     command.extend(
         (
+            "--jinja",
             "--metrics",
             "--slots",
             "--offline",

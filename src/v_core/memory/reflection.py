@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from ..llm import LLM
+from ..execution_claims import unsupported_execution_claims
 from ..utils import parse_llm_json
 from .models import MemoryKind, MemorySource, ReflectionEntry
 
@@ -20,6 +21,32 @@ class Reflection:
         *,
         execution: dict[str, Any] | None = None,
     ) -> ReflectionEntry:
+
+        successful_tools: list[str] = []
+        if execution is not None:
+            for call in execution.get("tool_calls", []):
+                if not isinstance(call, dict) or call.get("status") != "succeeded":
+                    continue
+                tool = str(call.get("tool", "")).strip()
+                if tool:
+                    successful_tools.append(tool)
+
+        unsupported = unsupported_execution_claims(result, successful_tools)
+        if unsupported:
+            # This is a second, independent boundary behind Agent. Even if a
+            # future routing bug marks fabricated work as completed, the lie
+            # cannot become a reflection, experience, relationship event, or
+            # long-term fact.
+            return ReflectionEntry(
+                task=task,
+                result=result,
+                summary="Runtime evidence does not support the claimed action.",
+                lesson="Never retain a claimed action without matching tool evidence.",
+                importance="high",
+                remember=False,
+                kind=MemoryKind.LESSON,
+                source=MemorySource.SELF_GENERATED,
+            )
 
         execution_evidence = json.dumps(
             execution or {

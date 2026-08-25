@@ -39,6 +39,8 @@ _BLOCKED_EXTRA_FLAGS = {
     "--api-key",
     "--models-preset",
     "--tools",
+    "--jinja",
+    "--no-jinja",
     "--webui",
     "-ctk",
     "-ctv",

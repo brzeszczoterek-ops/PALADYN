@@ -166,7 +166,6 @@ class BubblewrapBackend:
             f"--cpu={limits.cpu_seconds}",
             f"--fsize={limits.max_file_bytes}",
             f"--nofile={limits.max_open_files}",
-            f"--nproc={limits.max_processes}",
             "--",
             str(self.executable),
             "--die-with-parent",
@@ -220,7 +219,21 @@ class BubblewrapBackend:
             argv.extend(("--setenv", name, value))
 
         argv.append("--")
-        argv.extend(spec.command)
+        # RLIMIT_NPROC is accounted against the real user in the caller's user
+        # namespace. Applying it to bwrap itself makes sandbox startup depend on
+        # how many processes the desktop user already owns; a busy workstation
+        # can therefore prevent bwrap from creating its private namespaces at
+        # all. Apply the process limit only after bwrap has entered the isolated
+        # user/PID namespaces so it constrains the guest workload, not PALADYN's
+        # host session.
+        argv.extend(
+            (
+                "/usr/bin/prlimit",
+                f"--nproc={limits.max_processes}",
+                "--",
+                *spec.command,
+            )
+        )
         return argv
 
     async def _collect_output(

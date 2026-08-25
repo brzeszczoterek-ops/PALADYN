@@ -5,6 +5,7 @@ from .control import (
     StopRequested,
 )
 from .agent_trace import AgentTaskTrace
+from .task_contract import TaskContract
 from .hotkey import ChordDetector, LinuxHotkeyWatcher, input_devices, parse_chord
 from .journal import CheckpointStore, TaskJournal
 from .models import (
@@ -43,6 +44,7 @@ __all__ = [
     "StopRequested",
     "TaskBudget",
     "TaskJournal",
+    "TaskContract",
     "TaskStatus",
     "input_devices",
     "parse_chord",

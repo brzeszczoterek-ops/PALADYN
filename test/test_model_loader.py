@@ -215,7 +215,8 @@ def test_server_command_is_argument_array_with_enforced_local_boundary(
 
     assert command[0] == "/usr/bin/true"
     assert command[command.index("--model") + 1] == str(model.resolve())
-    assert command[-6:] == (
+    assert command[-7:] == (
+        "--jinja",
         "--metrics",
         "--slots",
         "--offline",

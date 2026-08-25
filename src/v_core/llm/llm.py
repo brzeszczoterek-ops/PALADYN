@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+import json
 import re
+from typing import Any
 
-from openai import AsyncOpenAI
+from openai import APIStatusError, AsyncOpenAI
 
 from .llm_config import load_llm_config
 
@@ -50,6 +53,27 @@ def trim_repetition(text: str) -> str:
     return text[:start].rstrip()
 
 
+@dataclass(slots=True)
+class LLMToolCall:
+    """One model-requested action, decoded from the provider protocol."""
+
+    call_id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+    argument_error: str = ""
+    raw_arguments: str = ""
+
+
+@dataclass(slots=True)
+class LLMResponse:
+    """Provider-neutral assistant response used by PALADYN's executor."""
+
+    content: str = ""
+    tool_calls: list[LLMToolCall] = field(default_factory=list)
+    finish_reason: str = ""
+    native_tools_enabled: bool = False
+
+
 class LLM:
 
     def __init__(self, api_key: str | None = None):
@@ -60,6 +84,107 @@ class LLM:
             base_url=self.config.base_url,
             api_key=api_key or os.getenv("V_CORE_API_KEY", "local"),
             timeout=float(os.getenv("V_CORE_TIMEOUT", "120")),
+        )
+        # None means untested. A strict/older GGUF template may reject the
+        # OpenAI tool schema; after one explicit provider rejection PALADYN
+        # uses its documented textual compatibility protocol for that run.
+        self._native_tools_supported: bool | None = None
+
+    async def respond(
+        self,
+        *,
+        messages: list,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
+        max_tokens: int | None = None,
+    ) -> LLMResponse:
+        """Return prose and native tool calls without discarding either.
+
+        ``ask`` intentionally remains a string API for chat, reflection, and
+        older tests. Agent execution uses this richer boundary.
+        """
+
+        normalized = self._normalize_system_messages(messages)
+        request: dict[str, Any] = {
+            "model": self.config.model,
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+            "messages": normalized,
+            "max_tokens": max_tokens or int(os.getenv("V_CORE_MAX_TOKENS", "512")),
+        }
+        native_requested = bool(tools) and self._native_tools_supported is not False
+        if native_requested:
+            request["tools"] = tools
+            request["tool_choice"] = tool_choice
+
+        try:
+            response = await self.client.chat.completions.create(**request)
+        except APIStatusError as error:
+            # llama.cpp supports many chat templates. Some older templates
+            # return a provider error when tools are present. Retry once as a
+            # normal chat request; the agent prompt still exposes the legacy
+            # JSON action protocol. Do not swallow ordinary provider failures.
+            error_detail = f"{error} {getattr(error, 'body', '')}".casefold()
+            template_rejection = error.status_code == 501 or any(
+                marker in error_detail
+                for marker in (
+                    "function calling",
+                    "jinja",
+                    "template",
+                    "tool choice",
+                    "tool_choice",
+                    "tools are not",
+                    "tools unsupported",
+                )
+            )
+            if (
+                not native_requested
+                or error.status_code not in {400, 422, 500, 501}
+                or not template_rejection
+            ):
+                raise
+            self._native_tools_supported = False
+            request.pop("tools", None)
+            request.pop("tool_choice", None)
+            response = await self.client.chat.completions.create(**request)
+            native_requested = False
+        else:
+            if native_requested:
+                self._native_tools_supported = True
+
+        choice = response.choices[0]
+        message = choice.message
+        content = trim_repetition(str(getattr(message, "content", "") or ""))
+        decoded_calls: list[LLMToolCall] = []
+        for index, call in enumerate(getattr(message, "tool_calls", None) or []):
+            function = getattr(call, "function", None)
+            name = str(getattr(function, "name", "") or "").strip()
+            raw = str(getattr(function, "arguments", "") or "")
+            call_id = str(getattr(call, "id", "") or f"call_{index + 1}")
+            arguments: dict[str, Any] = {}
+            argument_error = ""
+            try:
+                parsed = json.loads(raw or "{}")
+                if not isinstance(parsed, dict):
+                    raise ValueError("tool arguments must decode to a JSON object")
+                arguments = parsed
+            except (json.JSONDecodeError, ValueError) as error:
+                argument_error = f"{type(error).__name__}: {error}"
+            decoded_calls.append(
+                LLMToolCall(
+                    call_id=call_id,
+                    name=name,
+                    arguments=arguments,
+                    argument_error=argument_error,
+                    raw_arguments=raw,
+                )
+            )
+
+        return LLMResponse(
+            content=content,
+            tool_calls=decoded_calls,
+            finish_reason=str(getattr(choice, "finish_reason", "") or ""),
+            native_tools_enabled=native_requested,
         )
 
     async def ask(
@@ -82,22 +207,11 @@ class LLM:
                 },
             ]
 
-        messages = self._normalize_system_messages(messages)
-
-        response = await self.client.chat.completions.create(
-            model=self.config.model,
-            temperature=self.config.temperature,
-            top_p=self.config.top_p,
+        response = await self.respond(
             messages=messages,
             max_tokens=max_tokens or int(os.getenv("V_CORE_MAX_TOKENS", "512")),
         )
-
-        message = response.choices[0].message
-
-        if getattr(message, "content", None):
-            return trim_repetition(message.content)
-
-        return ""
+        return response.content
 
     async def stream(
         self,

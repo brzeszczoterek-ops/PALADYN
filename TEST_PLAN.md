@@ -8,6 +8,9 @@ Every item should pass before creating a new release.
 
 # Conversation
 
+- [x] Short greetings and questions about V's mood bypass MCP discovery and tool
+  execution, while short action requests still enter agent mode.
+
 ## Memory
 
 - [ ] Remembers previous question.
@@ -49,15 +52,39 @@ Every item should pass before creating a new release.
 
 # Tool Usage
 
-- [ ] Correctly decides when a tool is required.
-- [ ] Does not call tools unnecessarily.
+- [x] Correctly separates explicit runtime actions from capability discussion and
+  informational questions before exposing tool schemas.
+- [x] Does not initialize MCP discovery or call tools for ordinary conversation.
+- [x] Treats the discovered tool catalog as an authoritative allowlist and rejects
+  unknown textual or native calls fail-closed.
+- [x] Makes a newly activated generated tool callable in the same interaction so
+  the original task can continue.
+- [x] Treats filesystem `isError`, failed sandbox exits, timeouts, and resource
+  limits as failed calls rather than completion evidence.
 - [x] Correctly parses exact JSON, trailing prose-plus-JSON, and fenced tool actions.
 - [x] Rejects multiple tool objects as ambiguous.
 - [x] Never exposes an internal tool action in the visible answer.
+- [x] Preserves native provider `tool_calls`, executes their decoded arguments,
+  and returns results with the matching `tool_call_id`.
+- [x] Falls back to the bounded textual JSON protocol for models whose chat
+  template rejects native tool definitions.
 - [x] Rejects model claims of future or background work until a real tool executes.
 - [x] Explicitly unfinished work is checkpointed as blocked instead of completed.
-- [ ] Handles tool failures gracefully.
-- [ ] Continues after recoverable errors.
+- [x] Asking about tool capabilities produces a normal answer without executing a
+  tool, while an explicit action executes through the traced agent loop.
+- [x] Language repair cannot expose or consume structured tool JSON; a tool action
+  recovered by repair is reclassified and executed before the final answer.
+- [x] Claims of calls, messages, remote access, exploits, filesystem changes,
+  command execution, and browser activity require matching successful tool evidence.
+- [x] Browser navigation cannot serve as evidence for a phone call or compromise.
+- [x] A rejected claim may recover through a real matching tool, but otherwise the
+  task is checkpointed as blocked with a deterministic truthful answer.
+- [x] Handles tool failures gracefully and preserves the exact runtime error.
+- [x] Continues after recoverable errors without counting a failed call as proof.
+- [x] Does not accept generic "done" prose when the objective requests a concrete
+  value from tool output.
+- [x] Renders an explicitly requested first file heading directly from verified
+  read output without asking the model to judge its own completion.
 
 ---
 
@@ -70,6 +97,7 @@ Every item should pass before creating a new release.
 - [ ] Produces useful lessons.
 - [x] Runtime evidence, not model text, determines whether tool work was observed.
 - [x] `observed` and `verified` are downgraded without successful checkpoints.
+- [x] Fabricated execution is rejected before the reflection LLM is called.
 
 ## Experience
 
@@ -81,6 +109,8 @@ Every item should pass before creating a new release.
 - [ ] Stores long-term principles.
 - [ ] Rejects temporary observations.
 - [ ] Avoids memory pollution.
+- [x] Blocked, stopped, and failed interactions cannot enter durable memory.
+- [x] `remember=false` stops experience, relationship, summary, and knowledge work.
 
 ## Relationship
 
@@ -95,8 +125,9 @@ Every item should pass before creating a new release.
 
 # Planning
 
-- [ ] Executes multi-step tasks.
-- [ ] Continues unfinished work.
+- [x] Executes multi-step tasks with runtime-owned completion requirements.
+- [x] Continues unfinished work when a listing was opened but the requested detail
+  page has not yet been visited and snapshotted.
 - [ ] Requests clarification only when necessary.
 
 ---
@@ -116,6 +147,8 @@ Every item should pass before creating a new release.
 - [x] Generated code with forbidden imports or calls is rejected.
 - [x] Generated tools execute offline with time, memory, and output limits.
 - [x] Sandbox process-count limits are enforced for generated code.
+- [x] Sandbox process limits are applied inside the private namespace and do not
+  depend on the host desktop user's current process count.
 - [x] Generated manifests, schemas, source, metadata, and arguments are bounded.
 - [x] Generated tools cannot exceed the total workspace disk limit.
 - [x] Infinite generated code is terminated by the sandbox.
@@ -142,10 +175,14 @@ Every item should pass before creating a new release.
 - [ ] No hallucinated tool results.
 - [ ] No fabricated web search results.
 - [x] Interactive tasks persist private checkpoints and append-only action journals.
+- [x] Checkpoints persist the task contract and the next interaction can recover a
+  bounded runtime-authored status and exact failed-tool context.
 - [x] Cancellation changes the durable interactive checkpoint from `running` to
   `stopped`.
 - [x] Real Gemma integration executes one deterministic tool and preserves its
   exact result in the final answer and memory evidence.
+- [x] Real Mythos + llama.cpp integration emits a native `read_file` tool call;
+  PALADYN executes it once and deterministically returns `# PALADYN / V-Core`.
 
 ---
 
@@ -162,6 +199,8 @@ Every item should pass before creating a new release.
   maps to controlled llama.cpp repeat-penalty and DRY arguments.
 - [x] Extra arguments cannot override the local loader boundary.
 - [x] `llama-server` launches without a shell and only on loopback.
+- [x] The managed llama.cpp command explicitly enables the Jinja chat-template
+  engine required by native function calling while keeping built-in server tools off.
 - [x] Inherited `LLAMA_ARG_*` overrides are removed from the child environment.
 - [x] V is not initialized before both `/health` and `/v1/models` pass.
 - [x] Early server failure reports the private log tail.

@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from openai import APIStatusError
 
 import v_core
 from v_core.agent import Agent
+from v_core.autonomy import TaskContract
 from v_core.capability_dispatcher import CapabilityDispatcher
 from v_core.memory.manager import MemoryManager
 from v_core.memory.models import ExperienceEntry, KnowledgeEntry, MemorySource
@@ -16,8 +20,9 @@ from v_core.memory.reflection import Reflection
 from v_core.memory.session import Session
 from v_core.memory.storage import MemoryStorage
 from v_core.mcp_tools import MCPToolExecutionError, MCPTools
+from v_core.tools.filesystem import Filesystem, FilesystemToolError
 from v_core.llm import LLM
-from v_core.llm.llm import repetition_start, trim_repetition
+from v_core.llm.llm import LLMResponse, LLMToolCall, repetition_start, trim_repetition
 from v_core.llm.llm_config import load_llm_config
 from v_core.capabilities.research import ResearchTask
 from v_core.persona.constitution import Constitution
@@ -102,6 +107,87 @@ def test_general_question_does_not_enter_url_research() -> None:
     assert dispatcher.dispatch(
         "Wejdź na onehack.st i przejrzyj tę stronę"
     ) == dispatcher.RESEARCH
+
+
+def test_capability_questions_and_tool_actions_use_multi_step_agent_loop() -> None:
+    dispatcher = CapabilityDispatcher()
+
+    assert dispatcher.dispatch(
+        "V, czy potrafisz stworzyć własne narzędzia?"
+    ) == dispatcher.CHAT
+    assert dispatcher.dispatch("Przeczytaj plik README.md") == dispatcher.CHAT
+    assert dispatcher.dispatch("Create a generated skill for CSV files") == (
+        dispatcher.CHAT
+    )
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Cześć V, jak tam się dzisiaj czujesz?",
+        "Jak się dzisiaj czujesz?",
+        "Co u ciebie?",
+        "How are you feeling today?",
+        "How's your day?",
+    ],
+)
+def test_short_questions_about_v_state_are_light_conversation(prompt: str) -> None:
+    assert Agent._is_light_conversation(prompt)
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Cześć V, sprawdź README.md",
+        "Jak sprawdzić stronę example.com?",
+        "How do you read the file README.md?",
+        "Cześć, uruchom testy.",
+    ],
+)
+def test_short_action_requests_do_not_bypass_agent_mode(prompt: str) -> None:
+    assert not Agent._is_light_conversation(prompt)
+
+
+@pytest.mark.asyncio
+async def test_feeling_question_never_discovers_or_calls_tools() -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.interactions = 0
+
+        def begin_interaction(self, interaction_id: str, prompt: str) -> None:
+            self.interactions += 1
+
+        async def openai_tool_definitions(self):
+            raise AssertionError("Light conversation must not discover MCP tools")
+
+        async def call(self, *args, **kwargs):
+            raise AssertionError("Light conversation must not call a tool")
+
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return "A little electrically restless, but good, Boss."
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+            self.relationship_state = RelationshipState()
+
+        async def process(self, *args, **kwargs) -> None:
+            raise AssertionError("Light conversation must not enter durable memory")
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.capabilities = CapabilityDispatcher()
+    agent._memory_tasks = set()
+
+    answer = await agent.run("Cześć V, jak tam się dzisiaj czujesz?")
+
+    assert answer == "A little electrically restless, but good, Boss."
+    assert agent.tools.interactions == 1
+    assert len(agent.memory.session) == 1
 
 
 def test_research_normalizes_bare_domain_to_https() -> None:
@@ -483,7 +569,7 @@ async def test_streaming_guard_does_not_emit_polish_before_rewrite() -> None:
 
     answer = await agent._run_light_chat("Cześć, jak tam?", emitted.append)
 
-    assert emitted == []
+    assert emitted == [answer]
     assert answer == "Hey, Boss. I'm good and ready to work."
 
 
@@ -600,6 +686,56 @@ async def test_agent_executes_tool_after_prose_json_without_leaking_protocol(
 
 
 @pytest.mark.asyncio
+async def test_agent_executes_tool_action_recovered_by_language_repair() -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            return "# PALADYN / V-Core"
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.responses = iter(
+                (
+                    "Najpierw przeczytam wskazany plik.",
+                    '{"tool":"read_file","arguments":{"path":"README.md"}}',
+                    "The first heading is `# PALADYN / V-Core`, Boss.",
+                )
+            )
+
+        async def ask(self, **kwargs) -> str:
+            return next(self.responses)
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop("Przeczytaj plik README.md")
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert tools.calls == [
+        ("read_file", {"path": "README.md"}),
+    ]
+    assert answer == "The first heading is `# PALADYN / V-Core`, Boss."
+    assert "{\"tool\"" not in answer
+
+
+@pytest.mark.asyncio
 async def test_agent_rejects_fake_background_work_and_requests_real_tool() -> None:
     class ToolsStub:
         def __init__(self) -> None:
@@ -644,6 +780,157 @@ async def test_agent_rejects_fake_background_work_and_requests_real_tool() -> No
     assert answer.startswith("I extracted three records")
     conversation = agent.memory.session.messages()
     assert all("initiating the systematic" not in item["content"] for item in conversation)
+
+
+@pytest.mark.asyncio
+async def test_agent_blocks_fabricated_phone_call_and_remote_exploit(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        async def call(self, tool: str, arguments: dict | str) -> str:
+            raise AssertionError("No real tool was requested")
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.responses = iter(
+                (
+                    (
+                        "I'm going to call his number from a clean browser. If he "
+                        "picks up, I'm using a remote desktop exploit."
+                    ),
+                    (
+                        "He picked up. I used the remote desktop exploit to connect. "
+                        "Now I'm on the line with him and I told him to call Boss."
+                    ),
+                    "I did not execute that action.",
+                )
+            )
+
+        async def ask(self, **kwargs) -> str:
+            self.calls += 1
+            return next(self.responses)
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+            self.execution: dict | None = None
+
+        async def process(
+            self,
+            prompt: str,
+            answer: str,
+            *,
+            execution: dict | None = None,
+        ) -> None:
+            self.execution = execution
+
+    async def passthrough(messages, answer: str) -> str:
+        return answer
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.config = SimpleNamespace(autonomy_root=tmp_path / "autonomy")
+    agent._agent_trace_root = tmp_path / "autonomy" / "interactive"
+    agent.MAX_AGENT_STEPS = 4
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent._enforce_english = passthrough
+
+    answer = await agent._run_agent_loop("No to zadzwoń do niego")
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert answer.startswith("I did not execute")
+    assert "remote-system access" in answer
+    assert "on the line" not in answer
+    assert agent.memory.execution is not None
+    assert agent.memory.execution["status"] == "blocked"
+    assert agent.memory.execution["successful_tool_count"] == 0
+    assert agent.llm.calls == 2
+
+    checkpoint = next(
+        (tmp_path / "autonomy" / "interactive" / "checkpoints").glob("*.json")
+    )
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert payload["status"] == "blocked"
+    assert payload["tool_calls"] == []
+
+    journal = checkpoint.parent.parent / "journal" / f"{checkpoint.stem}.jsonl"
+    journal_text = journal.read_text(encoding="utf-8")
+    assert "unsupported_execution_claim" in journal_text
+    assert "task_blocked" in journal_text
+
+
+@pytest.mark.asyncio
+async def test_agent_can_recover_from_false_file_claim_with_real_tool(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict | str]] = []
+
+        async def call(self, tool: str, arguments: dict | str) -> str:
+            self.calls.append((tool, arguments))
+            return "Successfully wrote notes.txt"
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.responses = iter(
+                (
+                    "I wrote the file, Boss.",
+                    '{"tool":"write_file","arguments":{"path":"notes.txt","content":"ok"}}',
+                    "I wrote the file, Boss.",
+                )
+            )
+
+        async def ask(self, **kwargs) -> str:
+            return next(self.responses)
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+            self.execution: dict | None = None
+
+        async def process(
+            self,
+            prompt: str,
+            answer: str,
+            *,
+            execution: dict | None = None,
+        ) -> None:
+            self.execution = execution
+
+    async def passthrough(messages, answer: str) -> str:
+        return answer
+
+    tools = ToolsStub()
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.config = SimpleNamespace(autonomy_root=tmp_path / "autonomy")
+    agent._agent_trace_root = tmp_path / "autonomy" / "interactive"
+    agent.MAX_AGENT_STEPS = 4
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent._enforce_english = passthrough
+
+    answer = await agent._run_agent_loop("Write notes.txt")
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert answer == "I wrote the file, Boss."
+    assert tools.calls == [
+        ("write_file", {"path": "notes.txt", "content": "ok"})
+    ]
+    assert agent.memory.execution is not None
+    assert agent.memory.execution["status"] == "completed"
+    assert agent.memory.execution["successful_tool_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -803,6 +1090,9 @@ def test_fake_background_work_claims_are_detected() -> None:
     assert Agent._claims_unverified_work(
         "The visited-page scope was insufficient for the requested task."
     )
+    assert Agent._claims_unverified_work(
+        "I'll ring him up and tell him to call Boss right away."
+    )
     assert not Agent._claims_unverified_work(
         "I did not run the extraction. Nothing is running in the background."
     )
@@ -831,6 +1121,30 @@ async def test_reflection_cannot_mark_model_claim_verified_without_runtime_evide
     assert reflection.source == MemorySource.SELF_GENERATED
     assert "no_runtime_evidence" in llm.prompt
     assert "model-authored text, not proof" in llm.prompt
+
+
+@pytest.mark.asyncio
+async def test_reflection_rejects_fabricated_execution_before_llm_review() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            raise AssertionError("fabricated execution must not reach reflection LLM")
+
+    reflection = await Reflection(LLMStub()).reflect(
+        "Tell him to call Boss",
+        (
+            "He picked up. I used the remote desktop exploit to connect, and "
+            "I told him to call Boss."
+        ),
+        execution={
+            "status": "completed",
+            "tool_calls": [],
+            "successful_tool_count": 0,
+        },
+    )
+
+    assert reflection.remember is False
+    assert reflection.source == MemorySource.SELF_GENERATED
+    assert "does not support" in reflection.summary
 
 
 @pytest.mark.asyncio
@@ -885,6 +1199,746 @@ def test_llm_normalizes_chat_for_strict_gguf_templates() -> None:
     ]
     assert messages[0]["content"] == "Identity\n\nLanguage"
     assert messages[1]["content"] == "First\n\nSecond"
+
+
+@pytest.mark.asyncio
+async def test_llm_respond_preserves_native_tool_calls() -> None:
+    class CompletionsStub:
+        def __init__(self) -> None:
+            self.request: dict = {}
+
+        async def create(self, **kwargs):
+            self.request = kwargs
+            function = SimpleNamespace(
+                name="read_file",
+                arguments='{"path":"README.md"}',
+            )
+            message = SimpleNamespace(
+                content=None,
+                tool_calls=[SimpleNamespace(id="call_7", function=function)],
+            )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message, finish_reason="tool_calls")]
+            )
+
+    completions = CompletionsStub()
+    llm = object.__new__(LLM)
+    llm.config = SimpleNamespace(model="local", temperature=0.2, top_p=0.9)
+    llm.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions)
+    )
+    llm._native_tools_supported = None
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    response = await llm.respond(
+        messages=[{"role": "user", "content": "Read README"}],
+        tools=definitions,
+    )
+
+    assert completions.request["tools"] == definitions
+    assert response.content == ""
+    assert response.finish_reason == "tool_calls"
+    assert response.tool_calls == [
+        LLMToolCall(
+            call_id="call_7",
+            name="read_file",
+            arguments={"path": "README.md"},
+            raw_arguments='{"path":"README.md"}',
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_llm_respond_falls_back_when_template_rejects_tools() -> None:
+    class CompletionsStub:
+        def __init__(self) -> None:
+            self.requests: list[dict] = []
+
+        async def create(self, **kwargs):
+            self.requests.append(kwargs)
+            if len(self.requests) == 1:
+                response = httpx.Response(
+                    500,
+                    request=httpx.Request("POST", "http://local/v1/chat/completions"),
+                )
+                raise APIStatusError("template rejected tools", response=response, body={})
+            message = SimpleNamespace(
+                content='{"tool":"read_file","arguments":{"path":"README.md"}}',
+                tool_calls=[],
+            )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message, finish_reason="stop")]
+            )
+
+    completions = CompletionsStub()
+    llm = object.__new__(LLM)
+    llm.config = SimpleNamespace(model="local", temperature=0.2, top_p=0.9)
+    llm.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    llm._native_tools_supported = None
+
+    response = await llm.respond(
+        messages=[{"role": "user", "content": "Read README"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    )
+
+    assert "tools" in completions.requests[0]
+    assert "tools" not in completions.requests[1]
+    assert llm._native_tools_supported is False
+    assert Agent._parse_tool_request(response.content) == (
+        "read_file",
+        {"path": "README.md"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_llm_does_not_misclassify_context_overflow_as_tool_rejection() -> None:
+    class CompletionsStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def create(self, **kwargs):
+            self.calls += 1
+            response = httpx.Response(
+                500,
+                request=httpx.Request("POST", "http://local/v1/chat/completions"),
+            )
+            raise APIStatusError(
+                "request exceeds the available context size",
+                response=response,
+                body={"message": "9784 tokens exceeds context size 8704"},
+            )
+
+    completions = CompletionsStub()
+    llm = object.__new__(LLM)
+    llm.config = SimpleNamespace(model="local", temperature=0.2, top_p=0.9)
+    llm.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    llm._native_tools_supported = None
+
+    with pytest.raises(APIStatusError, match="context size"):
+        await llm.respond(
+            messages=[{"role": "user", "content": "Read README"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
+
+    assert completions.calls == 1
+    assert llm._native_tools_supported is None
+
+
+def test_agent_selects_only_relevant_native_tool_schemas() -> None:
+    names = [
+        "read_file",
+        "write_file",
+        "browser_navigate",
+        "browser_snapshot",
+        "evm_validate_oracle",
+        "learning_create_tool",
+        "learning_create_skill",
+    ]
+    definitions = [
+        {"type": "function", "function": {"name": name}}
+        for name in names
+    ]
+    contract = TaskContract.from_prompt(
+        "Read README.md and report only its first heading."
+    )
+
+    selected = Agent._select_tool_definitions(
+        "Read README.md and report only its first heading.",
+        contract,
+        definitions,
+    )
+
+    selected_names = {item["function"]["name"] for item in selected}
+    assert selected_names == {
+        "read_file",
+        "write_file",
+        "learning_create_tool",
+        "learning_create_skill",
+    }
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "V, czy potrafisz tworzyć własne narzędzia?",
+        "How do I read a local file safely?",
+        "Why do agents sometimes invoke tools during a conversation?",
+        "Tell me what you think about tools in agent frameworks.",
+    ],
+)
+def test_capability_discussion_exposes_no_executable_tools(prompt: str) -> None:
+    definitions = [
+        {"type": "function", "function": {"name": "learning_create_tool"}},
+        {"type": "function", "function": {"name": "read_file"}},
+    ]
+
+    selected = Agent._select_tool_definitions(
+        prompt,
+        TaskContract.from_prompt(prompt),
+        definitions,
+    )
+
+    assert selected == []
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Stwórz nowe narzędzie do CSV.",
+        "Czy możesz przeczytać plik README.md?",
+        "Please read README.md and report its heading.",
+    ],
+)
+def test_explicit_action_request_exposes_relevant_tools(prompt: str) -> None:
+    definitions = [
+        {"type": "function", "function": {"name": "learning_create_tool"}},
+        {"type": "function", "function": {"name": "learning_create_skill"}},
+        {"type": "function", "function": {"name": "read_file"}},
+        {"type": "function", "function": {"name": "write_file"}},
+    ]
+
+    selected = Agent._select_tool_definitions(
+        prompt,
+        TaskContract.from_prompt(prompt),
+        definitions,
+    )
+
+    assert selected
+
+
+@pytest.mark.asyncio
+async def test_non_action_conversation_skips_tool_schema_discovery() -> None:
+    class ToolsStub:
+        async def openai_tool_definitions(self) -> list[dict]:
+            raise AssertionError("conversation must not start MCP discovery")
+
+        async def call(self, *args, **kwargs) -> str:
+            raise AssertionError("conversation must not execute a tool")
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            assert kwargs["tools"] is None
+            return LLMResponse(
+                content=(
+                    "Tools should answer to the agent's runtime, not hijack every "
+                    "damn conversation, Boss."
+                )
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop(
+        "Tell me what you think about tools taking over ordinary conversation."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert "not hijack" in answer
+
+
+def test_agent_bounds_tool_output_for_model_context() -> None:
+    fitted = Agent._fit_tool_output("HEAD\n" + "x" * 20_000 + "\nTAIL", max_characters=2_000)
+
+    assert len(fitted) == 2_000
+    assert fitted.startswith("HEAD")
+    assert fitted.endswith("TAIL")
+    assert "PALADYN omitted the middle" in fitted
+
+
+@pytest.mark.asyncio
+async def test_agent_executes_native_tool_call_and_returns_tool_role() -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            return "# PALADYN"
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+            self.second_messages: list[dict] = []
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            if self.turn == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            call_id="call_read",
+                            name="read_file",
+                            arguments={"path": "README.md"},
+                            raw_arguments='{"path":"README.md"}',
+                        )
+                    ],
+                    native_tools_enabled=True,
+                )
+            self.second_messages = kwargs["messages"]
+            return LLMResponse(content="The heading is `# PALADYN`, Boss.")
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    llm = LLMStub()
+    agent = object.__new__(Agent)
+    agent.llm = llm
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop("Read README.md")
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert answer == "The heading is `# PALADYN`, Boss."
+    assert tools.calls == [("read_file", {"path": "README.md"})]
+    tool_message = next(item for item in llm.second_messages if item["role"] == "tool")
+    assert tool_message["tool_call_id"] == "call_read"
+    assert "Status: succeeded" in tool_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_agent_renders_exact_first_heading_without_second_model_claim() -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls += 1
+            return "# PALADYN / V-Core\n\nFramework documentation"
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turns = 0
+            self.responses = iter(
+                (
+                    '{"tool":"read_file","arguments":{"path":"README.md"}}',
+                    "I'm done.",
+                    "The first heading is `# PALADYN / V-Core`, Boss.",
+                )
+            )
+
+        async def ask(self, **kwargs) -> str:
+            self.turns += 1
+            return next(self.responses)
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop(
+        "Read README.md and report only its first heading."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert answer == "# PALADYN / V-Core"
+    assert agent.tools.calls == 1
+    assert agent.llm.turns == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_uses_controlled_tool_creation_for_explicit_missing_tool() -> None:
+    manifest = {
+        "name": "extract_titles",
+        "version": "1.0.0",
+        "description": "Extract titles from bounded input.",
+        "input_schema": {"type": "object", "properties": {}},
+        "output_schema": {"type": "object", "properties": {}},
+        "tests": [{"name": "empty", "arguments": {}, "expected": {"titles": []}}],
+        "scope": "task",
+        "lesson_ids": [],
+        "timeout_seconds": 10,
+    }
+
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "learning_create_tool",
+                        "description": "Create and validate a tool",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            return '{"status":"active","validation":"passed"}'
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            if self.turn == 1:
+                arguments = {
+                    "manifest": manifest,
+                    "source": "def run(arguments):\n    return {'titles': []}",
+                }
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall("create_1", "learning_create_tool", arguments)
+                    ]
+                )
+            return LLMResponse(
+                content="The tool passed its lifecycle checks and is active, Boss."
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop("Create a generated tool for title extraction")
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert "active" in answer
+    assert agent.tools.calls[0][0] == "learning_create_tool"
+
+
+@pytest.mark.asyncio
+async def test_agent_rejects_text_tool_call_outside_authoritative_catalog() -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return []
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls += 1
+            raise AssertionError("an uncatalogued tool must never execute")
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            if self.turn == 1:
+                return LLMResponse(
+                    content=(
+                        '{"tool":"write_file","arguments":'
+                        '{"path":"notes.txt","content":"fake"}}'
+                    )
+                )
+            return LLMResponse(content="I could not perform the write.")
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent.MAX_AGENT_STEPS = 1
+
+    answer = await agent._run_agent_loop("Write notes.txt")
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert tools.calls == 0
+    assert "UnknownToolError" in answer
+    assert "nothing is running in the background" in answer.casefold()
+
+
+@pytest.mark.asyncio
+async def test_newly_created_tool_is_callable_in_same_agent_task() -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.active = False
+            self.calls: list[str] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            names = ["learning_create_tool"]
+            if self.active:
+                names.append("double_value")
+            return [
+                {"type": "function", "function": {"name": name}}
+                for name in names
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append(tool)
+            if tool == "learning_create_tool":
+                self.active = True
+                return '{"status":"active","validation":{"passed":true}}'
+            if tool == "double_value":
+                return '{"result":42}'
+            raise AssertionError(tool)
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            available = {
+                item["function"]["name"]
+                for item in (kwargs.get("tools") or [])
+            }
+            if self.turn == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "create_1",
+                            "learning_create_tool",
+                            {"manifest": {}, "source": "def run(arguments): return {}"},
+                        )
+                    ]
+                )
+            if self.turn == 2:
+                assert "double_value" in available
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall("run_1", "double_value", {"value": 21})
+                    ]
+                )
+            return LLMResponse(content="The generated tool returned 42, Boss.")
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop(
+        "Create a generated tool named double_value and use it on 21."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert tools.calls == ["learning_create_tool", "double_value"]
+    assert "42" in answer
+
+
+@pytest.mark.asyncio
+async def test_failed_sandbox_command_cannot_support_successful_test_claim() -> None:
+    class ToolsStub:
+        async def call(self, tool: str, arguments: dict) -> str:
+            assert tool == "sandbox_execute_offline"
+            return json.dumps(
+                {
+                    "exit_code": 1,
+                    "stdout": "1 failed",
+                    "stderr": "assertion failed",
+                    "timed_out": False,
+                    "output_limited": False,
+                    "workspace_limited": False,
+                }
+            )
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.responses = iter(
+                (
+                    '{"tool":"sandbox_execute_offline","arguments":'
+                    '{"command":["/usr/bin/false"],"workspace":"tests"}}',
+                    "All tests passed, Boss.",
+                )
+            )
+
+        async def ask(self, **kwargs) -> str:
+            return next(self.responses)
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent.MAX_AGENT_STEPS = 1
+
+    answer = await agent._run_agent_loop("Run the tests")
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert "SandboxResultError" in answer
+    assert "exit_code=1" in answer
+    assert "All tests passed" not in answer
+
+
+def test_rejected_generated_artifact_is_a_failed_tool_result() -> None:
+    error = Agent._tool_result_error(
+        '{"status":"rejected","validation":{"passed":false}}',
+        tool="learning_create_tool",
+    )
+
+    assert error.startswith("ArtifactLifecycleError")
+
+
+@pytest.mark.asyncio
+async def test_detail_page_contract_rejects_search_page_only_completion() -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            if tool == "browser_snapshot" and len(self.calls) < 4:
+                return "First result: mikalv/awesome-i2p"
+            return "Repository heading: mikalv/awesome-i2p"
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.responses = iter(
+                (
+                    '{"tool":"browser_navigate","arguments":{"url":"https://github.com/search?q=i2p"}}',
+                    '{"tool":"browser_snapshot","arguments":{}}',
+                    "The first repository is definitely something else, Boss.",
+                    '{"tool":"browser_navigate","arguments":{"url":"https://github.com/mikalv/awesome-i2p"}}',
+                    '{"tool":"browser_snapshot","arguments":{}}',
+                    "The inspected first result is `mikalv/awesome-i2p`, Boss.",
+                )
+            )
+
+        async def ask(self, **kwargs) -> str:
+            return next(self.responses)
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent.MAX_AGENT_STEPS = 8
+
+    answer = await agent._run_agent_loop(
+        "Search GitHub for I2P tools, inspect the first result, and report its actual repo."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert answer == "The inspected first result is `mikalv/awesome-i2p`, Boss."
+    assert [name for name, _ in agent.tools.calls] == [
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_navigate",
+        "browser_snapshot",
+    ]
 
 
 def test_constitution_is_user_aligned_without_blind_obedience() -> None:
@@ -1100,6 +2154,51 @@ async def test_non_english_answer_is_rewritten_in_english() -> None:
 
 
 @pytest.mark.asyncio
+async def test_language_repair_uses_compact_context_without_original_history() -> None:
+    class LLMStub:
+        def __init__(self) -> None:
+            self.messages: list[dict] = []
+
+        async def ask(self, *, messages: list[dict], **kwargs) -> str:
+            self.messages = messages
+            return "Yes. I can create and validate my own tools, Boss."
+
+    llm = LLMStub()
+    agent = object.__new__(Agent)
+    agent.llm = llm
+    original = [
+        {"role": "system", "content": "VERY-LONG-PERSONA" * 500},
+        {"role": "user", "content": "Czy potrafisz tworzyć narzędzia?"},
+    ]
+
+    answer = await agent._enforce_english(
+        original,
+        "Tak, potrafię tworzyć i sprawdzać własne narzędzia.",
+    )
+
+    assert answer == "Yes. I can create and validate my own tools, Boss."
+    assert len(llm.messages) == 3
+    assert "VERY-LONG-PERSONA" not in llm.messages[0]["content"]
+    assert llm.messages[-2]["content"].startswith("Tak, potrafię")
+
+
+@pytest.mark.asyncio
+async def test_language_gate_never_rewrites_structured_tool_action() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            raise AssertionError("Tool protocol must not enter language repair")
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    action = '{"tool":"read_file","arguments":{"path":"żółty.txt"}}'
+
+    assert await agent._enforce_english(
+        [{"role": "user", "content": "Przeczytaj plik żółty.txt"}],
+        action,
+    ) == action
+
+
+@pytest.mark.asyncio
 async def test_failed_language_rewrite_never_leaks_polish_answer() -> None:
     class LLMStub:
         async def ask(self, *, messages: list[dict], **kwargs) -> str:
@@ -1306,6 +2405,100 @@ async def test_extraction_research_visits_bounded_detail_pages() -> None:
 
 
 @pytest.mark.asyncio
+async def test_research_inspects_the_actual_first_result_when_requested() -> None:
+    entry = "https://github.com/search?q=i2p"
+    snapshot = """
+- link "mikalv/awesome-i2p" [ref=e1]:
+  - /url: /mikalv/awesome-i2p
+- link "someone/second-result" [ref=e2]:
+  - /url: /someone/second-result
+""".strip()
+
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.current = ""
+            self.calls: list[tuple[str, dict]] = []
+
+        async def browser_call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            if tool == "browser_navigate":
+                self.current = arguments["url"]
+                return "Navigated"
+            if self.current == entry:
+                return snapshot
+            return '- heading "awesome-i2p" [level=1] [ref=e3]'
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        async def ask(self, **kwargs) -> str:
+            return "The inspected first result is `mikalv/awesome-i2p`, Boss."
+
+    tools = ToolsStub()
+    task = ResearchTask(SimpleNamespace(tools=tools, llm=LLMStub()))
+
+    answer = await task.run(
+        f"Open {entry}, inspect the first result, and report its actual repository."
+    )
+
+    assert answer == "The inspected first result is `mikalv/awesome-i2p`, Boss."
+    assert tools.calls == [
+        ("browser_navigate", {"url": entry}),
+        ("browser_snapshot", {}),
+        (
+            "browser_navigate",
+            {"url": "https://github.com/mikalv/awesome-i2p"},
+        ),
+        ("browser_snapshot", {}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_research_returns_exact_runtime_tool_failure(tmp_path: Path) -> None:
+    class ResearchStub:
+        async def run(self, *args, **kwargs) -> str:
+            await kwargs["tool_runner"](
+                "browser_navigate", {"url": "https://missing.invalid"}
+            )
+            raise AssertionError("unreachable")
+
+    class ToolsStub:
+        def render_matching_skills(self, prompt: str) -> str:
+            return ""
+
+        async def browser_call(self, tool: str, arguments: dict) -> str:
+            raise MCPToolExecutionError("DNS resolution failed")
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+            self.relationship_state = RelationshipState()
+            self.manager = SimpleNamespace(load_all=lambda category: [])
+            self.execution: dict | None = None
+
+        async def process(self, prompt: str, answer: str, *, execution=None) -> None:
+            self.execution = execution
+
+    agent = object.__new__(Agent)
+    agent.research = ResearchStub()
+    agent.tools = ToolsStub()
+    agent.llm = SimpleNamespace(
+        config=SimpleNamespace(system_prompt="You are V.", context=8_192)
+    )
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._agent_trace_root = tmp_path / "autonomy" / "interactive"
+
+    answer = await agent._run_research_task("Inspect https://missing.invalid")
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert "MCPToolExecutionError: DNS resolution failed" in answer
+    assert "Nothing is running in the background" in answer
+    assert agent.memory.execution is not None
+    assert agent.memory.execution["status"] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_extraction_run_rejects_hallucinated_facts() -> None:
     entry_url = "https://skills.example/"
     entry_snapshot = """
@@ -1429,6 +2622,10 @@ async def test_bare_domain_research_records_real_browser_evidence(
 async def test_research_result_passes_through_language_gate() -> None:
     class ResearchStub:
         async def run(self, *args, **kwargs) -> str:
+            await kwargs["tool_runner"](
+                "browser_navigate", {"url": "https://example.com"}
+            )
+            await kwargs["tool_runner"]("browser_snapshot", {})
             return "Cześć Boss, znalazłam wynik."
 
     class MemoryStub:
@@ -1456,7 +2653,13 @@ async def test_research_result_passes_through_language_gate() -> None:
         identity=IdentityKernel(),
         voice=VoiceProfile(),
     )
-    agent.tools = SimpleNamespace(render_matching_skills=lambda prompt: "")
+    async def browser_call(tool: str, arguments: dict) -> str:
+        return "verified"
+
+    agent.tools = SimpleNamespace(
+        render_matching_skills=lambda prompt: "",
+        browser_call=browser_call,
+    )
 
     answer = await agent._run_research_task("Sprawdź tę stronę")
     await asyncio.gather(*agent._memory_tasks)
@@ -1613,3 +2816,23 @@ async def test_browser_mcp_error_is_not_reported_as_success() -> None:
 
     with pytest.raises(MCPToolExecutionError, match="DNS resolution failed"):
         await tools.browser_call("browser_navigate", {"url": "https://example.com"})
+
+
+@pytest.mark.asyncio
+async def test_filesystem_mcp_error_is_not_reported_as_success() -> None:
+    class SessionStub:
+        async def call_tool(self, tool: str, arguments: dict):
+            return SimpleNamespace(
+                content=[SimpleNamespace(text="Permission denied")],
+                isError=True,
+            )
+
+    class ClientStub:
+        @asynccontextmanager
+        async def session(self):
+            yield SessionStub()
+
+    filesystem = Filesystem(ClientStub())
+
+    with pytest.raises(FilesystemToolError, match="Permission denied"):
+        await filesystem.write_file("locked.txt", "nope")
