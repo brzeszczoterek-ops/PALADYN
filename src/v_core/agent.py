@@ -792,6 +792,14 @@ Current relationship stage: {stage}.
             if isinstance(item, dict)
             and item.get("function", {}).get("name")
         }
+        explicitly_named_tools = self._explicitly_named_tools(
+            routing_prompt,
+            tool_definitions,
+        )
+        if explicitly_named_tools:
+            contract = contract.with_required_tools(explicitly_named_tools)
+            if trace is not None:
+                trace.set_requirements(contract.to_dict())
         tool_definitions = self._select_tool_definitions(
             routing_prompt,
             contract,
@@ -2072,12 +2080,21 @@ Rules:
             return []
 
         hints = set(capability_hints or ())
-        if not hints and not Agent._requests_runtime_action(prompt, contract):
+        if (
+            not hints
+            and not contract.required_tools
+            and not Agent._requests_runtime_action(prompt, contract)
+        ):
             return []
 
         text = prompt.casefold()
         selected: set[str] = set()
         matched = False
+
+        explicitly_named = Agent._explicitly_named_tools(prompt, definitions)
+        if explicitly_named:
+            selected.update(explicitly_named)
+            matched = True
 
         if (
             contract.requires_browser_navigation
@@ -2137,7 +2154,7 @@ Rules:
             if explicit_skill_creation:
                 selected.add("learning_create_skill")
             matched = True
-        elif re.search(
+        elif not explicitly_named and re.search(
             r"\b(?:artifacts?|learning|lessons?|skills?|tools?|"
             r"artefakt\w*|lekcj\w*|narzędzi\w*|narzedzi\w*)\b",
             text,
@@ -2188,6 +2205,24 @@ Rules:
             for item in definitions
             if item.get("function", {}).get("name") in selected
         ]
+
+    @staticmethod
+    def _explicitly_named_tools(
+        prompt: str,
+        definitions: list[dict[str, Any]],
+    ) -> list[str]:
+        text = prompt.casefold()
+        names: list[str] = []
+        for item in definitions:
+            name = str(item.get("function", {}).get("name", "")).strip()
+            if not name:
+                continue
+            if re.search(
+                rf"(?<![a-z0-9_]){re.escape(name.casefold())}(?![a-z0-9_])",
+                text,
+            ):
+                names.append(name)
+        return list(dict.fromkeys(names))
 
     @staticmethod
     def _is_continuation_request(prompt: str) -> bool:
@@ -2282,6 +2317,7 @@ Rules:
                 contract.requires_command_execution,
                 contract.requires_created_tool,
                 contract.requires_created_skill,
+                bool(contract.required_tools),
             )
         ):
             return True
@@ -2295,7 +2331,7 @@ Rules:
             r"dodaj|edytuj|napisz|otworz|otwórz|przeczytaj|przejrzyj|"
             r"przenieś|przenies|przetestuj|sprawdź|sprawdz|stwórz|stworz|"
             r"przeszukaj|przeszukać|przeszukac|uruchom|usuń|usun|wejdź|wejdz|"
-            r"wykonaj|wyszukaj|znajdź|znajdz|zrób|zrob"
+            r"użyj|uzyj|wykonaj|wyszukaj|znajdź|znajdz|zrób|zrob"
         )
         return bool(
             re.search(

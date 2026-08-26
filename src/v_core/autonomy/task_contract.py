@@ -106,6 +106,7 @@ class TaskContract:
     requires_created_tool: bool = False
     requires_created_tool_execution: bool = False
     requires_created_skill: bool = False
+    required_tools: tuple[str, ...] = ()
 
     @classmethod
     def from_prompt(cls, prompt: str) -> "TaskContract":
@@ -146,24 +147,53 @@ class TaskContract:
         """Rebuild a contract from runtime-owned checkpoint data."""
 
         source = values if isinstance(values, dict) else {}
-        return cls(
-            **{
-                name: bool(source.get(name, False))
-                for name in cls.__dataclass_fields__
-            }
+        flags = {
+            name: bool(source.get(name, False))
+            for name in cls.__dataclass_fields__
+            if name != "required_tools"
+        }
+        raw_tools = source.get("required_tools", [])
+        required_tools = (
+            tuple(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in raw_tools
+                    if str(item).strip()
+                )
+            )
+            if isinstance(raw_tools, (list, tuple))
+            else ()
         )
+        return cls(**flags, required_tools=required_tools)
 
     def merged(self, other: "TaskContract") -> "TaskContract":
         """Return the union of two independently detected requirements."""
 
+        flags = {
+            name: bool(getattr(self, name) or getattr(other, name))
+            for name in self.__dataclass_fields__
+            if name != "required_tools"
+        }
+        required_tools = tuple(
+            dict.fromkeys((*self.required_tools, *other.required_tools))
+        )
+        return type(self)(**flags, required_tools=required_tools)
+
+    def with_required_tools(self, names: list[str] | tuple[str, ...]) -> "TaskContract":
         return type(self)(
             **{
-                name: bool(getattr(self, name) or getattr(other, name))
+                name: getattr(self, name)
                 for name in self.__dataclass_fields__
-            }
+                if name != "required_tools"
+            },
+            required_tools=tuple(
+                dict.fromkeys(
+                    (*self.required_tools, *(item for item in names if item))
+                )
+            ),
         )
 
-    def to_dict(self) -> dict[str, bool]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     def unmet(self, calls: list[dict[str, Any]]) -> list[str]:
@@ -237,6 +267,9 @@ class TaskContract:
                 missing.append("generated_tool_execution")
         if self.requires_created_skill and "learning_create_skill" not in names:
             missing.append("learning_create_skill")
+        for required_tool in self.required_tools:
+            if required_tool not in names:
+                missing.append(required_tool)
         return missing
 
     def answer_issues(self, answer: str, calls: list[dict[str, Any]]) -> list[str]:

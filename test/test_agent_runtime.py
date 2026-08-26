@@ -2002,6 +2002,29 @@ def test_explicit_tool_creation_hides_low_level_learning_operations() -> None:
     }
 
 
+def test_explicit_active_tool_name_is_selected_and_required() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": "count_words"}},
+        {"type": "function", "function": {"name": "read_file"}},
+        {"type": "function", "function": {"name": "learning_create_tool"}},
+    ]
+    prompt = 'Użyj narzędzia count_words na tekście "V can build her own tools".'
+    contract = TaskContract.from_prompt(prompt).with_required_tools(
+        Agent._explicitly_named_tools(prompt, definitions)
+    )
+
+    selected = Agent._select_tool_definitions(prompt, contract, definitions)
+
+    assert [item["function"]["name"] for item in selected] == ["count_words"]
+    assert contract.unmet([]) == ["count_words"]
+    assert contract.unmet(
+        [{"tool": "count_words", "status": "failed"}]
+    ) == ["count_words"]
+    assert contract.unmet(
+        [{"tool": "count_words", "status": "succeeded"}]
+    ) == []
+
+
 @pytest.mark.parametrize(
     "prompt",
     [

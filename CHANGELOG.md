@@ -81,6 +81,9 @@
   a model summary cannot relabel a failed tool call as successful work
 - Composite tool creation revalidates an identical rejected bundle after an
   infrastructure recovery and assigns the next patch version to changed code
+- Explicit references to active generated-tool names are preserved in the
+  per-task allowlist and become mandatory completion evidence; a failed call can
+  no longer end that requested action as completed
 - Short questions about V's current state or mood, including Polish variants such
   as "jak się dzisiaj czujesz?", remain in light conversation and never initialize
   MCP tool discovery or the full execution loop

@@ -161,6 +161,8 @@ Every item should pass before creating a new release.
   tool calls require a complete manifest and deterministic test structure.
 - [x] Failed artifacts can be revalidated unchanged after infrastructure recovery;
   changed bundles receive the next immutable patch version.
+- [x] A user-specified active generated-tool name reaches the executable allowlist,
+  excludes unrelated learning operations, and remains required until it succeeds.
 - [x] Offline generated tools cannot claim browser, network, or internet retrieval.
 - [x] Failed tool tests prevent activation.
 - [x] Active generated tools survive a runtime restart.

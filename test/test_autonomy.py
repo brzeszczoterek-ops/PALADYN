@@ -60,6 +60,20 @@ def test_task_contract_detects_polish_local_tool_and_required_use() -> None:
     assert contract.unmet(calls) == []
 
 
+def test_task_contract_round_trip_preserves_dynamic_required_tools() -> None:
+    contract = TaskContract(requires_evidence_report=True).with_required_tools(
+        ["count_words", "count_words"]
+    )
+
+    restored = TaskContract.from_dict(contract.to_dict())
+    merged = restored.merged(
+        TaskContract().with_required_tools(["extract_domains"])
+    )
+
+    assert restored.required_tools == ("count_words",)
+    assert merged.required_tools == ("count_words", "extract_domains")
+
+
 def test_checkpoint_round_trip(tmp_path: Path) -> None:
     task = AutonomousTask(objective="Build a report", task_id="report-1")
     task.transition(TaskStatus.RUNNING)
