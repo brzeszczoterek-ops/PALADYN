@@ -603,6 +603,12 @@ class MCPTools:
             "evm_quote_flash_swap": "Calculate a local flash-swap repayment quote.",
             "evm_foundry_test_offline": "Run Foundry tests inside the offline sandbox.",
         }
+        if self.learning is not None:
+            for definition in self.learning.active_tool_definitions():
+                schemas[str(definition["name"])] = (
+                    str(definition["description"]),
+                    dict(definition["parameters"]),
+                )
         definitions: list[dict[str, Any]] = []
         for name in self.local_tool_names():
             description, schema = schemas.get(

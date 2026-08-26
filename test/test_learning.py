@@ -904,6 +904,15 @@ async def test_composite_mcp_creation_keeps_full_internal_lifecycle(
     )
     assert tool["status"] == "active"
     assert tool["validation"]["passed"] is True
+    generated_definition = next(
+        item
+        for item in tools._local_tool_definitions()
+        if item["function"]["name"] == "double_value"
+    )
+    assert generated_definition["function"]["description"] == (
+        "Double an integer deterministically."
+    )
+    assert generated_definition["function"]["parameters"] == INPUT_SCHEMA
 
     skill_manifest = SkillManifest(
         name="double_numbers",

@@ -1159,6 +1159,29 @@ Current relationship stage: {stage}.
 
             if native_requests:
                 requests = native_requests
+                for request in requests:
+                    repaired = self._repair_explicit_text_arguments(
+                        prompt,
+                        str(request.get("tool", "")),
+                        request.get("arguments", {}),
+                        tool_definitions,
+                        contract,
+                    )
+                    if repaired != request.get("arguments"):
+                        request["arguments"] = repaired
+                        request["raw_arguments"] = json.dumps(
+                            repaired,
+                            ensure_ascii=False,
+                        )
+                        if trace is not None:
+                            trace.record_event(
+                                "tool_arguments_repaired",
+                                {
+                                    "tool": request.get("tool", ""),
+                                    "fields": sorted(repaired),
+                                    "source": "explicit_quoted_text",
+                                },
+                            )
                 messages.append(
                     {
                         "role": "assistant",
@@ -1191,6 +1214,25 @@ Current relationship stage: {stage}.
                         "raw_arguments": "",
                     }
                 ]
+                repaired = self._repair_explicit_text_arguments(
+                    prompt,
+                    tool_name,
+                    arguments,
+                    tool_definitions,
+                    contract,
+                )
+                if repaired != arguments:
+                    arguments = repaired
+                    requests[0]["arguments"] = repaired
+                    if trace is not None:
+                        trace.record_event(
+                            "tool_arguments_repaired",
+                            {
+                                "tool": tool_name,
+                                "fields": sorted(repaired),
+                                "source": "explicit_quoted_text",
+                            },
+                        )
                 messages.append(
                     {
                         "role": "assistant",
@@ -2223,6 +2265,50 @@ Rules:
             ):
                 names.append(name)
         return list(dict.fromkeys(names))
+
+    @staticmethod
+    def _repair_explicit_text_arguments(
+        prompt: str,
+        tool_name: str,
+        arguments: Any,
+        definitions: list[dict[str, Any]],
+        contract: TaskContract,
+    ) -> Any:
+        if (
+            tool_name not in contract.required_tools
+            or not isinstance(arguments, dict)
+            or arguments
+        ):
+            return arguments
+        definition = next(
+            (
+                item
+                for item in definitions
+                if item.get("function", {}).get("name") == tool_name
+            ),
+            None,
+        )
+        if definition is None:
+            return arguments
+        schema = definition.get("function", {}).get("parameters", {})
+        if not isinstance(schema, dict) or schema.get("type") != "object":
+            return arguments
+        required = schema.get("required", [])
+        properties = schema.get("properties", {})
+        if (
+            not isinstance(required, list)
+            or len(required) != 1
+            or not isinstance(properties, dict)
+        ):
+            return arguments
+        field = str(required[0])
+        field_schema = properties.get(field, {})
+        if not isinstance(field_schema, dict) or field_schema.get("type") != "string":
+            return arguments
+        quoted = re.findall(r'["“„]([^"”]{1,20000})["”]', prompt)
+        if not quoted:
+            return arguments
+        return {field: quoted[-1]}
 
     @staticmethod
     def _is_continuation_request(prompt: str) -> bool:

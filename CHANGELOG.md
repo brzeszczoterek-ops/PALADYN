@@ -84,6 +84,10 @@
 - Explicit references to active generated-tool names are preserved in the
   per-task allowlist and become mandatory completion evidence; a failed call can
   no longer end that requested action as completed
+- Active generated tools publish their validated manifest description and input
+  schema instead of an empty generic parameter object
+- For an explicitly named tool with one required string field, quoted user text
+  deterministically repairs an empty model-authored argument object
 - Short questions about V's current state or mood, including Polish variants such
   as "jak się dzisiaj czujesz?", remain in light conversation and never initialize
   MCP tool discovery or the full execution loop

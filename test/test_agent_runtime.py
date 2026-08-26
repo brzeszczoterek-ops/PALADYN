@@ -2025,6 +2025,62 @@ def test_explicit_active_tool_name_is_selected_and_required() -> None:
     ) == []
 
 
+def test_empty_explicit_generated_tool_arguments_recover_quoted_text() -> None:
+    prompt = "Użyj count_words na tekście „V can build her own tools”."
+    contract = TaskContract().with_required_tools(["count_words"])
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "count_words",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    repaired = Agent._repair_explicit_text_arguments(
+        prompt,
+        "count_words",
+        {},
+        definitions,
+        contract,
+    )
+
+    assert repaired == {"text": "V can build her own tools"}
+
+
+def test_argument_repair_does_not_guess_multiple_required_fields() -> None:
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "join_text",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "left": {"type": "string"},
+                        "right": {"type": "string"},
+                    },
+                    "required": ["left", "right"],
+                },
+            },
+        }
+    ]
+
+    assert Agent._repair_explicit_text_arguments(
+        'Use join_text on "one" and "two".',
+        "join_text",
+        {},
+        definitions,
+        TaskContract().with_required_tools(["join_text"]),
+    ) == {}
+
+
 @pytest.mark.parametrize(
     "prompt",
     [

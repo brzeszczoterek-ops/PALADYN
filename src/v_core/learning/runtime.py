@@ -392,6 +392,24 @@ class LearningRuntime:
             if self._visible(record)
         )
 
+    def active_tool_definitions(self) -> list[dict[str, Any]]:
+        definitions: list[dict[str, Any]] = []
+        for record in self.store.list_records(
+            status=ArtifactStatus.ACTIVE,
+            kind=ArtifactKind.TOOL,
+        ):
+            if not self._visible(record):
+                continue
+            manifest, _ = self.store.load_tool(record)
+            definitions.append(
+                {
+                    "name": manifest.name,
+                    "description": manifest.description,
+                    "parameters": manifest.input_schema,
+                }
+            )
+        return sorted(definitions, key=lambda item: str(item["name"]))
+
     def render_matching_skills(self, user_input: str, *, maximum: int = 5) -> str:
         matched: list[tuple[ArtifactRecord, SkillManifest]] = []
         for record in self.store.list_records(
