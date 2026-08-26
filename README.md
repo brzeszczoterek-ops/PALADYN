@@ -39,7 +39,7 @@ preserving its own recognizable personality and judgment.
 
 ## Current scope and future direction
 
-PALADYN 1.5 is currently a single-user foundation centered on V. This version
+PALADYN 2.0 is currently a single-user foundation centered on V. This version
 does not yet include a persona creator: V's identity, constitution, and voice
 are part of the framework. The immediate priority is to make V dependable for
 real work, persistent learning, tool use, and increasingly autonomous task
@@ -301,6 +301,21 @@ If Ubuntu/AppArmor prevents Bubblewrap from configuring its private loopback,
 PALADYN retries with a fail-closed libseccomp network filter: the sandbox retains
 its filesystem, PID, capability, resource, and workspace isolation while socket
 creation and network syscalls remain denied.
+
+Ubuntu releases with `kernel.apparmor_restrict_unprivileged_userns=1` also need
+PALADYN's AppArmor profile before a desktop-launched process may create the user
+namespace used by Bubblewrap:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  packaging/apparmor/paladyn /etc/apparmor.d/paladyn
+sudo apparmor_parser -r /etc/apparmor.d/paladyn
+aa-exec -p paladyn -- v-core
+```
+
+The profile leaves PALADYN otherwise unconfined, as it already is during a
+normal terminal launch, and adds the explicit `userns` grant required by that
+Ubuntu policy. Isolation of generated code is still enforced inside Bubblewrap.
 
 Task artifacts are restricted to their authorized workspace. Persistent
 artifacts require a validated lesson and two owner-approved capabilities. The

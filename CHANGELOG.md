@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2.0.0 - 2026-08-26
+
 ### Added
 - A step-by-step Windows 10/11 installation guide using WSL2, including CPU and
   NVIDIA/CUDA llama.cpp builds, validation, limitations, troubleshooting, and a
@@ -58,6 +60,8 @@
   exact bounded error while replacing private invocation arguments with a digest
 - A fail-closed Bubblewrap recovery path for AppArmor loopback failures that
   retains filesystem/process isolation and blocks networking with libseccomp
+- A PALADYN AppArmor launch profile for Ubuntu systems that restrict
+  unprivileged user namespaces required by Bubblewrap
 
 ### Fixed
 - Tool availability is now a runtime-owned allowlist: schema-discovery failure,
@@ -88,6 +92,9 @@
   schema instead of an empty generic parameter object
 - For an explicitly named tool with one required string field, quoted user text
   deterministically repairs an empty model-authored argument object
+- Spoken multi-part tool names tolerate one unique, conservative transcription
+  error, so STT output such as `Can't Words` still resolves to `count_words`
+  without allowing ambiguous tool selection
 - Short questions about V's current state or mood, including Polish variants such
   as "jak się dzisiaj czujesz?", remain in light conversation and never initialize
   MCP tool discovery or the full execution loop

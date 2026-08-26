@@ -43,8 +43,8 @@ from v_core.relationship import RelationshipState
 import v_core.main as main_module
 
 
-def test_public_version_is_1_5_0() -> None:
-    assert v_core.__version__ == "1.5.0"
+def test_public_version_is_2_0_0() -> None:
+    assert v_core.__version__ == "2.0.0"
 
 
 def test_tool_request_accepts_structured_json() -> None:
@@ -2022,6 +2022,31 @@ def test_explicit_active_tool_name_is_selected_and_required() -> None:
     ) == ["count_words"]
     assert contract.unmet(
         [{"tool": "count_words", "status": "succeeded"}]
+    ) == []
+
+
+def test_spoken_tool_name_typo_uniquely_selects_existing_tool() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": "count_words"}},
+        {"type": "function", "function": {"name": "read_file"}},
+        {"type": "function", "function": {"name": "learning_create_tool"}},
+    ]
+    prompt = (
+        "V, użyj narzędzia Can't Words na zdaniu "
+        "V potrafi robić swoje własne narzędzia."
+    )
+
+    assert Agent._explicitly_named_tools(prompt, definitions) == ["count_words"]
+
+
+def test_ambiguous_spoken_tool_name_does_not_guess() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": "count_words"}},
+        {"type": "function", "function": {"name": "count_worlds"}},
+    ]
+
+    assert Agent._explicitly_named_tools(
+        "Use the count word tool.", definitions
     ) == []
 
 

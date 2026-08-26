@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from difflib import SequenceMatcher
 import json
 import os
 import re
@@ -2254,7 +2255,7 @@ Rules:
         definitions: list[dict[str, Any]],
     ) -> list[str]:
         text = prompt.casefold()
-        names: list[str] = []
+        exact_names: list[str] = []
         for item in definitions:
             name = str(item.get("function", {}).get("name", "")).strip()
             if not name:
@@ -2263,8 +2264,47 @@ Rules:
                 rf"(?<![a-z0-9_]){re.escape(name.casefold())}(?![a-z0-9_])",
                 text,
             ):
-                names.append(name)
-        return list(dict.fromkeys(names))
+                exact_names.append(name)
+        if exact_names:
+            return list(dict.fromkeys(exact_names))
+
+        # Voice transcription commonly turns an identifier such as
+        # ``count_words`` into natural-language words (for example
+        # ``Can't Words``). Permit one conservative, unique fuzzy match so an
+        # STT typo does not make the agent invent a replacement tool. This is
+        # deliberately limited to multi-part identifiers and requires a clear
+        # margin over the next candidate; ambiguity therefore fails closed.
+        prompt_words = Agent._tool_name_words(prompt)
+        candidates: list[tuple[float, str]] = []
+        for item in definitions:
+            name = str(item.get("function", {}).get("name", "")).strip()
+            name_words = Agent._tool_name_words(name)
+            if not name or len(name_words) < 2 or len(prompt_words) < len(name_words):
+                continue
+            expected = " ".join(name_words)
+            score = max(
+                SequenceMatcher(
+                    None,
+                    " ".join(prompt_words[index : index + len(name_words)]),
+                    expected,
+                ).ratio()
+                for index in range(len(prompt_words) - len(name_words) + 1)
+            )
+            if score >= 0.84:
+                candidates.append((score, name))
+
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        if not candidates:
+            return []
+        if len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.08:
+            return []
+        return [candidates[0][1]]
+
+    @staticmethod
+    def _tool_name_words(value: str) -> list[str]:
+        normalized = value.casefold().replace("'", "").replace("’", "")
+        normalized = normalized.replace("_", " ").replace("-", " ")
+        return re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
 
     @staticmethod
     def _repair_explicit_text_arguments(
