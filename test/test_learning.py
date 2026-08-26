@@ -42,7 +42,7 @@ from v_core.learning import (
     validate_schema,
     audit_learning_store,
 )
-from v_core.sandbox import BubblewrapBackend
+from v_core.sandbox import BubblewrapBackend, SandboxResult
 from v_core.mcp_tools import MCPTools
 from v_core.agent import Agent
 from v_core.memory.session import Session
@@ -167,6 +167,26 @@ def test_schema_rejects_unknown_and_missing_fields() -> None:
         validate_instance({"value": 2, "hidden": True}, INPUT_SCHEMA)
     with pytest.raises(SchemaError, match="missing"):
         validate_instance({}, INPUT_SCHEMA)
+
+
+def test_schema_accepts_bounded_description_annotations() -> None:
+    schema = {
+        "type": "object",
+        "description": "Input payload.",
+        "properties": {
+            "value": {"type": "integer", "description": "Value to double."},
+        },
+        "required": ["value"],
+        "additionalProperties": False,
+    }
+
+    validate_schema(schema)
+    validate_instance({"value": 2}, schema)
+
+
+def test_schema_rejects_invalid_description_annotation() -> None:
+    with pytest.raises(SchemaError, match="description"):
+        validate_schema({"type": "string", "description": 123})
 
 
 @pytest.mark.parametrize(
@@ -518,6 +538,26 @@ def test_record_status_tampering_is_detected(tmp_path: Path) -> None:
 
     with pytest.raises(JournalIntegrityError, match="status differs"):
         learning.store.load_record(staged.artifact_id)
+
+
+def test_real_tool_failure_is_recorded_without_private_arguments(tmp_path: Path) -> None:
+    learning = runtime(tmp_path)
+    evidence = learning.capture_tool_failure(
+        task_id="interactive-failure",
+        tool="browser_snapshot",
+        arguments={"secret_query": "private value"},
+        error="TimeoutError: page did not respond",
+    )
+
+    assert evidence.source is EvidenceSource.TOOL_RESULT
+    assert evidence.outcome is EvidenceOutcome.FAILURE
+    assert evidence.verified is True
+    assert evidence.confidence == 1.0
+    assert evidence.actual == "TimeoutError: page did not respond"
+    assert evidence.metadata["tool"] == "browser_snapshot"
+    assert len(evidence.metadata["arguments_sha256"]) == 64
+    stored = json.dumps(evidence.to_dict(), ensure_ascii=False)
+    assert "private value" not in stored
 
 
 def test_lesson_content_tampering_is_detected(tmp_path: Path) -> None:
@@ -887,6 +927,110 @@ async def test_composite_mcp_creation_keeps_full_internal_lifecycle(
     events = [item["event"] for item in tools.learning.store.audit_journal.read_verified()]
     assert events.count("artifact_staged") == 2
     assert events.count("artifact_transitioned") == 4
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.asyncio
+async def test_composite_creation_auto_versions_changed_rejected_bundle(
+    tmp_path: Path,
+) -> None:
+    learning = runtime(tmp_path)
+    manifest = tool_manifest(expected=5)
+    with pytest.raises(ArtifactValidationError):
+        await learning.create_tool(manifest, DOUBLE_SOURCE)
+    rejected = learning.store.list_records()[0]
+
+    corrected_manifest = tool_manifest(expected=4)
+    record = await learning.create_tool(corrected_manifest, DOUBLE_SOURCE)
+
+    assert record.status is ArtifactStatus.ACTIVE
+    assert record.version == "1.0.1"
+    assert record.artifact_id != rejected.artifact_id
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.asyncio
+async def test_composite_creation_revalidates_same_bundle_after_backend_recovery(
+    tmp_path: Path,
+) -> None:
+    class FailingBackend:
+        name = "temporary-failure"
+
+        async def run(self, spec) -> SandboxResult:
+            return SandboxResult(
+                command=spec.command,
+                exit_code=1,
+                stdout="",
+                stderr="temporary sandbox infrastructure failure",
+                duration_seconds=0.0,
+                backend=self.name,
+            )
+
+    learning = runtime(tmp_path)
+    learning.backend = FailingBackend()
+    with pytest.raises(ArtifactValidationError, match="temporary sandbox"):
+        await learning.create_tool(tool_manifest(), DOUBLE_SOURCE)
+    rejected = learning.store.list_records()[0]
+
+    learning.backend = BubblewrapBackend()
+    recovered = await learning.create_tool(tool_manifest(), DOUBLE_SOURCE)
+
+    assert recovered.artifact_id == rejected.artifact_id
+    assert recovered.status is ArtifactStatus.ACTIVE
+    assert recovered.version == "1.0.0"
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.asyncio
+async def test_composite_creation_reuses_identical_active_bundle(
+    tmp_path: Path,
+) -> None:
+    learning = runtime(tmp_path)
+    first = await learning.create_tool(tool_manifest(), DOUBLE_SOURCE)
+    second = await learning.create_tool(tool_manifest(), DOUBLE_SOURCE)
+
+    assert second.artifact_id == first.artifact_id
+    assert len(learning.store.list_records()) == 1
+
+
+def test_learning_tool_definition_requires_complete_manifest(tmp_path: Path) -> None:
+    tools = MCPTools(
+        SimpleNamespace(
+            filesystem_server=["/usr/bin/false"],
+            browser_server=["/usr/bin/false"],
+            workspace=tmp_path / "workspace",
+            learning_root=tmp_path / "learning",
+            learning_profile="client",
+            evm_profile="client",
+        )
+    )
+    definitions = {
+        item["function"]["name"]: item["function"]["parameters"]
+        for item in tools._local_tool_definitions()
+    }
+    manifest = definitions["learning_create_tool"]["properties"]["manifest"]
+
+    assert "description" in manifest["required"]
+    assert "tests" in manifest["required"]
+    assert manifest["properties"]["tests"]["items"]["required"] == [
+        "name",
+        "arguments",
+        "expected",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_generated_offline_tool_cannot_claim_web_retrieval(tmp_path: Path) -> None:
+    learning = runtime(tmp_path)
+    manifest = tool_manifest()
+    object.__setattr__(
+        manifest,
+        "description",
+        "Search the web and retrieve personal information.",
+    )
+
+    with pytest.raises(ArtifactPolicyError, match="run offline"):
+        await learning.create_tool(manifest, DOUBLE_SOURCE)
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")

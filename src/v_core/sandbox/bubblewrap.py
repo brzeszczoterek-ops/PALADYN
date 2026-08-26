@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import ctypes.util
 import os
 from pathlib import Path
 import re
@@ -40,6 +42,30 @@ _BLOCKED_ENV = {
     "PYTHONPATH",
     "SSH_AUTH_SOCK",
 }
+_LOOPBACK_PERMISSION_ERROR = (
+    "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"
+)
+_NETWORK_SYSCALLS = (
+    "accept",
+    "accept4",
+    "bind",
+    "connect",
+    "getpeername",
+    "getsockname",
+    "getsockopt",
+    "io_uring_setup",
+    "listen",
+    "recvfrom",
+    "recvmmsg",
+    "recvmsg",
+    "sendmmsg",
+    "sendmsg",
+    "sendto",
+    "setsockopt",
+    "shutdown",
+    "socket",
+    "socketpair",
+)
 
 
 class BubblewrapBackend:
@@ -57,6 +83,8 @@ class BubblewrapBackend:
         self,
         executable: str | Path | None = None,
         resource_limiter: str | Path | None = None,
+        *,
+        force_seccomp_network_filter: bool = False,
     ) -> None:
         discovered = str(executable) if executable else shutil.which("bwrap")
         if not discovered:
@@ -71,12 +99,59 @@ class BubblewrapBackend:
         if not limiter:
             raise SandboxUnavailable("prlimit is not installed")
         self.resource_limiter = Path(limiter).resolve()
+        self.force_seccomp_network_filter = force_seccomp_network_filter
 
     async def run(self, spec: SandboxSpec) -> SandboxResult:
         workspace = Path(spec.workspace).resolve()
         workspace.mkdir(parents=True, exist_ok=True)
         self._validate_spec(spec, workspace)
-        argv = self._build_argv(spec, workspace)
+
+        if self.force_seccomp_network_filter:
+            return await self._run_seccomp_network_fallback(spec, workspace)
+
+        result = await self._run_once(spec, workspace)
+        if (
+            not result.succeeded
+            and not result.timed_out
+            and not result.output_limited
+            and not result.workspace_limited
+            and _LOOPBACK_PERMISSION_ERROR in result.stderr
+        ):
+            return await self._run_seccomp_network_fallback(spec, workspace)
+        return result
+
+    async def _run_seccomp_network_fallback(
+        self,
+        spec: SandboxSpec,
+        workspace: Path,
+    ) -> SandboxResult:
+        filter_fd = self._network_filter_fd()
+        try:
+            return await self._run_once(
+                spec,
+                workspace,
+                share_network=True,
+                seccomp_fd=filter_fd,
+                backend_name="bubblewrap+seccomp-netblock",
+            )
+        finally:
+            os.close(filter_fd)
+
+    async def _run_once(
+        self,
+        spec: SandboxSpec,
+        workspace: Path,
+        *,
+        share_network: bool = False,
+        seccomp_fd: int | None = None,
+        backend_name: str | None = None,
+    ) -> SandboxResult:
+        argv = self._build_argv(
+            spec,
+            workspace,
+            share_network=share_network,
+            seccomp_fd=seccomp_fd,
+        )
 
         started = time.monotonic()
         process = await asyncio.create_subprocess_exec(
@@ -85,6 +160,7 @@ class BubblewrapBackend:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            pass_fds=((seccomp_fd,) if seccomp_fd is not None else ()),
         )
 
         timed_out = False
@@ -126,7 +202,7 @@ class BubblewrapBackend:
             stdout=self._decode(stdout[:limit]),
             stderr=self._decode(stderr[:limit]),
             duration_seconds=time.monotonic() - started,
-            backend=self.name,
+            backend=backend_name or self.name,
             timed_out=timed_out,
             output_limited=output_limited,
             workspace_limited=workspace_limited,
@@ -158,7 +234,14 @@ class BubblewrapBackend:
                     "workspace content is already mounted; do not duplicate it as input"
                 )
 
-    def _build_argv(self, spec: SandboxSpec, workspace: Path) -> list[str]:
+    def _build_argv(
+        self,
+        spec: SandboxSpec,
+        workspace: Path,
+        *,
+        share_network: bool = False,
+        seccomp_fd: int | None = None,
+    ) -> list[str]:
         limits = spec.limits
         argv = [
             str(self.resource_limiter),
@@ -171,9 +254,18 @@ class BubblewrapBackend:
             "--die-with-parent",
             "--new-session",
             "--unshare-all",
-            "--cap-drop",
-            "ALL",
-            "--clearenv",
+        ]
+        if share_network:
+            if seccomp_fd is None:
+                raise SandboxPolicyError(
+                    "retaining the host network namespace requires a seccomp filter"
+                )
+            argv.extend(("--share-net", "--seccomp", str(seccomp_fd)))
+        argv.extend(
+            [
+                "--cap-drop",
+                "ALL",
+                "--clearenv",
             "--ro-bind",
             "/usr",
             "/usr",
@@ -198,8 +290,9 @@ class BubblewrapBackend:
             "/nonexistent",
             "--bind",
             str(workspace),
-            "/workspace",
-        ]
+                "/workspace",
+            ]
+        )
 
         for index, source in enumerate(spec.read_only_inputs):
             resolved = Path(source).resolve(strict=True)
@@ -235,6 +328,71 @@ class BubblewrapBackend:
             )
         )
         return argv
+
+    @staticmethod
+    def _network_filter_fd() -> int:
+        """Compile a fail-closed seccomp filter that denies network syscalls."""
+
+        library_name = ctypes.util.find_library("seccomp")
+        if not library_name:
+            raise SandboxUnavailable(
+                "libseccomp is required for the offline network fallback"
+            )
+        library = ctypes.CDLL(library_name, use_errno=True)
+        library.seccomp_init.argtypes = [ctypes.c_uint32]
+        library.seccomp_init.restype = ctypes.c_void_p
+        library.seccomp_release.argtypes = [ctypes.c_void_p]
+        library.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+        library.seccomp_syscall_resolve_name.restype = ctypes.c_int
+        library.seccomp_rule_add.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        library.seccomp_rule_add.restype = ctypes.c_int
+        library.seccomp_export_bpf.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        library.seccomp_export_bpf.restype = ctypes.c_int
+
+        scmp_act_allow = 0x7FFF0000
+        scmp_act_errno = 0x00050000 | 1  # EPERM
+        context = library.seccomp_init(scmp_act_allow)
+        if not context:
+            raise SandboxUnavailable("libseccomp could not initialize a filter")
+
+        fd = -1
+        try:
+            for name in _NETWORK_SYSCALLS:
+                syscall = library.seccomp_syscall_resolve_name(name.encode("ascii"))
+                if syscall < 0:
+                    continue
+                result = library.seccomp_rule_add(
+                    context,
+                    scmp_act_errno,
+                    syscall,
+                    0,
+                )
+                if result < 0:
+                    raise SandboxUnavailable(
+                        f"libseccomp could not block syscall {name}: errno {-result}"
+                    )
+            fd = os.memfd_create(
+                "paladyn-network-seccomp",
+                flags=getattr(os, "MFD_CLOEXEC", 0),
+            )
+            result = library.seccomp_export_bpf(context, fd)
+            if result < 0:
+                raise SandboxUnavailable(
+                    f"libseccomp could not export the network filter: errno {-result}"
+                )
+            os.lseek(fd, 0, os.SEEK_SET)
+            return fd
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            raise
+        finally:
+            library.seccomp_release(context)
 
     async def _collect_output(
         self,

@@ -97,6 +97,7 @@ class LLM:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str = "auto",
         max_tokens: int | None = None,
+        temperature: float | None = None,
     ) -> LLMResponse:
         """Return prose and native tool calls without discarding either.
 
@@ -107,7 +108,9 @@ class LLM:
         normalized = self._normalize_system_messages(messages)
         request: dict[str, Any] = {
             "model": self.config.model,
-            "temperature": self.config.temperature,
+            "temperature": (
+                self.config.temperature if temperature is None else float(temperature)
+            ),
             "top_p": self.config.top_p,
             "messages": normalized,
             "max_tokens": max_tokens or int(os.getenv("V_CORE_MAX_TOKENS", "512")),
@@ -137,15 +140,54 @@ class LLM:
                     "tools unsupported",
                 )
             )
+            malformed_tool_arguments = error.status_code in {400, 422, 500} and any(
+                marker in error_detail
+                for marker in (
+                    "failed to parse tool call arguments as json",
+                    "parse tool call arguments",
+                    "parse_error.101",
+                    "missing closing quote",
+                )
+            )
             if (
                 not native_requested
                 or error.status_code not in {400, 422, 500, 501}
-                or not template_rejection
+                or not (template_rejection or malformed_tool_arguments)
             ):
                 raise
-            self._native_tools_supported = False
+
+            # A malformed native call is rejected by llama.cpp before its
+            # partial arguments reach PALADYN, so the normal argument validator
+            # cannot repair it. Retry this turn once through the compact textual
+            # compatibility protocol. Unlike a template rejection, this does not
+            # disable native tools for later turns: the template supports tools;
+            # this particular generation was merely malformed or truncated.
+            if template_rejection:
+                self._native_tools_supported = False
             request.pop("tools", None)
             request.pop("tool_choice", None)
+            if malformed_tool_arguments and not template_rejection:
+                request["messages"] = self._normalize_system_messages(
+                    [
+                        *normalized,
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous native tool call was rejected because "
+                                "its arguments were malformed or truncated JSON. Retry "
+                                "the same next action now using exactly one compact "
+                                "compatibility object: "
+                                '{"tool":"<available_tool>","arguments":{}}. '
+                                "Output JSON only, include only required fields, and "
+                                "close every string and brace. Do not narrate the call."
+                            ),
+                        },
+                    ]
+                )
+                request["temperature"] = min(
+                    float(self.config.temperature),
+                    0.1,
+                )
             response = await self.client.chat.completions.create(**request)
             native_requested = False
         else:
@@ -192,6 +234,7 @@ class LLM:
         prompt: str | None = None,
         messages: list | None = None,
         max_tokens: int | None = None,
+        temperature: float | None = None,
     ) -> str:
 
         if messages is None:
@@ -210,6 +253,7 @@ class LLM:
         response = await self.respond(
             messages=messages,
             max_tokens=max_tokens or int(os.getenv("V_CORE_MAX_TOKENS", "512")),
+            temperature=temperature,
         )
         return response.content
 

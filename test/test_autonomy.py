@@ -15,6 +15,7 @@ from v_core.autonomy import (
     ChordDetector,
     ControlChannel,
     ControlSignal,
+    ContextWindowManager,
     ExecutionMode,
     GlobalControlChannel,
     RuntimeRegistry,
@@ -22,12 +23,41 @@ from v_core.autonomy import (
     StepResult,
     TaskBudget,
     TaskContract,
+    MultilingualIntentRouter,
+    SemanticIntent,
     TaskJournal,
     TaskStatus,
     parse_chord,
 )
 from v_core.autonomy.policy import AuthorizationDenied, AuthorizationGuard
 from v_core.config import load_config
+
+
+def test_task_contract_detects_polish_local_tool_and_required_use() -> None:
+    contract = TaskContract.from_prompt(
+        "Stwórz lokalne narzędzie count_words, a następnie użyj go."
+    )
+
+    assert contract.requires_created_tool is True
+    assert contract.requires_created_tool_execution is True
+    assert contract.unmet([]) == [
+        "learning_create_tool",
+        "generated_tool_execution",
+    ]
+
+    calls = [
+        {
+            "tool": "learning_create_tool",
+            "status": "succeeded",
+            "result_excerpt": json.dumps({"name": "count_words"}),
+        },
+        {
+            "tool": "count_words",
+            "status": "succeeded",
+            "result_excerpt": json.dumps({"word_count": 6}),
+        },
+    ]
+    assert contract.unmet(calls) == []
 
 
 def test_checkpoint_round_trip(tmp_path: Path) -> None:
@@ -123,6 +153,208 @@ def test_task_contract_detects_generic_online_work_without_explicit_url() -> Non
     assert contract.requires_browser_snapshot is True
     assert contract.requires_evidence_report is True
     assert contract.unmet([]) == ["browser_navigate", "browser_snapshot"]
+
+
+def test_task_contract_detects_polish_infinitive_przeszukac_internet() -> None:
+    contract = TaskContract.from_prompt(
+        "Masz przeszukać internet i znaleźć narzędzia oraz umiejętności "
+        "potrzebne do monitorowania darknetowych forów."
+    )
+
+    assert contract.requires_browser_navigation is True
+    assert contract.requires_browser_snapshot is True
+    assert contract.requires_evidence_report is True
+
+
+def test_task_contract_detects_polish_locative_w_internecie() -> None:
+    contract = TaskContract.from_prompt(
+        "Znajdź mi w internecie informacje o tej osobie i podaj wyniki."
+    )
+
+    assert contract.requires_browser_navigation is True
+    assert contract.requires_browser_snapshot is True
+    assert contract.requires_evidence_report is True
+
+
+@pytest.mark.asyncio
+async def test_rollover_caps_complete_request_to_local_context_budget() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "completed": ["Checked source"] * 20,
+                    "findings": ["Concrete verified finding " + "x" * 500] * 20,
+                    "open_questions": ["Which result is relevant?"] * 20,
+                    "next_steps": ["Inspect the next source"] * 20,
+                }
+            )
+
+    manager = ContextWindowManager()
+    contract = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+    )
+    messages = [
+        {"role": "system", "content": "S" * 12_000},
+        {"role": "user", "content": "history " * 4_000},
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": f"browser_tool_{index}",
+                "description": "D" * 500,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for index in range(6)
+    ]
+    evidence = [
+        {
+            "sequence": index,
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": f"result-{index} " + "e" * 2_000,
+            "error": "",
+        }
+        for index in range(10)
+    ]
+
+    rollover = await manager.rollover(
+        llm=LLMStub(),
+        system_prompt="S" * 12_000,
+        objective="Inspect sources",
+        contract=contract,
+        messages=messages,
+        tools=tools,
+        evidence=evidence,
+        previous_summary=None,
+        context_tokens=12_000,
+        step=10,
+    )
+
+    assert rollover.estimated_tokens_after <= int(12_000 * 0.72)
+    assert rollover.estimated_tokens_after < rollover.estimated_tokens_before
+    assert rollover.evidence
+    assert all(
+        len(item) <= 240
+        for values in rollover.summary.values()
+        for item in values
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollover_cannot_relabel_failed_runtime_call_as_success() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "completed": ["Created and executed count_words"],
+                    "findings": ["Sandbox problem was fixed and execution succeeded"],
+                    "open_questions": ["What should run next?"],
+                    "next_steps": ["Use a different strategy"],
+                }
+            )
+
+    evidence = [
+        {
+            "sequence": 1,
+            "tool": "learning_create_tool",
+            "arguments": {},
+            "status": "failed",
+            "result_excerpt": (
+                "ArtifactValidationError: bwrap loopback RTM_NEWADDR denied"
+            ),
+            "error": "ArtifactValidationError",
+        }
+    ]
+    rollover = await ContextWindowManager().rollover(
+        llm=LLMStub(),
+        system_prompt="system",
+        objective="Create count_words",
+        contract=TaskContract(requires_created_tool=True),
+        messages=[{"role": "user", "content": "Create count_words"}],
+        tools=[],
+        evidence=evidence,
+        previous_summary=None,
+        context_tokens=8_192,
+        step=1,
+    )
+
+    assert rollover.summary["completed"] == ["learning_create_tool: failed"]
+    assert "RTM_NEWADDR" in rollover.summary["findings"][0]
+    assert not any(
+        "succeeded" in item for item in rollover.summary["findings"]
+    )
+
+
+def test_semantic_intent_accepts_only_closed_capability_vocabulary() -> None:
+    intent = SemanticIntent.parse(
+        json.dumps(
+            {
+                "action_requested": True,
+                "continue_previous": False,
+                "capabilities": ["browser", "invented_shell", "browser"],
+                "requires_report": True,
+                "distinct_detail_page": True,
+            }
+        )
+    )
+
+    assert intent is not None
+    assert intent.capabilities == ("browser",)
+    contract = intent.to_contract()
+    assert contract.requires_browser_navigation is True
+    assert contract.requires_browser_snapshot is True
+    assert contract.requires_distinct_detail_page is True
+    assert contract.requires_evidence_report is True
+
+
+@pytest.mark.asyncio
+async def test_multilingual_intent_router_classifies_hungarian_action() -> None:
+    class LLMStub:
+        def __init__(self) -> None:
+            self.kwargs: dict = {}
+
+        async def ask(self, **kwargs) -> str:
+            self.kwargs = kwargs
+            return json.dumps(
+                {
+                    "action_requested": True,
+                    "continue_previous": False,
+                    "capabilities": ["browser"],
+                    "requires_report": True,
+                    "distinct_detail_page": False,
+                }
+            )
+
+    llm = LLMStub()
+    router = MultilingualIntentRouter(llm)
+
+    intent = await router.classify(
+        "Keress az interneten es keszits jelentest az eredmenyekrol."
+    )
+
+    assert intent is not None
+    assert intent.action_requested is True
+    assert intent.capabilities == ("browser",)
+    assert intent.requires_report is True
+    assert llm.kwargs["temperature"] == 0.0
+    assert llm.kwargs["max_tokens"] == 128
+
+
+@pytest.mark.asyncio
+async def test_multilingual_intent_router_fails_closed_on_invalid_output() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return "I think this probably needs a browser."
+
+    intent = await MultilingualIntentRouter(LLMStub()).classify(
+        "Keress az interneten."
+    )
+
+    assert intent is None
 
 
 def test_task_contract_requires_real_detail_page_after_search_listing() -> None:

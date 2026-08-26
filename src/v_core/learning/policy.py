@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 import json
+import re
 from typing import Iterable
 
 from v_core.autonomy import AuthorizationGuard
@@ -76,6 +77,12 @@ _RESERVED_TOOL_NAMES = {
     "search_files",
     "write_file",
 }
+_PLACEHOLDER_TOOL_NAMES = {"new_tool", "snake_case_name", "tool_name"}
+_EXTERNAL_RETRIEVAL_CLAIM = re.compile(
+    r"\b(?:browse|download|fetch|internet|network|online|search\s+(?:the\s+)?web|"
+    r"web\s+search|przegląd\w*\s+sie\w*|internet\w*)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -99,12 +106,25 @@ class ArtifactPolicy:
 
     @staticmethod
     def validate_tool_manifest(manifest: ToolManifest) -> None:
+        if manifest.name in _PLACEHOLDER_TOOL_NAMES:
+            raise ArtifactPolicyError(
+                "generated tool name is still a placeholder; choose a concrete name"
+            )
         if (
             manifest.name in _RESERVED_TOOL_NAMES
             or manifest.name.startswith(("evm_", "learning_", "paladyn_"))
         ):
             raise ArtifactPolicyError(
                 f"generated tool name is reserved: {manifest.name}"
+            )
+        if manifest.description.strip(" .") == "":
+            raise ArtifactPolicyError(
+                "generated tool description is still a placeholder"
+            )
+        if _EXTERNAL_RETRIEVAL_CLAIM.search(manifest.description):
+            raise ArtifactPolicyError(
+                "generated tools run offline and cannot claim internet or web retrieval; "
+                "use an existing browser tool and create a skill to orchestrate it"
             )
         validate_schema(manifest.input_schema)
         validate_schema(manifest.output_schema)

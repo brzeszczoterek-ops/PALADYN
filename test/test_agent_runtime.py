@@ -12,7 +12,8 @@ from openai import APIStatusError
 
 import v_core
 from v_core.agent import Agent
-from v_core.autonomy import TaskContract
+from v_core.autonomy import ContextWindowManager, SemanticIntent, TaskContract
+from v_core.autonomy.agent_trace import AgentTaskTrace
 from v_core.capability_dispatcher import CapabilityDispatcher
 from v_core.memory.manager import MemoryManager
 from v_core.memory.models import ExperienceEntry, KnowledgeEntry, MemorySource
@@ -987,7 +988,7 @@ async def test_website_claim_requires_navigation_and_snapshot_evidence() -> None
 
 
 @pytest.mark.asyncio
-async def test_website_task_is_blocked_instead_of_hallucinated_without_evidence(
+async def test_website_task_waits_for_owner_instead_of_hallucinating_without_evidence(
     tmp_path: Path,
 ) -> None:
     class LLMStub:
@@ -1032,14 +1033,437 @@ async def test_website_task_is_blocked_instead_of_hallucinated_without_evidence(
     answer = await agent._run_agent_loop("Przejrzyj stronę onehack.st")
     await asyncio.gather(*agent._memory_tasks)
 
-    assert answer.startswith("I couldn't inspect that website")
+    assert answer.startswith("I reached the current batch limit")
+    assert "/continue" in answer
+    assert "/stop" in answer
     assert "goldmine" not in answer
+    assert "open the requested online source" in answer
+    assert "inspect and capture the source's actual content" in answer
+    assert "browser_snapshot" not in answer
     assert agent.memory.execution is not None
-    assert agent.memory.execution["status"] == "blocked"
+    assert agent.memory.execution["status"] == "awaiting_owner"
     checkpoint = next(
         (tmp_path / "autonomy" / "interactive" / "checkpoints").glob("*.json")
     )
-    assert json.loads(checkpoint.read_text(encoding="utf-8"))["status"] == "blocked"
+    assert (
+        json.loads(checkpoint.read_text(encoding="utf-8"))["status"]
+        == "awaiting_owner"
+    )
+
+
+@pytest.mark.asyncio
+async def test_owner_continue_resumes_same_checkpoint_and_prior_evidence(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        def begin_interaction(self, interaction_id: str, prompt: str) -> None:
+            return None
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {"type": "function", "function": {"name": "read_file"}}
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            return "# PALADYN\nVerified local content"
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.calls += 1
+            if self.calls == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "read_1",
+                            "read_file",
+                            {"path": "README.md"},
+                        )
+                    ]
+                )
+            assert "SAME-TASK OWNER RESUME" in kwargs["messages"][0]["content"]
+            assert "Verified local content" in kwargs["messages"][0]["content"]
+            return LLMResponse(content="The verified heading is `# PALADYN`, Boss.")
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.capabilities = CapabilityDispatcher()
+    agent.context_window = ContextWindowManager()
+    agent.intent_router = None
+    agent.config = SimpleNamespace(autonomy_root=tmp_path / "autonomy")
+    agent._agent_trace_root = tmp_path / "autonomy" / "interactive"
+    agent._last_execution_context = None
+    agent._memory_tasks = set()
+    agent.MAX_AGENT_STEPS = 1
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    paused = await agent.run("Read README.md and report its heading")
+    checkpoint_root = agent._agent_trace_root / "checkpoints"
+    checkpoints = list(checkpoint_root.glob("*.json"))
+    assert len(checkpoints) == 1
+    task_id = json.loads(checkpoints[0].read_text(encoding="utf-8"))["task_id"]
+    assert "/continue" in paused
+    assert "What I found:" in paused
+    assert "Verified local content" in paused
+    paused_payload = json.loads(checkpoints[0].read_text(encoding="utf-8"))
+    assert "progress_summary" in paused_payload["owner_checkpoint"]
+
+    answer = await agent.run("/continue")
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert answer == "The verified heading is `# PALADYN`, Boss."
+    assert agent.tools.calls == [("read_file", {"path": "README.md"})]
+    assert len(list(checkpoint_root.glob("*.json"))) == 1
+    payload = json.loads(checkpoints[0].read_text(encoding="utf-8"))
+    assert payload["task_id"] == task_id
+    assert payload["status"] == "completed"
+    assert [call["sequence"] for call in payload["tool_calls"]] == [1]
+    journal = (
+        agent._agent_trace_root / "journal" / f"{task_id}.jsonl"
+    ).read_text(encoding="utf-8")
+    assert "task_awaiting_owner" in journal
+    assert "task_resumed_by_owner" in journal
+    assert "task_completed" in journal
+
+
+@pytest.mark.asyncio
+async def test_owner_stop_closes_checkpoint_without_another_model_call(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def begin_interaction(self, interaction_id: str, prompt: str) -> None:
+            return None
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {"type": "function", "function": {"name": "read_file"}}
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            return "partial verified evidence"
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.calls += 1
+            return LLMResponse(
+                tool_calls=[
+                    LLMToolCall("read_1", "read_file", {"path": "README.md"})
+                ]
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.capabilities = CapabilityDispatcher()
+    agent.context_window = ContextWindowManager()
+    agent.intent_router = None
+    agent.config = SimpleNamespace(autonomy_root=tmp_path / "autonomy")
+    agent._agent_trace_root = tmp_path / "autonomy" / "interactive"
+    agent._last_execution_context = None
+    agent._memory_tasks = set()
+    agent.MAX_AGENT_STEPS = 1
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    await agent.run("Read README.md and continue analysing it")
+    assert agent.llm.calls == 1
+
+    answer = await agent.run("/stop")
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert answer.startswith("Stopped task")
+    assert agent.llm.calls == 1
+    checkpoint = next(
+        (agent._agent_trace_root / "checkpoints").glob("*.json")
+    )
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert payload["status"] == "stopped"
+    assert payload["finished_at"]
+    journal = (
+        agent._agent_trace_root / "journal" / f"{payload['task_id']}.jsonl"
+    ).read_text(encoding="utf-8")
+    assert "task_stopped_by_owner" in journal
+
+
+@pytest.mark.asyncio
+async def test_owner_continuous_authorization_crosses_silent_batch_boundaries(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def begin_interaction(self, interaction_id: str, prompt: str) -> None:
+            return None
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {"type": "function", "function": {"name": name}}
+                for name in ("browser_navigate", "browser_snapshot")
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append(tool)
+            if tool == "browser_navigate":
+                return "Opened the antiques marketplace"
+            return "Verified offer: Prussian WWI helmet, seller page inspected"
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.calls += 1
+            if self.calls == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "navigate_1",
+                            "browser_navigate",
+                            {"url": "https://antiques.example"},
+                        )
+                    ]
+                )
+            if self.calls == 2:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall("snapshot_1", "browser_snapshot", {})
+                    ]
+                )
+            return LLMResponse(
+                content="I found and inspected a verified Prussian helmet offer, Boss."
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.capabilities = CapabilityDispatcher()
+    agent.context_window = ContextWindowManager()
+    agent.intent_router = None
+    agent.config = SimpleNamespace(autonomy_root=tmp_path / "autonomy")
+    agent._agent_trace_root = tmp_path / "autonomy" / "interactive"
+    agent._last_execution_context = None
+    agent._memory_tasks = set()
+    agent.MAX_AGENT_STEPS = 1
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    paused = await agent.run(
+        "Search the internet for a Prussian WWI helmet and report what you find"
+    )
+    assert "/continue --continuous" in paused
+
+    answer = await agent.run("/continue --continuous")
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert answer == (
+        "I found and inspected a verified Prussian helmet offer, Boss."
+    )
+    assert agent.tools.calls == ["browser_navigate", "browser_snapshot"]
+    checkpoint = next(
+        (agent._agent_trace_root / "checkpoints").glob("*.json")
+    )
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert payload["status"] == "completed"
+    assert payload["owner_authorization"]["mode"] == "continuous"
+    journal = (
+        agent._agent_trace_root / "journal" / f"{payload['task_id']}.jsonl"
+    ).read_text(encoding="utf-8")
+    assert "task_continuous_authorized_by_owner" in journal
+    assert "task_continuous_batch_checkpoint" in journal
+
+
+@pytest.mark.asyncio
+async def test_continuous_task_cannot_override_identical_tool_loop_guard(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def begin_interaction(self, interaction_id: str, prompt: str) -> None:
+            return None
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [{"type": "function", "function": {"name": "read_file"}}]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            return "Verified initial content"
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.calls += 1
+            return LLMResponse(
+                tool_calls=[
+                    LLMToolCall(
+                        f"read_{self.calls}",
+                        "read_file",
+                        {"path": "README.md"},
+                    )
+                ]
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.capabilities = CapabilityDispatcher()
+    agent.context_window = ContextWindowManager()
+    agent.intent_router = None
+    agent.config = SimpleNamespace(autonomy_root=tmp_path / "autonomy")
+    agent._agent_trace_root = tmp_path / "autonomy" / "interactive"
+    agent._last_execution_context = None
+    agent._memory_tasks = set()
+    agent.MAX_AGENT_STEPS = 1
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    await agent.run("Read README.md and analyse it")
+    answer = await agent.run("/continue --continuous")
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert "detected execution loop" in answer
+    assert agent.llm.calls == 4
+    checkpoint = next(
+        (agent._agent_trace_root / "checkpoints").glob("*.json")
+    )
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert payload["status"] == "blocked"
+    journal = (
+        agent._agent_trace_root / "journal" / f"{payload['task_id']}.jsonl"
+    ).read_text(encoding="utf-8")
+    assert "repeated_tool_loop_detected" in journal
+
+
+@pytest.mark.asyncio
+async def test_identical_tool_call_loop_is_rejected_and_paused_early(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {"type": "function", "function": {"name": name}}
+                for name in ("browser_navigate", "browser_snapshot")
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls += 1
+            return "Same captured search result"
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.calls += 1
+            return LLMResponse(
+                tool_calls=[
+                    LLMToolCall(
+                        f"snapshot_{self.calls}",
+                        "browser_snapshot",
+                        {"target": "#same-result", "filename": "same.html"},
+                    )
+                ]
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._agent_trace_root = tmp_path / "interactive"
+    agent._last_execution_context = None
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent.MAX_AGENT_STEPS = 8
+
+    answer = await agent._run_agent_loop(
+        "Search the internet and report the verified result"
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert "kept requesting the same" in answer
+    assert "/continue" in answer
+    assert agent.tools.calls == 2
+    assert agent.llm.calls == 4
+    checkpoint = next(
+        (agent._agent_trace_root / "checkpoints").glob("*.json")
+    )
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert payload["status"] == "awaiting_owner"
+    assert [call["status"] for call in payload["tool_calls"]] == [
+        "succeeded",
+        "succeeded",
+        "failed",
+    ]
+    assert payload["tool_calls"][-1]["error"].startswith(
+        "RepeatedToolCallError"
+    )
+    journal = (
+        agent._agent_trace_root / "journal" / f"{payload['task_id']}.jsonl"
+    ).read_text(encoding="utf-8")
+    assert "repeated_tool_loop_detected" in journal
 
 
 @pytest.mark.asyncio
@@ -1309,6 +1733,73 @@ async def test_llm_respond_falls_back_when_template_rejects_tools() -> None:
 
 
 @pytest.mark.asyncio
+async def test_llm_retries_malformed_native_tool_arguments_as_compact_json() -> None:
+    class CompletionsStub:
+        def __init__(self) -> None:
+            self.requests: list[dict] = []
+
+        async def create(self, **kwargs):
+            self.requests.append(kwargs)
+            if len(self.requests) == 1:
+                response = httpx.Response(
+                    500,
+                    request=httpx.Request("POST", "http://local/v1/chat/completions"),
+                )
+                raise APIStatusError(
+                    "Failed to parse tool call arguments as JSON",
+                    response=response,
+                    body={
+                        "error": {
+                            "message": (
+                                "parse_error.101: invalid string: missing closing quote"
+                            )
+                        }
+                    },
+                )
+            message = SimpleNamespace(
+                content=(
+                    '{"tool":"browser_navigate","arguments":'
+                    '{"url":"https://example.com"}}'
+                ),
+                tool_calls=[],
+            )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message, finish_reason="stop")]
+            )
+
+    completions = CompletionsStub()
+    llm = object.__new__(LLM)
+    llm.config = SimpleNamespace(model="local", temperature=0.7, top_p=0.9)
+    llm.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    llm._native_tools_supported = None
+
+    response = await llm.respond(
+        messages=[{"role": "user", "content": "Inspect example.com"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_navigate",
+                    "description": "Open a web page",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    )
+
+    assert "tools" in completions.requests[0]
+    assert "tools" not in completions.requests[1]
+    assert completions.requests[1]["temperature"] == 0.1
+    assert "malformed or truncated JSON" in completions.requests[1]["messages"][-1]["content"]
+    assert llm._native_tools_supported is None
+    assert response.native_tools_enabled is False
+    assert Agent._parse_tool_request(response.content) == (
+        "browser_navigate",
+        {"url": "https://example.com"},
+    )
+
+
+@pytest.mark.asyncio
 async def test_llm_does_not_misclassify_context_overflow_as_tool_rejection() -> None:
     class CompletionsStub:
         def __init__(self) -> None:
@@ -1379,8 +1870,57 @@ def test_agent_selects_only_relevant_native_tool_schemas() -> None:
     assert selected_names == {
         "read_file",
         "write_file",
-        "learning_create_tool",
-        "learning_create_skill",
+    }
+
+
+def test_unclear_action_does_not_expose_the_entire_tool_catalog() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": name}}
+        for name in (
+            "browser_navigate",
+            "read_file",
+            "sandbox_execute_offline",
+            "evm_validate_oracle",
+            "learning_create_tool",
+            "learning_create_skill",
+        )
+    ]
+
+    selected = Agent._select_tool_definitions(
+        "Find the answer now.",
+        TaskContract(),
+        definitions,
+    )
+
+    assert selected == []
+
+
+def test_polish_w_internecie_action_gets_only_web_related_schemas() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": name}}
+        for name in (
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "read_file",
+            "sandbox_execute_offline",
+            "evm_validate_oracle",
+            "learning_create_tool",
+            "learning_create_skill",
+        )
+    ]
+    prompt = "Znajdź mi w internecie informacje o tej osobie i podaj wyniki."
+
+    selected = Agent._select_tool_definitions(
+        prompt,
+        TaskContract.from_prompt(prompt),
+        definitions,
+    )
+
+    assert {item["function"]["name"] for item in selected} == {
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_click",
     }
 
 
@@ -1431,6 +1971,512 @@ def test_explicit_action_request_exposes_relevant_tools(prompt: str) -> None:
     )
 
     assert selected
+
+
+def test_explicit_tool_creation_hides_low_level_learning_operations() -> None:
+    names = (
+        "learning_activate_artifact",
+        "learning_create_skill",
+        "learning_create_tool",
+        "learning_list_artifacts",
+        "learning_propose_lesson",
+        "learning_record_evidence",
+        "learning_stage_tool",
+        "learning_validate_artifact",
+    )
+    definitions = [
+        {"type": "function", "function": {"name": name}}
+        for name in names
+    ]
+    prompt = "Stwórz lokalne narzędzie count_words, a następnie użyj go."
+
+    selected = Agent._select_tool_definitions(
+        prompt,
+        TaskContract.from_prompt(prompt),
+        definitions,
+    )
+
+    assert {item["function"]["name"] for item in selected} == {
+        "learning_create_tool",
+        "learning_list_artifacts",
+    }
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Dobrze, w takim razie kontynuuj.",
+        "No to dawaj.",
+        "Dobrze, przyjacielu, w takim razie do dzieła.",
+        "Spróbuj jeszcze raz, tylko użyj odpowiedniego narzędzia.",
+        "Go ahead.",
+        "Try again using the proper tool.",
+    ],
+)
+def test_agent_recognizes_short_continuation_requests(prompt: str) -> None:
+    assert Agent._is_continuation_request(prompt)
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Jak się dziś czujesz?",
+        "Powiedz mi, jak działa kontynuacja zadań.",
+        "Why do agents use tools?",
+    ],
+)
+def test_agent_does_not_treat_ordinary_conversation_as_continuation(prompt: str) -> None:
+    assert not Agent._is_continuation_request(prompt)
+
+
+def test_latest_action_context_skips_empty_follow_up_checkpoint(tmp_path: Path) -> None:
+    action = AgentTaskTrace(tmp_path, "Inspect example.com and report its contents")
+    action.set_requirements(
+        TaskContract.from_prompt(
+            "Inspect example.com and report its contents"
+        ).to_dict()
+    )
+    action.complete("I need one more observation.")
+
+    empty_follow_up = AgentTaskTrace(tmp_path, "No to dawaj")
+    empty_follow_up.set_requirements(TaskContract().to_dict())
+    empty_follow_up.complete("I'll use the correct tool now.")
+
+    recovered = AgentTaskTrace.latest_action_context(tmp_path)
+
+    assert recovered is not None
+    assert recovered["task_id"] == action.task_id
+    assert recovered["requirements"]["requires_browser_navigation"] is True
+
+
+@pytest.mark.asyncio
+async def test_agent_continuation_inherits_browser_contract_and_tool_routing(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": name,
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+                for name in ("browser_navigate", "browser_snapshot", "read_file")
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            if tool == "browser_navigate":
+                return "Navigated to https://example.com"
+            return "Example Domain contains documentation links."
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+            self.offered_tools: list[set[str]] = []
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            self.offered_tools.append(
+                {
+                    item["function"]["name"]
+                    for item in (kwargs.get("tools") or [])
+                }
+            )
+            if self.turn == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            call_id="call_nav",
+                            name="browser_navigate",
+                            arguments={"url": "https://example.com"},
+                            raw_arguments='{"url":"https://example.com"}',
+                        )
+                    ],
+                    native_tools_enabled=True,
+                )
+            if self.turn == 2:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            call_id="call_snapshot",
+                            name="browser_snapshot",
+                            arguments={},
+                            raw_arguments="{}",
+                        )
+                    ],
+                    native_tools_enabled=True,
+                )
+            return LLMResponse(
+                content=(
+                    "I checked the damn page: Example Domain contains "
+                    "documentation links, Boss."
+                )
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    previous = AgentTaskTrace(tmp_path, "Inspect example.com and report its contents")
+    previous.set_requirements(
+        TaskContract.from_prompt(
+            "Inspect example.com and report its contents"
+        ).to_dict()
+    )
+    previous.complete("Let me search instead.")
+
+    tools = ToolsStub()
+    llm = LLMStub()
+    agent = object.__new__(Agent)
+    agent.llm = llm
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = AgentTaskTrace.latest_context(tmp_path)
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop("No to dawaj.")
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert answer == (
+        "I checked the damn page: Example Domain contains documentation links, Boss."
+    )
+    assert tools.calls == [
+        ("browser_navigate", {"url": "https://example.com"}),
+        ("browser_snapshot", {}),
+    ]
+    assert all(
+        {"browser_navigate", "browser_snapshot"}.issubset(names)
+        for names in llm.offered_tools
+    )
+    checkpoint = AgentTaskTrace.latest_context(tmp_path)
+    assert checkpoint is not None
+    assert checkpoint["requirements"]["requires_browser_navigation"] is True
+    assert checkpoint["requirements"]["requires_browser_snapshot"] is True
+
+
+@pytest.mark.asyncio
+async def test_agent_uses_semantic_browser_intent_for_hungarian_request(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": name,
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+                for name in ("browser_navigate", "browser_snapshot", "read_file")
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            if tool == "browser_navigate":
+                return "Navigated to https://example.com"
+            return "Example Domain contains documentation links."
+
+    class IntentRouterStub:
+        async def classify(self, prompt: str, **kwargs) -> SemanticIntent:
+            assert prompt == "Keress az interneten es keszits jelentest."
+            return SemanticIntent(
+                action_requested=True,
+                capabilities=("browser",),
+                requires_report=True,
+            )
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+            self.offered_tools: list[set[str]] = []
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            self.offered_tools.append(
+                {
+                    item["function"]["name"]
+                    for item in (kwargs.get("tools") or [])
+                }
+            )
+            if self.turn == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            call_id="call_nav_hu",
+                            name="browser_navigate",
+                            arguments={"url": "https://example.com"},
+                            raw_arguments='{"url":"https://example.com"}',
+                        )
+                    ],
+                    native_tools_enabled=True,
+                )
+            if self.turn == 2:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            call_id="call_snapshot_hu",
+                            name="browser_snapshot",
+                            arguments={},
+                            raw_arguments="{}",
+                        )
+                    ],
+                    native_tools_enabled=True,
+                )
+            return LLMResponse(
+                content=(
+                    "I checked the damn page: Example Domain contains "
+                    "documentation links, Boss."
+                )
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    llm = LLMStub()
+    agent = object.__new__(Agent)
+    agent.llm = llm
+    agent.intent_router = IntentRouterStub()
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = None
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop(
+        "Keress az interneten es keszits jelentest."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert "Example Domain" in answer
+    assert tools.calls == [
+        ("browser_navigate", {"url": "https://example.com"}),
+        ("browser_snapshot", {}),
+    ]
+    assert all(
+        names == {"browser_navigate", "browser_snapshot"}
+        for names in llm.offered_tools
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_rolls_context_and_continues_with_runtime_evidence(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": name,
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+                for name in ("browser_navigate", "browser_snapshot")
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append(tool)
+            marker = "NavigationEvidence" if tool == "browser_navigate" else "AlphaSignal"
+            return f"{marker} " + ("evidence " * 700)
+
+    class LLMStub:
+        config = SimpleNamespace(context=2_048)
+
+        def __init__(self) -> None:
+            self.turn = 0
+            self.summary_calls = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            if self.turn == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            call_id="call_nav_rollover",
+                            name="browser_navigate",
+                            arguments={"url": "https://example.com"},
+                            raw_arguments='{"url":"https://example.com"}',
+                        )
+                    ],
+                    native_tools_enabled=True,
+                )
+            if self.turn == 2:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            call_id="call_snapshot_rollover",
+                            name="browser_snapshot",
+                            arguments={},
+                            raw_arguments="{}",
+                        )
+                    ],
+                    native_tools_enabled=True,
+                )
+            assert "PALADYN context rollover capsule" in kwargs["messages"][-1]["content"]
+            return LLMResponse(
+                content=(
+                    "I checked the damn page. The verified snapshot contains "
+                    "AlphaSignal, Boss."
+                )
+            )
+
+        async def ask(self, **kwargs) -> str:
+            self.summary_calls += 1
+            return json.dumps(
+                {
+                    "completed": ["Navigated and captured evidence"],
+                    "findings": ["AlphaSignal is present in runtime evidence"],
+                    "open_questions": [],
+                    "next_steps": ["Finish the evidence-backed report"],
+                }
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    llm = LLMStub()
+    agent = object.__new__(Agent)
+    agent.llm = llm
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.context_window = ContextWindowManager(
+        threshold_percent=45,
+        reserve_tokens=256,
+    )
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = None
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent.MAX_AGENT_STEPS = 6
+
+    answer = await agent._run_agent_loop(
+        "Inspect https://example.com and report what you find."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert "AlphaSignal" in answer
+    assert tools.calls == ["browser_navigate", "browser_snapshot"]
+    assert llm.summary_calls >= 1
+    checkpoint_path = next((tmp_path / "checkpoints").glob("*.json"))
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "completed"
+    assert checkpoint["context_rollovers"]
+    assert all(
+        rollover["estimated_tokens_after"] < rollover["estimated_tokens_before"]
+        for rollover in checkpoint["context_rollovers"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_retries_once_after_provider_context_overflow(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        async def openai_tool_definitions(self) -> list[dict]:
+            return []
+
+    class LLMStub:
+        config = SimpleNamespace(context=4_096)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.calls += 1
+            if self.calls == 1:
+                response = httpx.Response(
+                    500,
+                    request=httpx.Request("POST", "http://local/v1/chat/completions"),
+                )
+                raise APIStatusError(
+                    "request exceeds the available context size",
+                    response=response,
+                    body={"message": "prompt exceeds the available context size"},
+                )
+            return LLMResponse(content="That context rollover worked, damn it.")
+
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "completed": [],
+                    "findings": [],
+                    "open_questions": [],
+                    "next_steps": ["Retry the interrupted generation"],
+                }
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    llm = LLMStub()
+    agent = object.__new__(Agent)
+    agent.llm = llm
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.context_window = ContextWindowManager(threshold_percent=90)
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = None
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop("Tell me your view of context rollover.")
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert answer == "That context rollover worked, damn it."
+    assert llm.calls == 2
+    checkpoint_path = next((tmp_path / "checkpoints").glob("*.json"))
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert checkpoint["context_rollovers"][0]["emergency"] is True
+
+
+def test_agent_rejects_promises_to_search_or_use_a_tool_later() -> None:
+    assert Agent._claims_unverified_work(
+        "Okay, I'll use the correct tool now."
+    )
+    assert Agent._claims_unverified_work(
+        "No direct match. Let me search for skills instead."
+    )
 
 
 @pytest.mark.asyncio
@@ -1820,8 +2866,13 @@ async def test_newly_created_tool_is_callable_in_same_agent_task() -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_sandbox_command_cannot_support_successful_test_claim() -> None:
+async def test_failed_sandbox_command_cannot_support_successful_test_claim(
+    tmp_path: Path,
+) -> None:
     class ToolsStub:
+        def __init__(self) -> None:
+            self.captured_failures: list[dict] = []
+
         async def call(self, tool: str, arguments: dict) -> str:
             assert tool == "sandbox_execute_offline"
             return json.dumps(
@@ -1834,6 +2885,10 @@ async def test_failed_sandbox_command_cannot_support_successful_test_claim() -> 
                     "workspace_limited": False,
                 }
             )
+
+        def capture_tool_failure(self, **failure: object) -> dict[str, str]:
+            self.captured_failures.append(dict(failure))
+            return {"evidence_id": "verified-failure", "outcome": "failure"}
 
     class LLMStub:
         config = SimpleNamespace(context=8_192)
@@ -1857,12 +2912,15 @@ async def test_failed_sandbox_command_cannot_support_successful_test_claim() -> 
         async def process(self, *args, **kwargs) -> None:
             return None
 
+    tools = ToolsStub()
     agent = object.__new__(Agent)
     agent.llm = LLMStub()
-    agent.tools = ToolsStub()
+    agent.tools = tools
     agent.memory = MemoryStub()
     agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
     agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent._agent_trace_root = tmp_path / "interactive"
+    agent._last_execution_context = None
     agent.MAX_AGENT_STEPS = 1
 
     answer = await agent._run_agent_loop("Run the tests")
@@ -1871,6 +2929,20 @@ async def test_failed_sandbox_command_cannot_support_successful_test_claim() -> 
     assert "SandboxResultError" in answer
     assert "exit_code=1" in answer
     assert "All tests passed" not in answer
+    assert len(tools.captured_failures) == 1
+    assert tools.captured_failures[0]["tool"] == "sandbox_execute_offline"
+    assert str(tools.captured_failures[0]["error"]).startswith(
+        "SandboxResultError"
+    )
+    checkpoint = next(
+        (agent._agent_trace_root / "checkpoints").glob("*.json")
+    )
+    journal = (
+        agent._agent_trace_root
+        / "journal"
+        / f"{json.loads(checkpoint.read_text(encoding='utf-8'))['task_id']}.jsonl"
+    ).read_text(encoding="utf-8")
+    assert "learning_evidence_recorded" in journal
 
 
 def test_rejected_generated_artifact_is_a_failed_tool_result() -> None:

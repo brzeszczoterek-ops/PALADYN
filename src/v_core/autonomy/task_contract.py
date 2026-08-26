@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 import re
 from typing import Any
 
@@ -10,13 +11,13 @@ from ..capabilities.web_target import requests_web_access
 _ONLINE_ACTION = re.compile(
     r"\b(?:browse|check|collect|extract|find|inspect|list|look\s+for|monitor|open|"
     r"research|scan|search|visit|crawl|scrape|"
-    r"ekstrakc\w*|monitor\w*|przejr\w*|sprawd\w*|szuk\w*|wejd\w*|"
+    r"ekstrakc\w*|monitor\w*|przejr\w*|przeszuk\w*|sprawd\w*|szuk\w*|wejd\w*|"
     r"wyszuk\w*|wyciagn\w*|wyciągn\w*|znajd\w*)\b",
     re.IGNORECASE,
 )
 _ONLINE_RESOURCE = re.compile(
     r"\b(?:browser|darknet|internet|online|page|repository|repo|site|web|website|"
-    r"github|market\w*|sieci|stron\w*|witryn\w*)\b",
+    r"github|osint|internet\w*|interne\w*|market\w*|sieci|stron\w*|witryn\w*)\b",
     re.IGNORECASE,
 )
 _DETAIL_PAGE = re.compile(
@@ -29,7 +30,8 @@ _DETAIL_PAGE = re.compile(
 )
 _CREATE_TOOL = re.compile(
     r"\b(?:create|build|implement|write|generate|stworz|stwórz|zbuduj|napisz|"
-    r"wygeneruj|zaimplementuj)\w*\s+(?:(?:a|an|new|now\w*|generated)\s+){0,3}"
+    r"wygeneruj|zaimplementuj)\w*\s+(?:(?:a|an|custom|local|new|now\w*|"
+    r"generated|lokal\w*|wlasn\w*|własn\w*)\s+){0,3}"
     r"(?:tool|narzedzi\w*|narzędzi\w*)\b",
     re.IGNORECASE,
 )
@@ -37,6 +39,12 @@ _CREATE_SKILL = re.compile(
     r"\b(?:create|build|implement|write|generate|stworz|stwórz|zbuduj|napisz|"
     r"wygeneruj|zaimplementuj)\w*\s+(?:(?:a|an|new|now\w*|generated)\s+){0,3}"
     r"(?:skill|umiejetn\w*|umiejętn\w*)\b",
+    re.IGNORECASE,
+)
+_USE_CREATED_TOOL = re.compile(
+    r"\b(?:and\s+then\s+use|then\s+use|use\s+it|"
+    r"a\s+nastepnie\s+uzyj|a\s+następnie\s+użyj|potem\s+uzyj|"
+    r"potem\s+użyj|uzyj\s+go|użyj\s+go)\b",
     re.IGNORECASE,
 )
 _READ_FILE = re.compile(
@@ -66,9 +74,9 @@ _FILE_TARGET = re.compile(
     re.IGNORECASE,
 )
 _REPORT_RESULT = re.compile(
-    r"\b(?:answer|describe|explain|extract|give|identify|list|report|summari[sz]e|tell|what|which|"
+    r"\b(?:answer|describe|explain|extract|find|give|identify|list|report|summari[sz]e|tell|what|which|"
     r"co|jakie|które|ktore|opisz\w*|podaj\w*|powiedz\w*|stre[śs]c\w*|wyciagn\w*|wyciągn\w*|"
-    r"wymien\w*|wymień\w*)\b",
+    r"wymien\w*|wymień\w*|znajd\w*|znale[źz]\w*)\b",
     re.IGNORECASE,
 )
 _FIRST_HEADING = re.compile(
@@ -96,6 +104,7 @@ class TaskContract:
     requires_evidence_report: bool = False
     requires_first_heading: bool = False
     requires_created_tool: bool = False
+    requires_created_tool_execution: bool = False
     requires_created_skill: bool = False
 
     @classmethod
@@ -113,6 +122,7 @@ class TaskContract:
         command_execution = bool(
             not online and _RUN_COMMAND.search(prompt) and _COMMAND_TARGET.search(prompt)
         )
+        creates_tool = bool(_CREATE_TOOL.search(prompt))
         return cls(
             requires_browser_navigation=online,
             requires_browser_snapshot=online,
@@ -124,8 +134,33 @@ class TaskContract:
                 _REPORT_RESULT.search(prompt)
             ),
             requires_first_heading=file_read and bool(_FIRST_HEADING.search(prompt)),
-            requires_created_tool=bool(_CREATE_TOOL.search(prompt)),
+            requires_created_tool=creates_tool,
+            requires_created_tool_execution=(
+                creates_tool and bool(_USE_CREATED_TOOL.search(prompt))
+            ),
             requires_created_skill=bool(_CREATE_SKILL.search(prompt)),
+        )
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any] | None) -> "TaskContract":
+        """Rebuild a contract from runtime-owned checkpoint data."""
+
+        source = values if isinstance(values, dict) else {}
+        return cls(
+            **{
+                name: bool(source.get(name, False))
+                for name in cls.__dataclass_fields__
+            }
+        )
+
+    def merged(self, other: "TaskContract") -> "TaskContract":
+        """Return the union of two independently detected requirements."""
+
+        return type(self)(
+            **{
+                name: bool(getattr(self, name) or getattr(other, name))
+                for name in self.__dataclass_fields__
+            }
         )
 
     def to_dict(self) -> dict[str, bool]:
@@ -182,6 +217,24 @@ class TaskContract:
 
         if self.requires_created_tool and "learning_create_tool" not in names:
             missing.append("learning_create_tool")
+        if self.requires_created_tool_execution:
+            created_name = ""
+            created_index = -1
+            for index, call in enumerate(succeeded):
+                if call.get("tool") != "learning_create_tool":
+                    continue
+                try:
+                    payload = json.loads(str(call.get("result_excerpt", "")))
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, dict) and payload.get("name"):
+                    created_name = str(payload["name"])
+                    created_index = index
+            if not created_name or not any(
+                index > created_index and call.get("tool") == created_name
+                for index, call in enumerate(succeeded)
+            ):
+                missing.append("generated_tool_execution")
         if self.requires_created_skill and "learning_create_skill" not in names:
             missing.append("learning_create_skill")
         return missing

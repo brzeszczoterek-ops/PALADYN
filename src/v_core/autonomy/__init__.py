@@ -5,6 +5,8 @@ from .control import (
     StopRequested,
 )
 from .agent_trace import AgentTaskTrace
+from .context_window import ContextRollover, ContextWindowManager
+from .intent import MultilingualIntentRouter, SemanticIntent
 from .task_contract import TaskContract
 from .hotkey import ChordDetector, LinuxHotkeyWatcher, input_devices, parse_chord
 from .journal import CheckpointStore, TaskJournal
@@ -32,12 +34,16 @@ __all__ = [
     "CheckpointStore",
     "ControlChannel",
     "ControlSignal",
+    "ContextRollover",
+    "ContextWindowManager",
     "ChordDetector",
     "ExecutionMode",
     "GlobalControlChannel",
     "LinuxHotkeyWatcher",
+    "MultilingualIntentRouter",
     "PanicRequested",
     "RuntimeRegistry",
+    "SemanticIntent",
     "StepOutcome",
     "StepDriver",
     "StepResult",

@@ -58,6 +58,72 @@ async def test_bubblewrap_has_no_host_network(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_seccomp_fallback_runs_code_but_denies_socket_creation(
+    tmp_path: Path,
+) -> None:
+    backend = BubblewrapBackend(force_seccomp_network_filter=True)
+    ordinary = await backend.run(
+        SandboxSpec(
+            command=("/usr/bin/python3", "-c", "print(6 * 7)"),
+            workspace=tmp_path / "ordinary",
+        )
+    )
+    network = await backend.run(
+        SandboxSpec(
+            command=(
+                "/usr/bin/python3",
+                "-c",
+                "import socket; socket.socket()",
+            ),
+            workspace=tmp_path / "network",
+        )
+    )
+
+    assert ordinary.succeeded
+    assert ordinary.stdout.strip() == "42"
+    assert ordinary.backend == "bubblewrap+seccomp-netblock"
+    assert not network.succeeded
+    assert "PermissionError" in network.stderr
+
+
+def test_share_network_cannot_be_enabled_without_seccomp(tmp_path: Path) -> None:
+    backend = BubblewrapBackend()
+    spec = SandboxSpec(command=("/usr/bin/true",), workspace=tmp_path)
+
+    with pytest.raises(SandboxPolicyError, match="requires a seccomp filter"):
+        backend._build_argv(spec, tmp_path.resolve(), share_network=True)
+
+
+@pytest.mark.asyncio
+async def test_loopback_permission_error_retries_with_seccomp_fallback(
+    tmp_path: Path,
+) -> None:
+    wrapper = tmp_path / "bwrap-once"
+    marker = tmp_path / "failed-once"
+    wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        f"if [[ ! -e {marker!s} ]]; then\n"
+        f"  touch {marker!s}\n"
+        "  echo 'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted' >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "exec /usr/bin/bwrap \"$@\"\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o700)
+    result = await BubblewrapBackend(executable=wrapper).run(
+        SandboxSpec(
+            command=("/usr/bin/python3", "-c", "print('recovered')"),
+            workspace=tmp_path / "workspace",
+        )
+    )
+
+    assert result.succeeded
+    assert result.stdout.strip() == "recovered"
+    assert result.backend == "bubblewrap+seccomp-netblock"
+
+
+@pytest.mark.asyncio
 async def test_bubblewrap_enforces_wall_clock_timeout(tmp_path: Path) -> None:
     result = await BubblewrapBackend().run(
         SandboxSpec(

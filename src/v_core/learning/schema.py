@@ -12,6 +12,7 @@ class SchemaError(ValueError):
 _TYPES = {"object", "array", "string", "integer", "number", "boolean", "null"}
 _KEYS = {
     "type",
+    "description",
     "properties",
     "required",
     "items",
@@ -37,6 +38,11 @@ def validate_schema(schema: dict[str, Any], *, depth: int = 0) -> None:
     kind = schema.get("type")
     if kind not in _TYPES:
         raise SchemaError(f"unsupported or missing schema type: {kind!r}")
+    description = schema.get("description")
+    if description is not None and (
+        not isinstance(description, str) or len(description) > 1_000
+    ):
+        raise SchemaError("schema description must be text of at most 1000 characters")
     applicable = {
         "object": {"properties", "required", "additionalProperties"},
         "array": {"items", "minItems", "maxItems"},
@@ -45,7 +51,7 @@ def validate_schema(schema: dict[str, Any], *, depth: int = 0) -> None:
         "number": {"minimum", "maximum"},
         "boolean": set(),
         "null": set(),
-    }[kind] | {"type", "enum"}
+    }[kind] | {"type", "description", "enum"}
     irrelevant = set(schema) - applicable
     if irrelevant:
         raise SchemaError(

@@ -435,6 +435,76 @@ class MCPTools:
 
     def _local_tool_definitions(self) -> list[dict[str, Any]]:
         object_schema = {"type": "object", "properties": {}}
+        generated_schema = {
+            "type": "object",
+            "additionalProperties": True,
+        }
+        tool_test_schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "arguments": {"type": "object", "additionalProperties": True},
+                "expected": {"type": "object", "additionalProperties": True},
+            },
+            "required": ["name", "arguments", "expected"],
+            "additionalProperties": False,
+        }
+        tool_manifest_schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "version": {"type": "string"},
+                "description": {"type": "string"},
+                "input_schema": generated_schema,
+                "output_schema": generated_schema,
+                "tests": {"type": "array", "items": tool_test_schema},
+                "scope": {"type": "string", "enum": ["task", "persistent"]},
+                "lesson_ids": {"type": "array", "items": {"type": "string"}},
+                "timeout_seconds": {"type": "number", "minimum": 0.05, "maximum": 120},
+            },
+            "required": [
+                "name",
+                "version",
+                "description",
+                "input_schema",
+                "output_schema",
+                "tests",
+            ],
+            "additionalProperties": False,
+        }
+        skill_test_schema = {
+            "type": "object",
+            "properties": {
+                "user_input": {"type": "string"},
+                "should_match": {"type": "boolean"},
+            },
+            "required": ["user_input", "should_match"],
+            "additionalProperties": False,
+        }
+        skill_manifest_schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "version": {"type": "string"},
+                "description": {"type": "string"},
+                "triggers": {"type": "array", "items": {"type": "string"}},
+                "steps": {"type": "array", "items": {"type": "string"}},
+                "required_tools": {"type": "array", "items": {"type": "string"}},
+                "tests": {"type": "array", "items": skill_test_schema},
+                "scope": {"type": "string", "enum": ["task", "persistent"]},
+                "lesson_ids": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": [
+                "name",
+                "version",
+                "description",
+                "triggers",
+                "steps",
+                "required_tools",
+                "tests",
+            ],
+            "additionalProperties": False,
+        }
         schemas: dict[str, tuple[str, dict[str, Any]]] = {
             "evm_analyze_erc20_abi": (
                 "Analyze an ERC-20 ABI locally.",
@@ -470,11 +540,12 @@ class MCPTools:
                 },
             ),
             "learning_create_tool": (
-                "Create, quarantine, test, and activate a missing generated tool.",
+                "Create, quarantine, test, and activate a deterministic offline tool. "
+                "Do not use it to fabricate facts or replace browser research.",
                 {
                     "type": "object",
                     "properties": {
-                        "manifest": {"type": "object"},
+                        "manifest": tool_manifest_schema,
                         "source": {"type": "string"},
                     },
                     "required": ["manifest", "source"],
@@ -482,10 +553,10 @@ class MCPTools:
                 },
             ),
             "learning_create_skill": (
-                "Create, validate, and activate a reusable skill manifest.",
+                "Create, validate, and activate a reusable orchestration skill.",
                 {
                     "type": "object",
-                    "properties": {"manifest": {"type": "object"}},
+                    "properties": {"manifest": skill_manifest_schema},
                     "required": ["manifest"],
                     "additionalProperties": False,
                 },
@@ -652,6 +723,24 @@ class MCPTools:
         if self.learning is None:
             return ""
         return self.learning.render_matching_skills(prompt)
+
+    def capture_tool_failure(
+        self,
+        *,
+        task_id: str,
+        tool: str,
+        arguments: dict[str, Any],
+        error: str,
+    ) -> dict[str, Any] | None:
+        if self.learning is None:
+            return None
+        evidence = self.learning.capture_tool_failure(
+            task_id=task_id,
+            tool=tool,
+            arguments=arguments,
+            error=error,
+        )
+        return evidence.to_dict()
 
     def _known_tool_names(self) -> set[str]:
         return set(self.local_tool_names()) | {

@@ -54,6 +54,10 @@
   prose until the actual objective has been satisfied
 - Durable previous-task recovery context containing bounded runtime status and
   exact failed-tool evidence
+- Runtime-authored learning evidence for interactive tool failures, retaining the
+  exact bounded error while replacing private invocation arguments with a digest
+- A fail-closed Bubblewrap recovery path for AppArmor loopback failures that
+  retains filesystem/process isolation and blocks networking with libseccomp
 
 ### Fixed
 - Tool availability is now a runtime-owned allowlist: schema-discovery failure,
@@ -68,6 +72,15 @@
   serve as evidence that commands or tests succeeded
 - Bubblewrap applies `RLIMIT_NPROC` inside its private user/PID namespaces, so a
   busy desktop session cannot prevent the sandbox itself from starting
+- Generated-tool function schemas require the complete manifest and test shape,
+  accept bounded JSON Schema descriptions, reject placeholder names, and prevent
+  offline artifacts from claiming fabricated browser or internet retrieval
+- Polish requests to create and then use a local tool now require both lifecycle
+  activation and a subsequent invocation before the task can complete
+- Context rollover completion and findings are derived from runtime evidence, so
+  a model summary cannot relabel a failed tool call as successful work
+- Composite tool creation revalidates an identical rejected bundle after an
+  infrastructure recovery and assigns the next patch version to changed code
 - Short questions about V's current state or mood, including Polish variants such
   as "jak się dzisiaj czujesz?", remain in light conversation and never initialize
   MCP tool discovery or the full execution loop

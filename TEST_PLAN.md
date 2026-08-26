@@ -138,6 +138,8 @@ Every item should pass before creating a new release.
 - [x] Model-authored JSON cannot mark its own evidence as verified.
 - [x] User corrections retain framework task identity and the raw user message.
 - [x] Autonomous failures and explicitly verified results are recorded.
+- [x] Interactive tool failures are recorded automatically with the exact error
+  and a digest instead of private invocation arguments.
 - [x] Lessons require independent tasks, fingerprints, and verified evidence.
 - [x] Evidence and artifact-journal tampering is detected.
 - [x] Artifact source and manifest tampering is detected before activation.
@@ -149,10 +151,17 @@ Every item should pass before creating a new release.
 - [x] Sandbox process-count limits are enforced for generated code.
 - [x] Sandbox process limits are applied inside the private namespace and do not
   depend on the host desktop user's current process count.
+- [x] Bubblewrap loopback permission failures retry through an enforced seccomp
+  network denylist; ordinary offline code runs while socket creation is denied.
 - [x] Generated manifests, schemas, source, metadata, and arguments are bounded.
 - [x] Generated tools cannot exceed the total workspace disk limit.
 - [x] Infinite generated code is terminated by the sandbox.
 - [x] Input and output JSON schemas are enforced.
+- [x] Bounded JSON Schema `description` annotations are accepted, while generated
+  tool calls require a complete manifest and deterministic test structure.
+- [x] Failed artifacts can be revalidated unchanged after infrastructure recovery;
+  changed bundles receive the next immutable patch version.
+- [x] Offline generated tools cannot claim browser, network, or internet retrieval.
 - [x] Failed tool tests prevent activation.
 - [x] Active generated tools survive a runtime restart.
 - [x] Three runtime failures automatically retire an active generated tool.

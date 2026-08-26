@@ -194,6 +194,40 @@ work to the user.
 Streaming stops when PALADYN detects a clear repeated-generation loop, while
 ordinary rhetorical repetition is preserved. Session history is bounded by both
 turn count and the active model's context budget.
+
+Long multi-step tasks use automatic context rollover. Before the estimated
+prompt, tool schemas, and reserved response budget reach 70% of the active model
+window, PALADYN builds a durable continuation capsule, replaces the accumulated
+chat messages with a fresh context, and continues the same task. The capsule
+keeps a model-compressed working summary separate from the runtime-owned tool
+evidence; successful calls remain authoritative in memory and every rollover is
+written to the task journal and atomic checkpoint as `context_rolled`. A provider
+context-overflow response triggers one emergency rollover and retry instead of
+silently abandoning the task. Set `V_CORE_CONTEXT_ROLLOVER_PERCENT` from 45 to 90
+to tune the threshold. Rollover budgets the complete provider request—including
+the fixed system prompt, selected function schemas, summary, and retained tool
+evidence—and reduces the executable schema catalog to the task's actual domain.
+Multi-step tasks allow 32 actions by default; set
+`V_CORE_MAX_AGENT_STEPS` from 1 to 128 for a different bounded batch. Reaching
+that boundary is not treated as an error: PALADYN writes an atomic checkpoint,
+changes the task to `awaiting_owner`, and asks for `/continue` or `/stop`.
+The owner prompt reports the substantive findings collected from verified tool
+results and what remains to be done—not just step counts and internal tool
+telemetry—so the decision to continue is informed by actual task progress.
+`/continue` grants another equally sized batch on the same task ID with its
+verified tool evidence and rollover summary intact; `/stop` closes it
+intentionally while preserving the checkpoint.
+
+For a task that should keep working unattended, the owner can reply
+`/continue --continuous` at that checkpoint. The authorization applies only to
+that task. Later batch boundaries still write silent progress summaries and
+atomic checkpoints, but do not interrupt the run. Completion and real runtime
+blockades are still reported, `Ctrl+C` and the independent `Q+P+0` panic chord
+remain active, and three consecutive batches without new successful tool
+evidence stop a broken or looping model. Continuous authorization keeps an
+active task moving; periodic monitoring over days or weeks additionally needs a
+scheduled wait/wake driver and a notification channel.
+
 Routine greetings do not trigger the expensive persistent-memory pipeline. For
 substantive interactions the visible answer returns first; reflection and
 memory consolidation run as cancellable background work while the terminal
@@ -256,6 +290,17 @@ verified outcomes become provenance-bearing evidence. Lessons remain candidates
 until independently supported. Generated tools and skills then pass through an
 immutable quarantine, policy checks, offline tests, capability-gated activation,
 and automatic rollback on repeated runtime failure.
+
+Interactive tool failures are captured by the runtime automatically; the model
+does not have to remember to record them. Private invocation arguments are not
+copied into learning memory—the evidence stores the exact bounded error, tool
+name, and an argument digest. Generated Python tools are deliberately offline
+data transforms. They cannot present hard-coded claims as web research; reusable
+online workflows must be expressed as skills over the existing browser tools.
+If Ubuntu/AppArmor prevents Bubblewrap from configuring its private loopback,
+PALADYN retries with a fail-closed libseccomp network filter: the sandbox retains
+its filesystem, PID, capability, resource, and workspace isolation while socket
+creation and network syscalls remain denied.
 
 Task artifacts are restricted to their authorized workspace. Persistent
 artifacts require a validated lesson and two owner-approved capabilities. The

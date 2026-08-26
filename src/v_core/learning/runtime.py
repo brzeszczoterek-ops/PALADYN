@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
@@ -22,6 +22,7 @@ from .models import (
     LessonStatus,
     SkillManifest,
     ToolManifest,
+    clean_text,
     utc_now,
 )
 from .policy import ArtifactPolicy, ArtifactPolicyError
@@ -119,6 +120,48 @@ class LearningRuntime:
             trusted_verifier=True,
         )
 
+    def capture_tool_failure(
+        self,
+        *,
+        task_id: str,
+        tool: str,
+        arguments: dict[str, Any],
+        error: str,
+    ) -> LearningEvidence:
+        """Persist a real tool failure without trusting the language model.
+
+        Arguments can contain private or bulky user data, so the learning store
+        receives only a stable digest. The exact bounded runtime error remains
+        available as evidence for later lesson proposals and regression tests.
+        """
+
+        encoded_arguments = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        arguments_digest = hashlib.sha256(
+            encoded_arguments.encode("utf-8")
+        ).hexdigest()
+        return self.record_evidence(
+            LearningEvidence(
+                task_id=task_id,
+                source=EvidenceSource.TOOL_RESULT,
+                outcome=EvidenceOutcome.FAILURE,
+                summary=f"Tool {tool} failed during supervised execution.",
+                expected="The requested tool call should complete successfully.",
+                actual=error,
+                confidence=1.0,
+                verified=True,
+                metadata={
+                    "tool": clean_text(tool, maximum=128),
+                    "arguments_sha256": arguments_digest,
+                },
+            ),
+            trusted_verifier=True,
+        )
+
     def propose_lesson(
         self,
         *,
@@ -194,9 +237,62 @@ class LearningRuntime:
         manifest: ToolManifest,
         source: str,
     ) -> ArtifactRecord:
+        existing = self._tool_version_record(manifest)
+        if existing is not None:
+            saved_manifest, saved_source = self.store.load_tool(existing)
+            same_bundle = (
+                saved_manifest.to_dict() == manifest.to_dict()
+                and saved_source.read_text(encoding="utf-8") == source
+            )
+            if same_bundle:
+                if existing.status is ArtifactStatus.ACTIVE:
+                    return existing
+                if existing.status in {
+                    ArtifactStatus.QUARANTINED,
+                    ArtifactStatus.REJECTED,
+                }:
+                    await self.validate_artifact(existing.artifact_id)
+                    return self.activate_artifact(existing.artifact_id)
+                if existing.status is ArtifactStatus.VALIDATED:
+                    return self.activate_artifact(existing.artifact_id)
+            manifest = self._next_tool_patch_version(manifest)
         record = self.stage_tool(manifest, source)
         await self.validate_artifact(record.artifact_id)
         return self.activate_artifact(record.artifact_id)
+
+    def _tool_version_record(
+        self,
+        manifest: ToolManifest,
+    ) -> ArtifactRecord | None:
+        scope_key = self._scope_key(manifest.scope)
+        return next(
+            (
+                record
+                for record in self.store.list_records()
+                if record.kind is ArtifactKind.TOOL
+                and record.name == manifest.name
+                and record.version == manifest.version
+                and record.scope is manifest.scope
+                and record.scope_key == scope_key
+            ),
+            None,
+        )
+
+    def _next_tool_patch_version(self, manifest: ToolManifest) -> ToolManifest:
+        major, minor, patch = (int(item) for item in manifest.version.split("."))
+        occupied = {
+            record.version
+            for record in self.store.list_records()
+            if record.kind is ArtifactKind.TOOL
+            and record.name == manifest.name
+            and record.scope is manifest.scope
+            and record.scope_key == self._scope_key(manifest.scope)
+        }
+        while True:
+            patch += 1
+            candidate = f"{major}.{minor}.{patch}"
+            if candidate not in occupied:
+                return replace(manifest, version=candidate)
 
     async def create_skill(
         self,
