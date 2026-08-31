@@ -1,6 +1,199 @@
 # V-Core Changelog
 
-## Unreleased
+## 3.0.0 - 2026-08-31
+
+### Added
+- Local GGUF qualification cards covering instruction following, structured
+  output, tool use and abstention, coding, research routing, conversation, and
+  V's structural voice contract, plus grounded unknowns and execution honesty
+- Deterministic one-model-at-a-time routing across at most three qualified local
+  models, with profile invalidation, verified fallbacks, a shared reconfigurable
+  LLM client, and private prompt-digest journals
+- The `paladyn-model` operator CLI for qualification, pool configuration,
+  routing control, model inventory, and dry-run route inspection
+- A source-owned generated-tool lifecycle: the LLM now emits Python only, while
+  PALADYN derives the manifest, strict schemas, owner-oracle or deterministic
+  smoke tests, activation, post-activation invocation, and verified report
+- Model-profile chat-template selection with automatic Hermes 3 detection and a
+  vendored, reviewed `tool_use` template, keeping startup fully offline while
+  allowing llama.cpp to emit native function calls for that model family
+- A domain-independent structured-fixture protocol for generated tools: PALADYN
+  binds exact JSON inputs and expected results from the owner request, validates
+  on the first fixture, and executes an activated tool on the last fixture
+- High-level `web_search` and `web_read` tools: PALADYN now turns a focused
+  DuckDuckGo query into grounded result URLs, opens an exact observed result,
+  and rejects detail addresses invented by the model
+- Model-level V identity primer loaded by the local llama-server at process
+  startup through a private `--system-prompt-file`; the same short anchor is
+  applied before PALADYN's detailed persona across compatible GGUF templates
+- Live, per-task browser audit in the owner monitor, showing every requested
+  URL, redirect, tool outcome, and actual HTTP status without mixing in visits
+  from older tasks
+- Read-only self-review of PALADYN's prior task logs through
+  `runtime_review_task`, with bounded runtime-grounded findings that cite exact
+  tool-call and context-rollover numbers
+
+### Fixed
+- Generated tools that ignore concrete owner fixture fields and hard-code the
+  demonstrated answer are rejected before staging; explicit offline/no-web
+  constraints also survive semantic routing and remove browser capabilities
+- Source generation receives no callable tools, accepts a narrowly parsed legacy
+  wrapper from models trained to emit function envelopes, and PALADYN—not the
+  model—binds and executes the newly activated artifact
+- Generated-artifact phases now force the required lifecycle builder at the
+  provider boundary, reject calls to a not-yet-activated artifact, and recover
+  schema-shaped bare builder payloads without adding task-, language-, or
+  tool-name-specific patches
+- Hermes-style textual function-call envelopes accept only the reviewed call
+  metadata fields and cannot reinterpret an artifact manifest as an executable
+  tool call
+- Generated-tool repair rollovers now retain the failed candidate source, exact
+  expected result, and validator error instead of dropping all useful evidence
+  behind a duplicated large fixture
+- Offline fixture URLs no longer create a false browser contract, explicit
+  requests to execute the newly created tool require a separate runtime success,
+  and malformed optional artifact versions fall back to `1.0.0`
+- Dictated HTTP(S) addresses are reconstructed from spoken punctuation and
+  treated as direct owner-supplied targets; a failed direct URL is attempted
+  once and reported truthfully instead of being replaced with an unrelated
+  search result (such as a Wikipedia page about “dwukropek”)
+- After tool evidence is complete, two malformed grounded-answer drafts now
+  trigger a deterministic evidence report instead of another rewrite/context
+  rollover loop
+- Light conversation no longer inherits the repeated “Still awake, still
+  dangerous” catchphrase or closes with “What's the plan, Boss?”; deliberately
+  mangled input now gets V's short sarcastic clarification instead of the
+  sterile “You're speaking in code” response
+- Push-to-talk now defaults to `F2` in both the runtime and desktop launcher;
+  terminal bindings accept the common SS3 and CSI `F2` escape sequences
+- Empty action acknowledgements such as “I know exactly what you want. Let's do
+  it.” can no longer complete a task without execution; PALADYN rejects the
+  empty enthusiasm and keeps the runtime loop open for a real tool call
+- Runtime-owned failure, evidence, loop, and step-boundary messages keep their
+  exact operational truth while speaking in V's direct voice instead of falling
+  back to dry helpdesk prose
+- Semantically mangled speech and word salad now stop at the intent boundary;
+  V answers with a short sarcastic clarification instead of generating unrelated
+  persona filler or pretending that the fragment was understood
+- Grammatically parseable but absurd non sequiturs are distinguished from ordinary
+  conversation and receive the same bounded V-style reaction; bare "Want me to
+  do something?" closings are now rejected as helpdesk voice
+- Repetitive chants and phonetic loops are rejected by a fast runtime-owned
+  language-neutral detector before any LLM call, avoiding a slow full-persona
+  generation for obvious banter
+- Short non-action statements now use a compact current-message-only V prompt;
+  previous task checkpoints, execution memory, agent instructions, and tool
+  schemas can no longer hijack casual banter or mangled speech
+- When a local intent parser copies an unrelated previous subject into a new
+  utterance, PALADYN now asks Boss to repeat it instead of letting the main model
+  fake understanding; routine context rollovers are also skipped when they save
+  only a negligible number of tokens
+- A non-continuation intent must ground its subject and search query in the
+  current user message, preventing previous-task context from turning an
+  unrelated utterance into stale browser work
+- Public-business tasks now keep tool execution open until observed sources
+  contain every requested address, contact, or opening-hours field; a namesake
+  product page can no longer satisfy a location-information contract by itself
+- Public-fact commands now use language-independent normalized intent fields;
+  when a local classifier contradicts its own browser/report/query structure,
+  PALADYN repairs the structural contradiction rather than matching one language
+- Public-fact evidence is bound to the router's exact named subject, preventing
+  an address or opening time for a similarly named business from completing the
+  wrong task
+- Failed persona rewrites no longer erase a substantive answer with a voice-gate
+  status message
+- Evidence-finalization replies use a compact 256-token budget, cutting the long
+  wait before voice validation without reducing tool-generation budgets
+- URLs copied imperfectly by a local model are now mapped back only when they
+  match exactly one previously observed search result after separator cleanup;
+  PALADYN opens that grounded URL instead of repeating the same web search
+- Background learning no longer sends every historical experience and knowledge
+  entry to the model: each memory stage now uses a bounded newest-first evidence
+  slice, preventing accumulated memory from overflowing the model context
+- Concrete public-fact lookups requesting multiple fields such as location
+  count, opening hours, and addresses recover a browser execution contract when
+  a local model incorrectly classifies the command as ordinary conversation
+- Exiting PALADYN now terminates the complete local session, including an exact
+  matching llama-server adopted from an interrupted earlier run, releasing VRAM
+  and closing the owner monitor instead of leaving orphan processes behind
+- Conditional requests such as “find an alternative; create a tool only if none
+  exists” no longer make artifact creation an unconditional completion
+  requirement, while the fallback builders remain available when needed
+- Discovery redirects derive a bounded query from the primary request instead
+  of sending the complete multi-stage workflow to DuckDuckGo
+- Online discovery accepts a detail page only when its URL was present in an
+  earlier inspected search result, so a model cannot substitute a remembered
+  address for actual search evidence
+- Tight-context rollover removes duplicated dynamic memory before raw evidence,
+  preserves the newest verified tool result, and no longer resumes from an
+  evidence-free capsule
+- A rollover advances its evidence cursor only through calls actually embedded
+  in the raw capsule; an omitted call is retried on the next compaction instead
+  of being silently forgotten
+- V's voice gate rejects service-desk endings such as “If you'd like, I can...”
+  and “What would you prefer?”
+- Interactive checkpoints abandoned by a dead PALADYN process are recovered as
+  interrupted on the next start instead of remaining permanently `running`
+- Once a task's runtime evidence contract is satisfied, PALADYN closes tool
+  execution and reserves two tool-free turns for the final report; continued
+  tool requests are rejected and fall back to a deterministic evidence summary
+- Browser snapshots are rejected after failed navigation until a working URL is
+  opened, and a third byte-identical result from the same tool is detected even
+  when the model changes superficial arguments such as target or filename
+- Startup can safely reuse an already-loaded local llama-server only after its
+  health endpoint, model alias, owner PID, executable, GGUF path, port, private
+  bind address, and offline flags all match the selected profile; unrelated HTTP
+  services on the port remain protected from takeover
+- Polish web commands using the direct form `sieć` now deterministically route
+  to browser execution instead of being misclassified as ordinary conversation
+- Browser research now exposes and forwards `browser_type`, allowing V to enter
+  and submit search queries rather than misuse in-page text search on a homepage
+- Browser responses with HTTP 4xx/5xx status are recorded as failed evidence,
+  and named online recommendations absent from observed sources are rejected
+  before they can reach Boss as fabricated research
+- Repeated context rollovers summarize only evidence added since the previous
+  capsule, preventing duplicated calls and findings from consuming the window
+- V's voice gate now detects formulaic corporate-report structure and validates
+  the rewritten answer again; a still-sanitized first rewrite receives a second,
+  stricter V-voice pass instead of being emitted unchecked
+- Alternating between two dead URLs can no longer evade loop detection: an exact
+  action that failed twice is rejected before another external call, and browser
+  recovery directs the model to real search results instead of domain guessing
+- Online discovery without an owner-supplied address now starts from DuckDuckGo;
+  when an initial direct navigation fails before any page opens, PALADYN also
+  falls back to DuckDuckGo instead of letting the model mutate the dead hostname
+- Language-independent browser intent now preserves the same discovery rule,
+  Google detours during discovery are redirected back to DuckDuckGo even after a
+  successful page load, and HTTP/CAPTCHA failures cannot seed bypass advice into
+  a context-rollover capsule
+- Browser retry identity normalizes URL case, root slashes, and fragments, while
+  context rollover replaces DNS-inspired domain guesses with a verified-search
+  recovery step
+- Every `learning_*` operation now exposes its real required argument schema;
+  empty or malformed model calls are rejected before tool execution and returned
+  to the model for a bounded corrected attempt
+- Research mentioning ordinary tools no longer exposes the complete learning
+  lifecycle, preventing unrelated browsing tasks from drifting into empty
+  evidence, lesson, staging, or creation calls
+- Generated tool creation receives a context-aware output budget large enough for
+  its manifest, schemas, deterministic tests, and Python source instead of
+  truncating the call at the ordinary 512-token response limit
+- V's voice gate now catches additional helpdesk scripts such as "I know what
+  you're asking", "Let me break it down", and "Would you like me to..."; the
+  compact persona also restores the explicitly unsanitized hacker register
+- Browser accessibility scaffolding such as `generic [ref=...]` can no longer be
+  accepted as a concrete research finding
+- Generic action requests such as "find all available information about ..."
+  now reach the multilingual semantic router when the lexical imperative alone
+  does not identify an execution capability
+- Agent prompts contain only the tools selected for the current interaction;
+  unavailable learning and creation tools are no longer advertised from the
+  global profile catalog and cannot distract a research task
+- An explicitly named active tool overrides an erroneous semantic guess that the
+  user requested creation of a new tool
+- Conditional follow-ups about creating a missing tool are recognized as task
+  continuations, including the common Polish Whisper mistranscription observed
+  during push-to-talk testing
 
 ## 2.0.0 - 2026-08-26
 
@@ -58,6 +251,10 @@
   exact failed-tool evidence
 - Runtime-authored learning evidence for interactive tool failures, retaining the
   exact bounded error while replacing private invocation arguments with a digest
+- An owner-approved privileged generated-code policy: `owner_lab` may autonomously
+  create and persist tools using arbitrary Python imports, file operations,
+  subprocesses, and dynamic execution inside PALADYN's audited offline sandbox;
+  `client` retains the restricted source policy and lesson promotion gate
 - A fail-closed Bubblewrap recovery path for AppArmor loopback failures that
   retains filesystem/process isolation and blocks networking with libseccomp
 - A PALADYN AppArmor launch profile for Ubuntu systems that restrict

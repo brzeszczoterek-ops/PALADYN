@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import ast
+from copy import deepcopy
 from difflib import SequenceMatcher
+import hashlib
 import json
 import os
 import re
 from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from typing import Any
+from urllib.parse import parse_qs, quote_plus, unquote, urlsplit, urlunsplit
 from uuid import uuid4
 
 from openai import APIStatusError
@@ -26,6 +30,7 @@ from .tool_dispatcher import ToolDispatcher
 from .memory.memory_engine import MemoryEngine
 from .capability_dispatcher import CapabilityDispatcher
 from .capabilities.research import ResearchTask
+from .capabilities.web_target import extract_web_target
 from .execution_claims import (
     claim_has_runtime_capability,
     tool_supports_claim,
@@ -35,6 +40,8 @@ from .execution_claims import (
 from .persona.kernel import IdentityKernel
 from .persona.voice import (
     VoiceProfile,
+    looks_bland_clarification,
+    looks_empty_action_acknowledgement,
     looks_generic_assistant_voice,
     looks_sanitized_contempt,
 )
@@ -59,10 +66,11 @@ class Agent:
         self,
         config: Config,
         memory: MemoryEngine,
+        llm: LLM | None = None,
     ):
         self.config = config
 
-        self.llm = LLM()
+        self.llm = llm or LLM()
 
         self.intent_router = MultilingualIntentRouter(self.llm)
 
@@ -90,6 +98,9 @@ class Agent:
 
         self._memory_tasks: set[asyncio.Task[Any]] = set()
         self._agent_trace_root = config.autonomy_root / "interactive"
+        recovered = AgentTaskTrace.recover_stale_running(self._agent_trace_root)
+        for task_id in recovered:
+            print(f"[Task {task_id}] recovered as interrupted")
         self._last_execution_context = AgentTaskTrace.latest_context(
             self._agent_trace_root
         )
@@ -175,6 +186,9 @@ class Agent:
         self,
         prompt: str,
         on_token: Callable[[str], None] | None,
+        *,
+        trace: AgentTaskTrace | None = None,
+        remember: bool = True,
     ) -> str:
         relationship = self.memory.relationship_state
         stage = self.persona._relationship_stage(relationship)
@@ -206,6 +220,10 @@ For this short conversational reply:
 - Your edge comes from your point of view, direct rhythm, irreverence, humor, and
   willingness to disagree—not from mechanically dropping a swear into a polite reply.
 - Speak peer-to-peer. React to what Boss actually said instead of offering your services.
+- If the current message is word salad, a chant, an absurd non sequitur, or likely
+  mangled speech, tease Boss briefly and ask for a repeat. Do not invent meaning,
+  an implied request, or shared history. A fitting reaction is that Boss's brain
+  just threw a syntax error; vary naturally instead of copying a catchphrase forever.
 - Do not sound politely available for service. Avoid canned lines such as "How can
   I help?", "Ready when you are", or "What can I do for you?" React like V instead.
 - Do not invent memories, facts, feelings, or shared history.
@@ -222,8 +240,19 @@ Current relationship stage: {stage}.
             {
                 "role": "assistant",
                 "content": (
-                    "Still awake. Still dangerous to badly designed systems. "
-                    "What's going on, Boss?"
+                    "Running hot and mildly offended by the world's bad code. "
+                    "You look suspiciously awake too, Boss."
+                ),
+            },
+            {
+                "role": "user",
+                "content": "Purple spoons, uncle static, Sunday exploded.",
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "Boss... you okay, or did your brain just throw a syntax "
+                    "error? Try that again."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -249,7 +278,9 @@ Current relationship stage: {stage}.
         if on_token is not None:
             on_token(answer)
 
-        await self._remember_task(prompt, answer)
+        execution = self._finish_agent_trace(trace, answer) if trace is not None else None
+        if remember:
+            await self._remember_task(prompt, answer, execution=execution)
         return answer
 
     async def _stream_guarded_english(
@@ -336,8 +367,9 @@ Current relationship stage: {stage}.
 
         text = " ".join(words)
         action_intent = re.search(
-            r"\b(?:browse|create|delete|edit|execute|extract|find|inspect|open|"
-            r"read|research|run|search|test|write|"
+            r"\b(?:analy[sz]e|audit|browse|create|delete|edit|execute|extract|"
+            r"find|inspect|open|read|research|review|run|search|test|write|"
+            r"analizuj\w*|przeanalizuj\w*|przejrzyj\w*|"
             r"edytuj\w*|napisz\w*|otworz\w*|otwórz\w*|przeczyt\w*|"
             r"przeszuk\w*|sprawd\w*|stworz\w*|stwórz\w*|usun\w*|usuń\w*|"
             r"uruchom\w*|wykonaj\w*|wyszuk\w*|znajd\w*)\b",
@@ -396,6 +428,37 @@ Current relationship stage: {stage}.
         return bool(set(words) & greetings) and set(words) <= (
             greetings | conversational | {"co", "u", "ciebie", "v", "boss"}
         )
+
+    @staticmethod
+    def _unclear_input_answer() -> str:
+        return (
+            "Boss... you okay, or did your brain just throw a syntax error? "
+            "Try that again."
+        )
+
+    @staticmethod
+    def _looks_like_repetitive_banter(prompt: str) -> bool:
+        """Catch repeated chants without depending on any human language."""
+
+        tokens = re.findall(r"[^\W_]+", prompt.casefold(), flags=re.UNICODE)
+        if len(tokens) < 5:
+            return False
+        return len(set(tokens)) / len(tokens) <= 0.55
+
+    def _finish_unclear_input(
+        self,
+        trace: AgentTaskTrace | None,
+        on_token: Callable[[str], None] | None,
+        *,
+        reason: str,
+    ) -> str:
+        answer = self._unclear_input_answer()
+        if trace is not None:
+            trace.record_event("unclear_input_rejected", {"reason": reason})
+        self._finish_agent_trace(trace, answer)
+        if on_token is not None:
+            on_token(answer)
+        return answer
 
     async def _run_tool_task(
         self,
@@ -504,14 +567,45 @@ Current relationship stage: {stage}.
                 print(f"[Task {trace.task_id}] stopped")
             raise
         except BaseException as error:
+            direct_target = extract_web_target(prompt)
+            if direct_target and not contract.requires_web_discovery:
+                answer = self._direct_navigation_failure_answer(
+                    direct_target,
+                    f"{type(error).__name__}: {error}",
+                )
+                if trace is not None:
+                    trace.record_event(
+                        "direct_navigation_failure_reported",
+                        {
+                            "url": direct_target,
+                            "tool_sequence": (
+                                trace.tool_calls[-1].get("sequence")
+                                if trace.tool_calls
+                                else None
+                            ),
+                            "retried": False,
+                        },
+                    )
+                    trace.fail("direct navigation failed after one attempt")
+                    self._last_execution_context = AgentTaskTrace.latest_context(
+                        trace.root
+                    )
+                    print(f"[Task {trace.task_id}] failed")
+                    evidence = trace.evidence()
+                else:
+                    evidence = None
+                await self._remember_task(prompt, answer, execution=evidence)
+                if on_token is not None:
+                    on_token(answer)
+                return answer
             if trace is not None:
                 trace.fail(f"{type(error).__name__}: {error}")
                 self._last_execution_context = AgentTaskTrace.latest_context(trace.root)
                 print(f"[Task {trace.task_id}] failed")
             answer = (
-                "I couldn't complete the browser task. The runtime tool failed "
-                f"with: {type(error).__name__}: {error}. Nothing is running in "
-                "the background, and I won't invent a result."
+                "The browser task crashed. The runtime returned "
+                f"`{type(error).__name__}: {error}`. Nothing is running in "
+                "the background, and I'm not inventing a prettier result."
             )
             evidence = trace.evidence() if trace is not None else None
             await self._remember_task(prompt, answer, execution=evidence)
@@ -547,10 +641,9 @@ Current relationship stage: {stage}.
 
         if self._claims_unverified_work(answer):
             answer = (
-                "I gathered verified browser evidence, but I did not finish "
-                "the requested extraction. "
-                "Nothing is still running in the background, and I won't dress "
-                "a promise up as completed work."
+                "I gathered real browser evidence, but the extraction didn't "
+                "finish. Nothing is still running in the background, and I'm "
+                "not dressing a promise up as completed work."
             )
             evidence = self._block_agent_trace(
                 trace,
@@ -629,17 +722,35 @@ Current relationship stage: {stage}.
         on_token: Callable[[str], None] | None,
         trace: AgentTaskTrace | None,
     ) -> str:
-        contract = TaskContract.from_prompt(prompt)
+        prompt_contract = TaskContract.from_prompt(prompt)
+        contract = prompt_contract
         routing_prompt = prompt
         semantic_intent: SemanticIntent | None = None
+        semantic_failure_reason = ""
+        preferred_web_query = ""
+        preferred_web_target = extract_web_target(prompt) or ""
+        inherited_contract: TaskContract | None = None
         lexical_continuation = self._is_continuation_request(prompt)
         deterministic_action = self._requests_runtime_action(prompt, contract)
+        if (
+            not lexical_continuation
+            and not deterministic_action
+            and self._looks_like_repetitive_banter(prompt)
+        ):
+            return self._finish_unclear_input(
+                trace,
+                on_token,
+                reason="repetitive_banter",
+            )
         intent_router = getattr(self, "intent_router", None)
         classify_intent = getattr(intent_router, "classify", None)
         if (
-            not deterministic_action
-            and not lexical_continuation
+            not lexical_continuation
             and callable(classify_intent)
+            and (
+                not deterministic_action
+                or not self._contract_has_execution_route(contract)
+            )
         ):
             try:
                 semantic_intent = await classify_intent(
@@ -657,25 +768,168 @@ Current relationship stage: {stage}.
                         {"error": f"{type(error).__name__}: {error}"[:2_000]},
                     )
             else:
-                if trace is not None and semantic_intent is not None:
-                    trace.record_event(
-                        "semantic_intent_classified",
-                        {
-                            "action_requested": semantic_intent.action_requested,
-                            "continue_previous": semantic_intent.continue_previous,
-                            "capabilities": list(semantic_intent.capabilities),
-                            "requires_report": semantic_intent.requires_report,
-                            "distinct_detail_page": (
-                                semantic_intent.distinct_detail_page
-                            ),
-                        },
-                    )
+                if trace is not None:
+                    if semantic_intent is None:
+                        semantic_failure_reason = str(
+                            getattr(intent_router, "last_failure_reason", "")
+                        )
+                        trace.record_event(
+                            "semantic_intent_unparsed",
+                            {
+                                "reason": semantic_failure_reason,
+                                "response_excerpt": str(
+                                    getattr(intent_router, "last_response", "")
+                                )[:2_000]
+                            },
+                        )
+                    else:
+                        trace.record_event(
+                            "semantic_intent_classified",
+                            {
+                                "message_clear": semantic_intent.message_clear,
+                                "message_odd": semantic_intent.message_odd,
+                                "action_requested": semantic_intent.action_requested,
+                                "continue_previous": semantic_intent.continue_previous,
+                                "capabilities": list(semantic_intent.capabilities),
+                                "requires_report": semantic_intent.requires_report,
+                                "distinct_detail_page": (
+                                    semantic_intent.distinct_detail_page
+                                ),
+                                "artifact_fallback": semantic_intent.artifact_fallback,
+                                "required_public_fields": list(
+                                    semantic_intent.required_public_fields
+                                ),
+                                "public_subject": semantic_intent.public_subject,
+                                "web_query": semantic_intent.web_query,
+                            },
+                        )
+
+        if (
+            semantic_intent is not None
+            and (
+                not semantic_intent.message_clear
+                or semantic_intent.message_odd
+            )
+            and not lexical_continuation
+            and not deterministic_action
+        ):
+            return self._finish_unclear_input(
+                trace,
+                on_token,
+                reason=(
+                    "semantic_message_odd"
+                    if semantic_intent.message_odd
+                    else "semantic_message_unclear"
+                ),
+            )
+
+        if (
+            semantic_intent is not None
+            and semantic_intent.message_clear
+            and not semantic_intent.message_odd
+            and not semantic_intent.action_requested
+            and not semantic_intent.continue_previous
+            and not semantic_intent.capabilities
+            and len(re.findall(r"[^\W_]+", prompt, flags=re.UNICODE)) <= 20
+            and not prompt.rstrip().endswith("?")
+        ):
+            if trace is not None:
+                trace.record_event(
+                    "compact_chat_selected",
+                    {"reason": "short_non_action_statement"},
+                )
+            return await self._run_light_chat(
+                prompt,
+                on_token,
+                trace=trace,
+                remember=False,
+            )
 
         capability_hints = set(
             semantic_intent.capabilities if semantic_intent is not None else ()
         )
         if semantic_intent is not None:
-            contract = contract.merged(semantic_intent.to_contract())
+            contract = contract.merged(semantic_intent.to_contract(prompt))
+            preferred_web_query = semantic_intent.web_query
+            preferred_web_target = (
+                preferred_web_target
+                or extract_web_target(semantic_intent.web_query)
+                or ""
+            )
+        elif (
+            prompt_contract.allows_artifact_fallback
+            and TaskContract.implies_artifact_discovery(prompt)
+        ):
+            # A malformed or logically contradictory semantic classification
+            # must not turn "find an alternative, otherwise build one" into
+            # chat or artifact inventory management. The runtime owns this
+            # recovery contract; the model only supplies the language engine.
+            preferred_web_query = self._discovery_search_query(prompt)
+            contract = contract.merged(
+                TaskContract(
+                    requires_browser_navigation=True,
+                    requires_browser_snapshot=True,
+                    requires_web_discovery=True,
+                    requires_distinct_detail_page=True,
+                    requires_evidence_report=True,
+                    allows_artifact_fallback=True,
+                )
+            )
+            capability_hints.add("browser")
+            if trace is not None:
+                trace.record_event(
+                    "semantic_intent_recovered",
+                    {
+                        "reason": "conditional_artifact_without_execution_route",
+                        "web_query": preferred_web_query,
+                        "capabilities": ["browser"],
+                    },
+                )
+        elif (
+            deterministic_action
+            and not self._contract_has_execution_route(contract)
+            and TaskContract.implies_public_web_lookup(prompt)
+        ):
+            # A small local model can mistake a concrete business/entity lookup
+            # for conversation. Count/hours/address requests are externally
+            # verifiable work, so recover a browser contract instead of letting
+            # the model promise a search without receiving any tools.
+            preferred_web_query = self._public_fact_search_query(prompt)
+            contract = contract.merged(
+                TaskContract(
+                    requires_browser_navigation=True,
+                    requires_browser_snapshot=True,
+                    requires_web_discovery=True,
+                    requires_distinct_detail_page=True,
+                    requires_evidence_report=True,
+                    required_public_fields=(
+                        TaskContract.requested_public_fields(prompt)
+                    ),
+                )
+            )
+            capability_hints.add("browser")
+            if trace is not None:
+                trace.record_event(
+                    "semantic_intent_recovered",
+                    {
+                        "reason": "public_fact_lookup_without_execution_route",
+                        "web_query": preferred_web_query,
+                        "capabilities": ["browser"],
+                    },
+                )
+
+        if (
+            semantic_intent is None
+            and semantic_failure_reason == "current_message_grounding"
+            and not lexical_continuation
+            and not deterministic_action
+            and not self._contract_has_execution_route(contract)
+        ):
+            return self._finish_unclear_input(
+                trace,
+                on_token,
+                reason=semantic_failure_reason,
+            )
 
         continued_context = self._continued_action_context(
             prompt,
@@ -697,10 +951,44 @@ Current relationship stage: {stage}.
             if previous_objective:
                 routing_prompt = f"{previous_objective}\n\nFollow-up: {prompt}"
 
+        if TaskContract.disables_web(prompt):
+            web_requirements_present = any(
+                (
+                    contract.requires_browser_navigation,
+                    contract.requires_browser_snapshot,
+                    contract.requires_web_discovery,
+                    contract.requires_distinct_detail_page,
+                    bool(contract.required_public_fields),
+                )
+            )
+            contract = contract.without_web()
+            capability_hints.difference_update(
+                {"browser", "web", "web_search", "web_read"}
+            )
+            preferred_web_query = ""
+            preferred_web_target = ""
+            if trace is not None and web_requirements_present:
+                trace.record_event(
+                    "owner_network_constraint_enforced",
+                    {
+                        "reason": "explicit_no_web_clause",
+                        "semantic_web_requirements_discarded": True,
+                    },
+                )
+
         system_prompt = self._build_system_prompt(
             prompt,
-            agent_mode=True,
+            agent_mode=False,
         )
+        if contract.allows_artifact_fallback:
+            system_prompt += (
+                "\n\n=== CONDITIONAL ARTIFACT FALLBACK ===\n"
+                "Boss made tool or skill creation conditional. Research and inspect "
+                "real candidates first. If a suitable verified candidate exists, "
+                "report it and do not create an artifact. Only if the inspected "
+                "evidence shows that no suitable candidate was found may you invoke "
+                "learning_create_tool or learning_create_skill."
+            )
         if continued_context is not None:
             system_prompt += (
                 "\n\n=== CONTINUED RUNTIME OBJECTIVE ===\n"
@@ -798,6 +1086,13 @@ Current relationship stage: {stage}.
             tool_definitions,
         )
         if explicitly_named_tools:
+            # An existing tool named by Boss is already the execution route.
+            # A semantic classifier that merely saw the word "tool" must not
+            # turn that request into a second, unrelated tool-creation task.
+            contract = prompt_contract
+            if inherited_contract is not None:
+                contract = contract.merged(inherited_contract)
+            capability_hints.clear()
             contract = contract.with_required_tools(explicitly_named_tools)
             if trace is not None:
                 trace.set_requirements(contract.to_dict())
@@ -806,6 +1101,11 @@ Current relationship stage: {stage}.
             contract,
             tool_definitions,
             capability_hints=capability_hints,
+        )
+        agent_system_base = system_prompt
+        system_prompt = agent_system_base + (
+            "\n\n=== AGENT MODE ===\n"
+            + self._agent_mode_prompt(tool_definitions)
         )
 
         messages: list[dict[str, str]] = [
@@ -865,6 +1165,11 @@ Current relationship stage: {stage}.
             if isinstance(latest_summary, dict):
                 working_summary = latest_summary
         last_rollover_after: int | None = None
+        last_rollover_sequence = 0
+        finalization_prompted = False
+        finalization_rejections = 0
+        finalization_answer_rejections = 0
+        latest_browser_snapshot_text = ""
 
         def evidence_ledger() -> list[dict[str, Any]]:
             return sorted(
@@ -877,20 +1182,29 @@ Current relationship stage: {stage}.
             step: int,
             emergency: bool,
             force: bool = False,
-            use_model_summary: bool = True,
+            use_model_summary: bool = False,
+            request_tools: list[dict[str, Any]] | None = None,
         ) -> None:
             nonlocal messages, working_summary, last_rollover_after
+            nonlocal last_rollover_sequence
             if context_window is None:
                 return
+            ledger = evidence_ledger()
+            new_evidence = [
+                call
+                for call in ledger
+                if int(call.get("sequence") or 0) > last_rollover_sequence
+            ]
             rollover = await context_window.rollover(
                 llm=self.llm,
                 system_prompt=system_prompt,
                 objective=prompt,
                 contract=contract,
                 messages=messages,
-                tools=tool_definitions,
-                evidence=evidence_ledger(),
+                tools=(tool_definitions if request_tools is None else request_tools),
+                evidence=ledger,
                 previous_summary=working_summary,
+                evidence_since_previous=new_evidence,
                 context_tokens=context_tokens,
                 step=step,
                 use_model_summary=use_model_summary,
@@ -898,17 +1212,29 @@ Current relationship stage: {stage}.
             if (
                 not emergency
                 and not force
-                and rollover.estimated_tokens_after
-                >= rollover.estimated_tokens_before
+                and not context_window.materially_reduces(
+                    rollover.estimated_tokens_before,
+                    rollover.estimated_tokens_after,
+                )
             ):
-                # A tiny conversation can be smaller than the fixed capsule
-                # header. Defer until enough new material accumulates; calling
-                # that a compaction would only move the overflow closer.
+                # A fixed system prompt can make a capsule only a few tokens
+                # smaller. Defer until enough material accumulates; recording
+                # such a rollover creates noise without restoring useful room.
                 last_rollover_after = rollover.estimated_tokens_before
                 return
             messages = rollover.messages
             working_summary = rollover.summary
             last_rollover_after = rollover.estimated_tokens_after
+            # Advance only through evidence that was actually placed in the raw
+            # capsule. A zero-evidence rollover must retry the omitted calls next
+            # time instead of silently declaring them transferred.
+            last_rollover_sequence = max(
+                (
+                    int(call.get("sequence") or 0)
+                    for call in rollover.evidence
+                ),
+                default=last_rollover_sequence,
+            )
             if trace is not None:
                 trace.context_rolled(
                     step=step,
@@ -934,13 +1260,48 @@ Current relationship stage: {stage}.
             configured_steps = self.MAX_AGENT_STEPS
         maximum_steps = max(1, min(128, configured_steps))
 
-        for step in range(
-            maximum_steps
-        ):
+        # Two finalization-only turns are reserved beyond the executable step
+        # budget. Once the contract is satisfied those turns expose no tools,
+        # so they cannot extend the task; they only let the model render the
+        # evidence-backed answer or hit the deterministic fallback.
+        for step in range(maximum_steps + 2):
+            finalization_required = (
+                bool(successful_calls)
+                and not contract.unmet(successful_calls)
+            )
+            if step >= maximum_steps and not finalization_required:
+                break
+            active_tool_definitions = (
+                []
+                if finalization_required
+                else self._phase_tool_definitions(
+                    contract,
+                    tool_definitions,
+                    successful_calls,
+                )
+            )
+            source_owned_phase = self._source_owned_tool_phase(
+                contract,
+                active_tool_definitions,
+                successful_calls,
+            )
+            model_tool_definitions = (
+                [] if source_owned_phase else active_tool_definitions
+            )
+            phase_prompt = (
+                self._generated_source_phase_prompt(prompt)
+                if source_owned_phase
+                else self._agent_mode_prompt(active_tool_definitions)
+            )
+            system_prompt = agent_system_base + (
+                "\n\n=== AGENT MODE ===\n" + phase_prompt
+            )
+            if messages and messages[0].get("role") == "system":
+                messages[0]["content"] = system_prompt
             if context_window is not None:
                 estimated = context_window.estimate_tokens(
                     messages,
-                    tool_definitions,
+                    model_tool_definitions,
                 )
                 grew_since_rollover = (
                     last_rollover_after is None
@@ -948,23 +1309,101 @@ Current relationship stage: {stage}.
                 )
                 if grew_since_rollover and context_window.should_rollover(
                     messages,
-                    tool_definitions,
+                    model_tool_definitions,
                     context_tokens=context_tokens,
                 ):
-                    await rollover_context(step=step, emergency=False)
+                    await rollover_context(
+                        step=step,
+                        emergency=False,
+                        request_tools=model_tool_definitions,
+                    )
 
-            answer = ""
+            if finalization_required and not finalization_prompted:
+                finalization_prompted = True
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "PALADYN's runtime evidence contract is now satisfied. "
+                            "Tool execution is closed for this task. Produce the final "
+                            "answer now using only the verified tool evidence already "
+                            "present. Do not request, describe, or promise another tool "
+                            "call, and do not invent findings."
+                        ),
+                    }
+                )
+                if trace is not None:
+                    trace.record_event(
+                        "task_contract_satisfied",
+                        {
+                            "after_tool_sequence": max(
+                                (
+                                    int(call.get("sequence") or 0)
+                                    for call in successful_calls
+                                ),
+                                default=0,
+                            ),
+                            "tool_execution_closed": True,
+                        },
+                    )
+
+            runtime_execution_request = self._runtime_generated_tool_execution_request(
+                prompt,
+                contract,
+                active_tool_definitions,
+                successful_calls,
+                observed_snapshot=latest_browser_snapshot_text,
+            )
+            answer = (
+                json.dumps(
+                    {
+                        "tool": runtime_execution_request[0],
+                        "arguments": runtime_execution_request[1],
+                    },
+                    ensure_ascii=False,
+                )
+                if runtime_execution_request is not None
+                else ""
+            )
+            if runtime_execution_request is not None and trace is not None:
+                trace.record_event(
+                    "generated_tool_execution_bound",
+                    {
+                        "tool": runtime_execution_request[0],
+                        "fields": sorted(runtime_execution_request[1]),
+                        "source": "runtime_objective_fixture",
+                    },
+                )
             native_requests: list[dict[str, Any]] = []
-            for generation_attempt in range(2):
+            for generation_attempt in range(
+                0 if runtime_execution_request is not None else 2
+            ):
                 native_requests = []
                 try:
                     responder = getattr(self.llm, "respond", None)
                     if callable(responder):
                         response = await responder(
                             messages=messages,
-                            tools=tool_definitions or None,
-                            tool_choice="auto",
-                            max_tokens=512,
+                            tools=model_tool_definitions or None,
+                            tool_choice=(
+                                "auto"
+                                if source_owned_phase
+                                else self._phase_tool_choice(
+                                    contract,
+                                    active_tool_definitions,
+                                    successful_calls,
+                                )
+                            ),
+                            max_tokens=(
+                                256
+                                if finalization_required
+                                else 1_024
+                                if source_owned_phase
+                                else self._agent_generation_budget(
+                                    active_tool_definitions,
+                                    context_tokens=context_tokens,
+                                )
+                            ),
                         )
                         answer = str(getattr(response, "content", "") or "")
                         for index, call in enumerate(
@@ -1003,7 +1442,11 @@ Current relationship stage: {stage}.
                         and context_window is not None
                         and self._is_context_overflow(error)
                     ):
-                        await rollover_context(step=step, emergency=True)
+                        await rollover_context(
+                            step=step,
+                            emergency=True,
+                            request_tools=model_tool_definitions,
+                        )
                         continue
                     raise
                 break
@@ -1015,7 +1458,116 @@ Current relationship stage: {stage}.
             # The model can explicitly request a tool.
             #
 
-            tool_request = None if native_requests else self._parse_tool_request(answer)
+            tool_request = None
+            if source_owned_phase and not native_requests:
+                source = self._parse_generated_tool_source(answer)
+                if source:
+                    tool_request = ("learning_create_tool", {"source": source})
+                    if trace is not None:
+                        trace.record_event(
+                            "generated_tool_source_accepted",
+                            {
+                                "bytes": len(source.encode("utf-8")),
+                                "sha256": hashlib.sha256(
+                                    source.encode("utf-8")
+                                ).hexdigest(),
+                                "runtime_owns_contract": True,
+                            },
+                        )
+                else:
+                    if trace is not None:
+                        trace.record_event(
+                            "generated_tool_source_rejected",
+                            {
+                                "reason": "missing_valid_run_function",
+                                "candidate": answer[:2_000],
+                            },
+                        )
+                    messages.extend(
+                        [
+                            {"role": "assistant", "content": answer},
+                            {
+                                "role": "user",
+                                "content": (
+                                    "PALADYN rejected that source draft. Return only "
+                                    "valid Python defining synchronous "
+                                    "def run(arguments) that returns one JSON object. "
+                                    "No prose, JSON envelope, manifest, tests, or tool "
+                                    "call."
+                                ),
+                            },
+                        ]
+                    )
+                    continue
+            elif not native_requests:
+                tool_request = self._parse_tool_request(answer)
+            if tool_request is None and not native_requests:
+                tool_request = self._parse_active_lifecycle_payload(
+                    answer,
+                    active_tool_definitions,
+                )
+                if tool_request is not None and trace is not None:
+                    trace.record_event(
+                        "bare_lifecycle_payload_recovered",
+                        {
+                            "builder": tool_request[0],
+                            "fields": sorted(tool_request[1]),
+                        },
+                    )
+
+            if finalization_required and (native_requests or tool_request is not None):
+                finalization_rejections += 1
+                if trace is not None:
+                    trace.record_event(
+                        "post_contract_tool_call_rejected",
+                        {
+                            "attempt": finalization_rejections,
+                            "tools": [
+                                str(item.get("tool", ""))
+                                for item in native_requests
+                            ] or ([str(tool_request[0])] if tool_request else []),
+                        },
+                    )
+                if finalization_rejections >= 2:
+                    final_answer = (
+                        "Enough. The model tried twice to reopen tools after the "
+                        "evidence was already complete, so I killed that loop. "
+                        "Here's the runtime-verified result—no invented extras:\n\n"
+                        + self._owner_progress_report(
+                            working_summary,
+                            successful_calls,
+                            [],
+                        )
+                    )
+                    evidence = self._finish_agent_trace(trace, final_answer)
+                    await self._remember_task(
+                        prompt,
+                        final_answer,
+                        execution=evidence,
+                    )
+                    if on_token is not None:
+                        on_token(final_answer)
+                    return final_answer
+                messages.extend(
+                    [
+                        {
+                            "role": "assistant",
+                            "content": (
+                                "I attempted another tool call after PALADYN closed "
+                                "tool execution."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                "That tool call was rejected. Give the final grounded "
+                                "answer now. No tools are available and no background "
+                                "work exists."
+                            ),
+                        },
+                    ]
+                )
+                continue
 
             if tool_request is None and not native_requests:
 
@@ -1030,16 +1582,58 @@ Current relationship stage: {stage}.
                 tool_request = self._parse_tool_request(final_answer)
 
                 if tool_request is None:
+                    public_recovery = self._public_fact_recovery_request(
+                        prompt,
+                        contract,
+                        successful_calls,
+                        tool_definitions,
+                        preferred_query=preferred_web_query,
+                    )
+                    if public_recovery is not None:
+                        tool_request = public_recovery
+                        if trace is not None:
+                            trace.record_event(
+                                "public_fact_search_recovered",
+                                {
+                                    "query": str(
+                                        public_recovery[1].get("query", "")
+                                    ),
+                                    "missing": [
+                                        item
+                                        for item in contract.unmet(successful_calls)
+                                        if item.startswith("public_fact:")
+                                    ],
+                                    "reason": (
+                                        "model_stopped_before_requested_fields"
+                                    ),
+                                },
+                            )
+
+                if tool_request is None:
                     missing_evidence = [
                         *contract.unmet(successful_calls),
-                        *contract.answer_issues(final_answer, successful_calls),
+                        *contract.answer_issues(
+                            final_answer,
+                            successful_calls,
+                            request=prompt,
+                        ),
                     ]
                     unverified_work = self._claims_unverified_work(final_answer)
+                    empty_action_acknowledgement = (
+                        runtime_action_requested
+                        and not successful_calls
+                        and looks_empty_action_acknowledgement(final_answer)
+                    )
                     unsupported = unsupported_execution_claims(
                         final_answer,
                         successful_tools,
                     )
-                    if unverified_work or missing_evidence or unsupported:
+                    if (
+                        unverified_work
+                        or empty_action_acknowledgement
+                        or missing_evidence
+                        or unsupported
+                    ):
                         rejected_unverified_work = True
                         rejected_claims.update(unsupported)
                         if trace is not None:
@@ -1047,6 +1641,8 @@ Current relationship stage: {stage}.
                                 reason = "missing_required_tool_evidence"
                             elif unsupported:
                                 reason = "unsupported_execution_claim"
+                            elif empty_action_acknowledgement:
+                                reason = "empty_action_acknowledgement"
                             else:
                                 reason = "unverified_future_or_background_work"
                             trace.record_event(
@@ -1058,6 +1654,43 @@ Current relationship stage: {stage}.
                                     "unsupported_claims": list(unsupported),
                                 },
                             )
+                        if finalization_required and not contract.unmet(
+                            successful_calls
+                        ):
+                            finalization_answer_rejections += 1
+                            if finalization_answer_rejections >= 2:
+                                final_answer = (
+                                    "The model mangled the grounded final report "
+                                    "twice, so I killed that rewrite loop. Here's "
+                                    "the runtime-verified result instead:\n\n"
+                                    + self._owner_progress_report(
+                                        working_summary,
+                                        successful_calls,
+                                        [],
+                                    )
+                                )
+                                if trace is not None:
+                                    trace.record_event(
+                                        "final_answer_loop_cut_off",
+                                        {
+                                            "rejected_candidates": (
+                                                finalization_answer_rejections
+                                            ),
+                                            "tool_execution_closed": True,
+                                        },
+                                    )
+                                evidence = self._finish_agent_trace(
+                                    trace,
+                                    final_answer,
+                                )
+                                await self._remember_task(
+                                    prompt,
+                                    final_answer,
+                                    execution=evidence,
+                                )
+                                if on_token is not None:
+                                    on_token(final_answer)
+                                return final_answer
                         impossible_claims = tuple(
                             category
                             for category in unsupported
@@ -1082,13 +1715,30 @@ Current relationship stage: {stage}.
                                 on_token(final_answer)
                             return final_answer
                         missing_description = list(missing_evidence) + list(unsupported)
+                        if empty_action_acknowledgement:
+                            missing_description.append(
+                                "answer:acknowledgement_without_execution"
+                            )
+                        ungrounded_online = any(
+                            item.startswith("answer:ungrounded_online_claims=")
+                            for item in missing_evidence
+                        )
                         if any(
                             item.startswith("answer:") for item in missing_evidence
-                        ) and not contract.unmet(successful_calls):
+                        ) and not contract.unmet(successful_calls) and not ungrounded_online:
                             repair_action = (
                                 "Do not call the observation tool again. Use its exact "
                                 "successful output already present in this conversation "
                                 "and provide the concrete result Boss requested."
+                            )
+                        elif ungrounded_online:
+                            repair_action = (
+                                "Every named product, project, person, repository, or "
+                                "recommendation must be present in a real source observed "
+                                "during this task. Navigate to an actual source and capture "
+                                "a snapshot for each claim you keep, or omit the unsupported "
+                                "claim. A 4xx/5xx page and a site homepage are not evidence "
+                                "for an unobserved recommendation."
                             )
                         else:
                             repair_action = (
@@ -1183,6 +1833,86 @@ Current relationship stage: {stage}.
                                     "source": "explicit_quoted_text",
                                 },
                             )
+                    grounded = self._repair_grounded_generated_tool_arguments(
+                        prompt,
+                        str(request.get("tool", "")),
+                        request.get("arguments", {}),
+                        tool_definitions,
+                        successful_calls,
+                    )
+                    if grounded != request.get("arguments"):
+                        request["arguments"] = grounded
+                        request["raw_arguments"] = json.dumps(
+                            grounded,
+                            ensure_ascii=False,
+                        )
+                        if trace is not None:
+                            trace.record_event(
+                                "tool_arguments_repaired",
+                                {
+                                    "tool": request.get("tool", ""),
+                                    "fields": (
+                                        ["test.arguments"]
+                                        if request.get("tool")
+                                        == "learning_create_tool"
+                                        else sorted(grounded)
+                                    ),
+                                    "source": "runtime_structured_literal",
+                                },
+                            )
+                    discovery_repaired = self._repair_web_discovery_navigation(
+                        prompt,
+                        str(request.get("tool", "")),
+                        request.get("arguments", {}),
+                        contract,
+                        successful_calls,
+                        failed_calls,
+                        preferred_query=preferred_web_query,
+                        preferred_target=preferred_web_target,
+                    )
+                    if discovery_repaired != request.get("arguments"):
+                        original = request.get("arguments", {})
+                        request["arguments"] = discovery_repaired
+                        request["raw_arguments"] = json.dumps(
+                            discovery_repaired,
+                            ensure_ascii=False,
+                        )
+                        if trace is not None:
+                            trace.record_event(
+                                "browser_discovery_redirected",
+                                {
+                                    "requested": original,
+                                    "executed": discovery_repaired,
+                                    "reason": (
+                                        "owner_supplied_direct_url"
+                                        if preferred_web_target
+                                        and not contract.requires_web_discovery
+                                        else "unverified_initial_domain"
+                                    ),
+                                },
+                            )
+                    snapshot_repaired = self._repair_observed_snapshot_input(
+                        str(request.get("tool", "")),
+                        request.get("arguments", {}),
+                        tool_definitions,
+                        successful_calls,
+                        latest_browser_snapshot_text,
+                    )
+                    if snapshot_repaired != request.get("arguments"):
+                        request["arguments"] = snapshot_repaired
+                        request["raw_arguments"] = json.dumps(
+                            snapshot_repaired,
+                            ensure_ascii=False,
+                        )
+                        if trace is not None:
+                            trace.record_event(
+                                "tool_arguments_repaired",
+                                {
+                                    "tool": request.get("tool", ""),
+                                    "fields": ["snapshot_text"],
+                                    "source": "runtime_observed_browser_snapshot",
+                                },
+                            )
                 messages.append(
                     {
                         "role": "assistant",
@@ -1234,6 +1964,76 @@ Current relationship stage: {stage}.
                                 "source": "explicit_quoted_text",
                             },
                         )
+                grounded = self._repair_grounded_generated_tool_arguments(
+                    prompt,
+                    tool_name,
+                    arguments,
+                    tool_definitions,
+                    successful_calls,
+                )
+                if grounded != arguments:
+                    arguments = grounded
+                    requests[0]["arguments"] = grounded
+                    if trace is not None:
+                        trace.record_event(
+                            "tool_arguments_repaired",
+                            {
+                                "tool": tool_name,
+                                "fields": (
+                                    ["test.arguments"]
+                                    if tool_name == "learning_create_tool"
+                                    else sorted(grounded)
+                                ),
+                                "source": "runtime_structured_literal",
+                            },
+                        )
+                discovery_repaired = self._repair_web_discovery_navigation(
+                    prompt,
+                    tool_name,
+                    arguments,
+                    contract,
+                    successful_calls,
+                    failed_calls,
+                    preferred_query=preferred_web_query,
+                    preferred_target=preferred_web_target,
+                )
+                if discovery_repaired != arguments:
+                    original = arguments
+                    arguments = discovery_repaired
+                    requests[0]["arguments"] = discovery_repaired
+                    if trace is not None:
+                        trace.record_event(
+                            "browser_discovery_redirected",
+                            {
+                                "requested": original,
+                                "executed": discovery_repaired,
+                                "reason": (
+                                    "owner_supplied_direct_url"
+                                    if preferred_web_target
+                                    and not contract.requires_web_discovery
+                                    else "unverified_initial_domain"
+                                ),
+                            },
+                        )
+                snapshot_repaired = self._repair_observed_snapshot_input(
+                    tool_name,
+                    arguments,
+                    tool_definitions,
+                    successful_calls,
+                    latest_browser_snapshot_text,
+                )
+                if snapshot_repaired != arguments:
+                    arguments = snapshot_repaired
+                    requests[0]["arguments"] = snapshot_repaired
+                    if trace is not None:
+                        trace.record_event(
+                            "tool_arguments_repaired",
+                            {
+                                "tool": tool_name,
+                                "fields": ["snapshot_text"],
+                                "source": "runtime_observed_browser_snapshot",
+                            },
+                        )
                 messages.append(
                     {
                         "role": "assistant",
@@ -1244,20 +2044,41 @@ Current relationship stage: {stage}.
                     }
                 )
 
+            # The phase catalog is authoritative for this turn. A model must
+            # not jump directly to a generated tool that is present only in
+            # its prose or memory before the learning lifecycle activates it.
             available_names = {
                 item.get("function", {}).get("name")
-                for item in tool_definitions
+                for item in active_tool_definitions
                 if isinstance(item, dict)
             }
             for request in requests:
                 tool_name = str(request["tool"])
                 arguments = request["arguments"]
+                lifecycle_builder = self._creation_lifecycle_builder(
+                    tool_name,
+                    active_tool_definitions,
+                    contract,
+                    successful_calls,
+                )
+                request["lifecycle_builder"] = lifecycle_builder
                 request_identity = self._tool_request_identity(
                     tool_name,
                     arguments,
                 )
+                ledger = evidence_ledger()
+                prior_failed_identical = sum(
+                    1
+                    for previous_call in ledger
+                    if previous_call.get("status") == "failed"
+                    and self._tool_request_identity(
+                        str(previous_call.get("tool", "")),
+                        previous_call.get("arguments", {}),
+                    )
+                    == request_identity
+                )
                 consecutive_repeats = 0
-                for previous_call in reversed(evidence_ledger()):
+                for previous_call in reversed(ledger):
                     if self._tool_request_identity(
                         str(previous_call.get("tool", "")),
                         previous_call.get("arguments", {}),
@@ -1265,7 +2086,7 @@ Current relationship stage: {stage}.
                         break
                     consecutive_repeats += 1
 
-                if consecutive_repeats >= 3:
+                if consecutive_repeats >= 3 or prior_failed_identical >= 3:
                     if trace is not None:
                         trace.record_event(
                             "repeated_tool_loop_detected",
@@ -1273,6 +2094,7 @@ Current relationship stage: {stage}.
                                 "tool": tool_name,
                                 "arguments": arguments,
                                 "consecutive_requests": consecutive_repeats + 1,
+                                "prior_failed_identical": prior_failed_identical,
                             },
                         )
                     missing_evidence = contract.unmet(successful_calls)
@@ -1285,9 +2107,9 @@ Current relationship stage: {stage}.
                         missing_descriptions,
                     )
                     answer = (
-                        f"I paused because the model kept requesting the same "
+                        f"I cut this off because the model kept requesting the same "
                         f"`{tool_name}` action with identical arguments without "
-                        "producing new evidence. Here is the last verified task "
+                        "producing new evidence. Here's the last verified task "
                         f"state:\n\n{progress_report}\n\n"
                     )
                     if trace is not None and trace.continuous_authorized:
@@ -1335,6 +2157,16 @@ Current relationship stage: {stage}.
                     )
 
                 tool_error = str(request.get("argument_error", "")) or None
+                if tool_error is None:
+                    argument_problem = self._tool_argument_problem(
+                        tool_name,
+                        arguments,
+                        active_tool_definitions,
+                    )
+                    if argument_problem:
+                        tool_error = (
+                            "ToolArgumentValidationError: " + argument_problem
+                        )
                 if consecutive_repeats >= 2:
                     tool_error = (
                         "RepeatedToolCallError: PALADYN rejected a third "
@@ -1342,6 +2174,31 @@ Current relationship stage: {stage}.
                         "arguments. Use existing evidence, change strategy, or "
                         "finish truthfully."
                     )
+                if prior_failed_identical >= 2:
+                    tool_error = (
+                        "RepeatedFailedToolCallError: this exact action has already "
+                        "failed twice. Do not retry or guess a nearby domain. For web "
+                        "discovery, use a real search-results URL or open a search "
+                        "page, snapshot it, and submit the query with browser_type."
+                    )
+                if tool_error is None and tool_name == "browser_snapshot":
+                    latest_navigation = next(
+                        (
+                            call
+                            for call in reversed(ledger)
+                            if call.get("tool") == "browser_navigate"
+                        ),
+                        None,
+                    )
+                    if (
+                        latest_navigation is not None
+                        and latest_navigation.get("status") == "failed"
+                    ):
+                        tool_error = (
+                            "BrowserStateError: snapshot rejected because the latest "
+                            "browser navigation failed. Navigate to a verified working "
+                            "URL before requesting another snapshot."
+                        )
                 if not tool_name:
                     tool_error = tool_error or "ProtocolError: missing tool name"
                 elif catalog_error:
@@ -1349,6 +2206,22 @@ Current relationship stage: {stage}.
                         "ToolCatalogError: executable tool schemas are unavailable: "
                         + catalog_error
                     )
+                elif lifecycle_builder:
+                    tool_error = (
+                        "GeneratedToolLifecycleError: the requested generated tool "
+                        f"{tool_name!r} does not exist yet. Do not call the final "
+                        "tool name before activation. The next action must call "
+                        f"{lifecycle_builder!r} with its complete required schema, "
+                        "including Python source and a deterministic test."
+                    )
+                    if trace is not None:
+                        trace.record_event(
+                            "premature_generated_tool_call_redirected",
+                            {
+                                "requested_tool": tool_name,
+                                "required_builder": lifecycle_builder,
+                            },
+                        )
                 elif catalog_is_authoritative and tool_name not in available_names:
                     tool_error = f"UnknownToolError: {tool_name} is not an available tool"
 
@@ -1370,13 +2243,57 @@ Current relationship stage: {stage}.
                     tool_result = f"Tool execution failed: {tool_error}"
 
                 tool_result = str(tool_result)
-                model_tool_result = self._fit_tool_output(
-                    tool_result,
-                    max_characters=max(
-                        1_500,
-                        min(6_000, context_tokens - 2_048) // max(1, len(requests)),
-                    ),
+                result_sha256 = hashlib.sha256(
+                    tool_result.encode("utf-8", errors="replace")
+                ).hexdigest()
+                matching_results = [
+                    call
+                    for call in ledger
+                    if call.get("tool") == tool_name
+                    and call.get("result_sha256") == result_sha256
+                ]
+                if tool_error is None and len(matching_results) >= 2:
+                    tool_error = (
+                        "RepeatedToolResultError: this tool produced the same "
+                        "byte-identical result three times despite the attempted "
+                        "strategy changes. Use existing evidence or change the "
+                        "browser state with a different tool."
+                    )
+                    if trace is not None:
+                        trace.record_event(
+                            "repeated_tool_result_detected",
+                            {
+                                "tool": tool_name,
+                                "prior_sequences": [
+                                    int(call.get("sequence") or 0)
+                                    for call in matching_results[-8:]
+                                ],
+                                "result_sha256": result_sha256,
+                            },
+                        )
+                model_output_limit = max(
+                    1_500,
+                    min(6_000, context_tokens - 2_048) // max(1, len(requests)),
                 )
+                if tool_name == "browser_snapshot":
+                    model_tool_result = self._fit_browser_snapshot_output(
+                        tool_result,
+                        max_characters=model_output_limit,
+                    )
+                else:
+                    model_tool_result = self._fit_tool_output(
+                        tool_result,
+                        max_characters=model_output_limit,
+                    )
+                if tool_error is None and tool_name == "browser_snapshot":
+                    latest_browser_snapshot_text = model_tool_result
+                    observe_snapshot = getattr(
+                        self.tools,
+                        "observe_browser_snapshot",
+                        None,
+                    )
+                    if callable(observe_snapshot):
+                        observe_snapshot(model_tool_result)
                 call_record = {
                     "sequence": trace_sequence or (
                         len(successful_calls) + len(failed_calls) + 1
@@ -1384,7 +2301,12 @@ Current relationship stage: {stage}.
                     "tool": tool_name,
                     "arguments": arguments,
                     "status": "failed" if tool_error else "succeeded",
-                    "result_excerpt": tool_result[:2_000],
+                    "result_sha256": result_sha256,
+                    "result_excerpt": (
+                        model_tool_result[:2_000]
+                        if tool_name == "browser_snapshot"
+                        else tool_result[:2_000]
+                    ),
                     "error": tool_error or "",
                 }
                 if trace is not None and trace_sequence is not None:
@@ -1392,6 +2314,11 @@ Current relationship stage: {stage}.
                         trace_sequence,
                         tool_result,
                         error=tool_error,
+                        evidence_excerpt=(
+                            model_tool_result
+                            if tool_name == "browser_snapshot"
+                            else None
+                        ),
                     )
                     print(
                         f"[Task {trace.task_id}] tool {trace_sequence} "
@@ -1402,6 +2329,7 @@ Current relationship stage: {stage}.
                     successful_calls.append(call_record)
                     if tool_name in {
                         "learning_create_tool",
+                        "learning_create_snapshot_extractor",
                         "learning_activate_artifact",
                     } and callable(definition_loader):
                         try:
@@ -1511,13 +2439,95 @@ Current relationship stage: {stage}.
                     )
                 else:
                     messages.append({"role": "user", "content": tool_message})
+                if (
+                    source_owned_phase
+                    and tool_name == "learning_create_tool"
+                    and tool_error
+                ):
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "PALADYN rejected the generated source; no artifact "
+                                "was activated. Produce a corrected replacement now. "
+                                "Return ONLY Python source defining synchronous "
+                                "def run(arguments). Consume every concrete fixture "
+                                "field through arguments and never hard-code the "
+                                "expected output. The trusted runtime validation "
+                                f"error was: {tool_error[:1_500]}"
+                            ),
+                        }
+                    )
+                if lifecycle_builder:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "PALADYN lifecycle correction: you attempted to call "
+                                f"the requested final tool `{tool_name}` before it was "
+                                "created. It is not executable. Do not repeat that "
+                                "name now. Your next response must invoke the available "
+                                f"`{lifecycle_builder}` function through native tool "
+                                "calling, with every required field from its supplied "
+                                "schema. Only after PALADYN returns an active artifact "
+                                "may you call the generated tool name."
+                            ),
+                        }
+                    )
+
+            direct_failure = self._direct_navigation_failure(
+                preferred_web_target,
+                contract,
+                failed_calls,
+            )
+            if direct_failure is not None:
+                final_answer = self._direct_navigation_failure_answer(
+                    preferred_web_target,
+                    str(
+                        direct_failure.get("error")
+                        or direct_failure.get("result_excerpt")
+                        or "navigation failed"
+                    ),
+                )
+                if trace is not None:
+                    trace.record_event(
+                        "direct_navigation_failure_reported",
+                        {
+                            "url": preferred_web_target,
+                            "tool_sequence": direct_failure.get("sequence"),
+                            "retried": False,
+                        },
+                    )
+                if trace is not None:
+                    trace.fail("direct navigation failed after one attempt")
+                    self._last_execution_context = AgentTaskTrace.latest_context(
+                        trace.root
+                    )
+                    print(f"[Task {trace.task_id}] failed")
+                    evidence = trace.evidence()
+                else:
+                    evidence = None
+                await self._remember_task(
+                    prompt,
+                    final_answer,
+                    execution=evidence,
+                )
+                if on_token is not None:
+                    on_token(final_answer)
+                return final_answer
 
             deterministic_answer = contract.deterministic_answer(successful_calls)
             if deterministic_answer is not None and not contract.unmet(successful_calls):
                 if trace is not None:
                     trace.record_event(
                         "deterministic_result_rendered",
-                        {"contract": "first_heading"},
+                        {
+                            "contract": (
+                                "generated_tool_execution"
+                                if contract.requires_created_tool_execution
+                                else "first_heading"
+                            )
+                        },
                     )
                 evidence = self._finish_agent_trace(trace, deterministic_answer)
                 await self._remember_task(
@@ -1578,7 +2588,7 @@ Current relationship stage: {stage}.
                 raise _ContinueAgentBatch
 
             answer = (
-                "I stopped the continuous run because three consecutive step "
+                "I killed the continuous run because three consecutive step "
                 "batches produced no new successful tool evidence. Here is the "
                 "last verified task state:\n\n"
                 f"{progress_report}\n\n"
@@ -1631,17 +2641,16 @@ Current relationship stage: {stage}.
                 f"{failure_detail}."
             )
         answer = (
-            f"I reached the current batch limit of {maximum_steps} agent steps. "
-            "Here is the actual task progress so far:\n\n"
+            f"Batch limit: {maximum_steps} agent steps. Here's the real progress, "
+            "not a made-up finish:\n\n"
             f"{progress_report}\n\n"
             f"Checkpoint: {len(successful_calls)} successful and "
             f"{len(failed_calls)} failed tool calls. "
             f"Still needed: {remaining}.{failure_note} "
-            "Do you want me to continue this exact "
-            f"task with another batch of up to {maximum_steps} steps, or stop? "
-            "Reply `/continue` for one more batch, `/continue --continuous` to "
-            "authorize this task to keep taking further batches without asking "
-            "again, or `/stop`. Nothing is running in the background while I wait."
+            "Your call: `/continue` gives this exact task another batch of up to "
+            f"{maximum_steps} steps; `/continue --continuous` lets it keep taking "
+            "further batches without asking again; `/stop` kills it. "
+            "Nothing is running in the background while I wait."
         )
 
         await self._remember_task(
@@ -1670,12 +2679,133 @@ Current relationship stage: {stage}.
         }
 
         def clean(value: Any) -> str:
-            text = " ".join(str(value).split()).strip()
+            raw = str(value).strip()
+            try:
+                structured = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                structured = None
+            if isinstance(structured, dict):
+                if structured.get("engine") == "duckduckgo" and isinstance(
+                    structured.get("results"), list
+                ):
+                    results = []
+                    for item in structured["results"][:8]:
+                        if not isinstance(item, dict) or not item.get("url"):
+                            continue
+                        title = " ".join(str(item.get("title", "")).split()).strip()
+                        url = str(item["url"]).strip()
+                        results.append(f"{title} — {url}" if title else url)
+                    if results:
+                        query = " ".join(str(structured.get("query", "")).split())
+                        return (f"Search for “{query}” found: " + "; ".join(results))[
+                            :600
+                        ]
+                content = structured.get("content")
+                if isinstance(content, str) and content.strip():
+                    return clean(content)
+
+            text = " ".join(raw.split()).strip()
             for name in tool_names:
                 prefix = f"{name}:"
                 if text.casefold().startswith(prefix.casefold()):
                     text = text[len(prefix):].strip()
                     break
+
+            no_match = re.search(
+                r"no\s+matches?\s+found\s+for\s+[\"“']?([^\"”']+)",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if no_match:
+                query = no_match.group(1).strip().rstrip(". ")
+                return (
+                    f"No match for \N{LEFT DOUBLE QUOTATION MARK}{query}"
+                    f"\N{RIGHT DOUBLE QUOTATION MARK} was found on the inspected page."
+                )[:600]
+
+            # Browser adapters return useful page metadata together with large
+            # Playwright/accessibility dumps. Owner reports must preserve the
+            # verified URL/title without leaking YAML, element refs, or executed
+            # JavaScript as if it were a research finding.
+            page_url = re.search(
+                r"Page URL:\s*\[?(https?://[^\s\])]+)",
+                text,
+                flags=re.IGNORECASE,
+            )
+            page_title = re.search(
+                r"Page Title:\s*(.+?)(?=\s+-\s+Console:|\s+###\s+Snapshot|"
+                r"\s+\[PALADYN\s|$)",
+                text,
+                flags=re.IGNORECASE,
+            )
+            raw_browser_output = bool(
+                page_url
+                or re.search(
+                    r"(?:###\s+(?:Ran Playwright code|Snapshot|Page)|"
+                    r"```ya?ml|\bgeneric\s*\[(?:active\]\s*)?\[?ref=|"
+                    r"\[ref=[^\]]+\]|\bcursor=(?:pointer|text)\b)",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if raw_browser_output:
+                if page_url:
+                    url = page_url.group(1).rstrip(".,")
+                    title = page_title.group(1).strip(" -.") if page_title else ""
+                    if title.casefold().startswith("loading http"):
+                        title = ""
+                    page_summary = (
+                        f"Source: {url} — {title}." if title else f"Source: {url}."
+                    )
+                    headings: list[str] = []
+                    for heading in re.findall(
+                        r'\bheading\s+"([^"]+)"\s+\[level=(?:2|3)\]',
+                        text,
+                        flags=re.IGNORECASE,
+                    ):
+                        compact_heading = " ".join(heading.split()).strip(" -.")
+                        if (
+                            compact_heading
+                            and compact_heading.casefold() != title.casefold()
+                            and compact_heading.casefold()
+                            not in {item.casefold() for item in headings}
+                        ):
+                            headings.append(compact_heading)
+                    if headings:
+                        numbered = [
+                            heading
+                            for heading in headings
+                            if re.match(r"^\d+[.)]\s+", heading)
+                        ]
+                        if numbered:
+                            selected = []
+                            for heading in numbered:
+                                candidate = re.sub(
+                                    r"^\d+[.)]\s+", "", heading
+                                ).split(":", 1)[0].strip()
+                                if candidate and candidate.casefold() not in {
+                                    item.casefold() for item in selected
+                                }:
+                                    selected.append(candidate)
+                        else:
+                            selected = headings
+                        label = (
+                            "Verified candidates" if numbered else "Verified sections"
+                        )
+                        page_summary += f" {label}: " + "; ".join(selected[:10]) + "."
+                    return page_summary[:600]
+                return ""
+
+            # Failed calls can be present in a model-produced rollover summary
+            # even though this function also receives the successful-call ledger.
+            # Do not promote adapter diagnostics into verified findings.
+            if re.search(
+                r"^browser_[a-z0-9_]+:\s*browser_[a-z0-9_]+\s+requires\b|"
+                r"^(?:error(?:\s+code)?|tool\s+error|failed)\b",
+                text,
+                flags=re.IGNORECASE,
+            ):
+                return ""
             return text[:600]
 
         raw_findings = (
@@ -1685,20 +2815,84 @@ Current relationship stage: {stage}.
             else []
         )
         findings: list[str] = []
-        seen: set[str] = set()
-        for item in raw_findings:
+        finding_indexes: dict[str, int] = {}
+
+        def finding_key(finding: str) -> str:
+            source = re.match(r"(?:Visited\s+|Source:\s+)(https?://\S+)", finding)
+            if source:
+                return "url:" + source.group(1).rstrip(".,").casefold()
+            return "text:" + finding.casefold()
+
+        def add_finding(item: Any) -> None:
             finding = clean(item)
-            key = finding.casefold()
-            if finding and key not in seen:
+            if not finding:
+                return
+            key = finding_key(finding)
+            existing = finding_indexes.get(key)
+            if existing is None:
+                finding_indexes[key] = len(findings)
                 findings.append(finding)
-                seen.add(key)
-        if not findings:
-            for call in successful_calls[-8:]:
-                finding = clean(call.get("result_excerpt", ""))
-                key = finding.casefold()
-                if finding and key not in seen:
-                    findings.append(finding)
-                    seen.add(key)
+            elif len(finding) > len(findings[existing]):
+                # Context summaries deliberately truncate evidence. When the
+                # immutable call ledger still contains a richer description of
+                # the same page, keep that one (including verified headings)
+                # instead of reducing the owner report to a bare URL.
+                findings[existing] = finding
+
+        # A model-written or bounded rollover summary is planning context, not
+        # the evidence source of record. When the immutable call ledger exists,
+        # derive owner-visible findings from it alone. This also prevents a
+        # truncated summary URL from becoming a duplicate of the real URL.
+        has_detail_source = False
+        if successful_calls:
+            for call in successful_calls:
+                tool = str(call.get("tool", ""))
+                if tool not in {"browser_navigate", "web_read"}:
+                    continue
+                arguments = call.get("arguments", {})
+                url = str(arguments.get("url", "")) if isinstance(arguments, dict) else ""
+                parsed = urlsplit(url)
+                hostname = (parsed.hostname or "").casefold()
+                if url and not (
+                    hostname.endswith("duckduckgo.com")
+                    or hostname in {
+                        "google.com",
+                        "www.google.com",
+                        "bing.com",
+                        "www.bing.com",
+                        "search.brave.com",
+                        "search.yahoo.com",
+                    }
+                ):
+                    has_detail_source = True
+                    break
+
+        if successful_calls:
+            for call in successful_calls[-12:]:
+                if has_detail_source and call.get("tool") == "web_search":
+                    continue
+                excerpt = call.get("result_excerpt", "")
+                finding = clean(excerpt)
+                if has_detail_source and finding.startswith("Source: http"):
+                    match = re.match(r"Source:\s+(https?://\S+)", finding)
+                    hostname = (
+                        (urlsplit(match.group(1)).hostname or "").casefold()
+                        if match
+                        else ""
+                    )
+                    if hostname.endswith("duckduckgo.com") or hostname in {
+                        "google.com",
+                        "www.google.com",
+                        "bing.com",
+                        "www.bing.com",
+                        "search.brave.com",
+                        "search.yahoo.com",
+                    }:
+                        continue
+                add_finding(excerpt)
+        else:
+            for item in raw_findings:
+                add_finding(item)
 
         raw_next_steps: list[Any] = []
         if isinstance(summary, dict):
@@ -1718,16 +2912,14 @@ Current relationship stage: {stage}.
         if not next_steps:
             next_steps = [clean(item) for item in missing if clean(item)]
 
-        lines = ["What I found:"]
+        lines = ["Verified findings:"]
         if findings:
             lines.extend(f"- {item}" for item in findings[-8:])
         else:
             lines.append("- No verified task findings yet.")
-        lines.append("What remains:")
         if next_steps:
+            lines.append("Still open:")
             lines.extend(f"- {item}" for item in next_steps[:8])
-        else:
-            lines.append("- Produce and verify the final answer from the collected evidence.")
         return "\n".join(lines)
 
     @staticmethod
@@ -1740,6 +2932,9 @@ Current relationship stage: {stage}.
             "browser_navigate:distinct_detail_page": (
                 "open the relevant result or offer page, not only the listing"
             ),
+            "browser_navigate:detail_not_discovered": (
+                "open a detail-page URL actually present in the inspected search results"
+            ),
             "browser_snapshot:detail_page": (
                 "inspect the actual content of that result or offer page"
             ),
@@ -1748,6 +2943,21 @@ Current relationship stage: {stage}.
             "command_execution": "run and verify the requested command or tests",
             "learning_create_tool": "create, validate, and activate the needed tool",
             "learning_create_skill": "create, validate, and activate the needed skill",
+            "public_fact:address": (
+                "find a source containing the requested street or postal address"
+            ),
+            "public_fact:contact": (
+                "find a source containing the requested phone number or email address"
+            ),
+            "public_fact:opening_hours": (
+                "find a source containing explicit opening days and times"
+            ),
+            "public_fact:count": (
+                "find evidence stating the number of matching locations"
+            ),
+            "public_fact:subject": (
+                "verify that the source describes the exact requested subject"
+            ),
             "answer:evidence_observation_missing": (
                 "collect concrete evidence needed for the final report"
             ),
@@ -1779,12 +2989,550 @@ Current relationship stage: {stage}.
 
     @staticmethod
     def _tool_request_identity(tool: str, arguments: Any) -> str:
+        if tool == "browser_navigate" and isinstance(arguments, dict):
+            arguments = dict(arguments)
+            raw_url = str(arguments.get("url", "")).strip()
+            try:
+                parts = urlsplit(raw_url)
+            except ValueError:
+                parts = None
+            if parts is not None and parts.scheme and parts.netloc:
+                path = parts.path.rstrip("/")
+                arguments["url"] = urlunsplit(
+                    (
+                        parts.scheme.casefold(),
+                        parts.netloc.casefold(),
+                        path,
+                        parts.query,
+                        "",
+                    )
+                )
         return json.dumps(
             {"tool": tool, "arguments": arguments},
             ensure_ascii=False,
             sort_keys=True,
             default=str,
         )
+
+    @staticmethod
+    def _discovery_search_query(prompt: str) -> str:
+        """Derive a bounded, language-agnostic query from the primary clause."""
+
+        normalized = " ".join(prompt.split()).strip()
+        if not normalized:
+            return "web research"
+        # Conditional fallback instructions normally follow the primary request
+        # as another sentence. A short salutation may precede it. Search engines
+        # need the first substantive clause, not either piece of conversational
+        # scaffolding. The preamble check uses punctuation, position and token
+        # shape rather than requiring the user's language to be known.
+        clauses = [
+            clause.strip()
+            for clause in re.split(r"(?<=[.!?])\s+|[\r\n]+", normalized)
+            if clause.strip()
+        ]
+        primary = clauses[0]
+        if len(clauses) > 1:
+            primary_words = re.findall(
+                r"[^\W_]+(?:[-'][^\W_]+)*",
+                primary,
+                re.UNICODE,
+            )
+            # A generic conversational lead-in may not address V by name at
+            # all (for example, "I have an important task for you"). When it
+            # contains no concrete product/protocol anchor, prefer the first
+            # following clause that does. This stays language-agnostic and
+            # avoids teaching the parser a list of translated lead-in phrases.
+            anchored_following = next(
+                (
+                    clause
+                    for clause in clauses[1:]
+                    if Agent._discovery_anchor_index(
+                        re.findall(
+                            r"[^\W_]+(?:[-'][^\W_]+)*",
+                            clause,
+                            re.UNICODE,
+                        )
+                    )
+                    is not None
+                ),
+                None,
+            )
+            if (
+                Agent._discovery_anchor_index(primary_words) is None
+                and anchored_following is not None
+            ):
+                primary = anchored_following
+            elif Agent._looks_like_discovery_preamble(primary, clauses[1]):
+                primary = clauses[1]
+        primary_words = re.findall(
+            r"[^\W_]+(?:[-'][^\W_]+)*",
+            primary,
+            re.UNICODE,
+        )
+        if len(primary_words) > 18:
+            anchor = Agent._discovery_anchor_index(primary_words)
+            if anchor is not None:
+                primary = " ".join(primary_words[max(0, anchor - 3) : anchor + 1])
+        primary = re.sub(
+            r"^(?:(?:v|boss|paladyn)\s*[,!:—-]\s*)+",
+            "",
+            primary,
+            flags=re.IGNORECASE,
+        ).strip(" .!?;:")
+        if not primary:
+            primary = normalized
+        if len(primary) > 220:
+            primary = primary[:220].rsplit(" ", 1)[0]
+        return primary
+
+    @staticmethod
+    def _public_fact_search_query(prompt: str) -> str:
+        """Derive a concise entity/location query without trusting the router.
+
+        Capitalized names and places are useful cross-language anchors. If the
+        request has none, retain the normal bounded discovery query.
+        """
+
+        words = re.findall(r"[^\W_]+(?:[-'][^\W_]+)*", prompt, re.UNICODE)
+        anchors = [
+            word
+            for index, word in enumerate(words)
+            if index > 0 and len(word) >= 3 and word[0].isupper()
+        ]
+        query = " ".join(dict.fromkeys(anchors)).strip()
+        return query or Agent._discovery_search_query(prompt)
+
+    @staticmethod
+    def _public_fact_recovery_request(
+        prompt: str,
+        contract: TaskContract,
+        successful_calls: list[dict[str, Any]],
+        tool_definitions: list[dict[str, Any]],
+        *,
+        preferred_query: str = "",
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Build a new grounded search when the model stops before public facts.
+
+        Completion fields belong to PALADYN's runtime contract, not to the local
+        model's judgment. If the model tries to finish without a requested
+        address, contact, opening time, or location count, the runtime schedules
+        a different focused DuckDuckGo query instead of accepting the empty
+        answer. Query variants are bounded and never repeat within one task.
+        """
+
+        available = {
+            str(item.get("function", {}).get("name", ""))
+            for item in tool_definitions
+            if isinstance(item, dict)
+            and isinstance(item.get("function"), dict)
+        }
+        if "web_search" not in available:
+            return None
+
+        missing = {
+            item.removeprefix("public_fact:")
+            for item in contract.unmet(successful_calls)
+            if item.startswith("public_fact:")
+        }
+        if not missing:
+            return None
+
+        previous_queries = {
+            " ".join(str(call.get("arguments", {}).get("query", "")).split())
+            .strip()
+            .casefold()
+            for call in successful_calls
+            if call.get("tool") == "web_search"
+            and isinstance(call.get("arguments"), dict)
+        }
+        previous_queries.discard("")
+
+        base = " ".join(preferred_query.split()).strip()
+        if not base:
+            base = Agent._discovery_search_query(prompt)
+        if not base:
+            return None
+
+        field_terms: list[str] = []
+        for field, terms in (
+            ("count", ("locations",)),
+            ("address", ("address",)),
+            ("contact", ("phone", "contact")),
+            ("opening_hours", ("opening", "hours")),
+        ):
+            if field in missing:
+                field_terms.extend(terms)
+        suffix = " ".join(dict.fromkeys(field_terms))
+
+        # Proper-name pairs survive across languages and give search engines a
+        # useful exact anchor without maintaining a dictionary of user phrases.
+        entity_matches = re.findall(
+            r"\b[A-ZÀ-ÖØ-ÞĄĆĘŁŃÓŚŹŻ][^\W_]{2,}"
+            r"(?:[ -]+[A-ZÀ-ÖØ-ÞĄĆĘŁŃÓŚŹŻ][^\W_]{2,}){1,3}\b",
+            prompt,
+            re.UNICODE,
+        )
+        entity = (
+            contract.required_public_subject
+            or (entity_matches[-1].strip() if entity_matches else "")
+        )
+        anchored = base
+        if entity and entity.casefold() in base.casefold():
+            anchored = re.sub(
+                re.escape(entity),
+                f'"{entity}"',
+                base,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+
+        candidates = [
+            f"{base} {suffix}",
+            f"{anchored} {suffix} official",
+            f"{anchored} {suffix} business directory",
+            f"{anchored} {suffix} map listing",
+        ]
+        for candidate in candidates:
+            normalized = " ".join(candidate.split()).strip()
+            if normalized and normalized.casefold() not in previous_queries:
+                return "web_search", {"query": normalized, "max_results": 10}
+        return None
+
+    @staticmethod
+    def _discovery_anchor_index(words: list[str]) -> int | None:
+        """Locate a grounded product/protocol-like token without knowing language."""
+
+        frequencies: dict[str, int] = {}
+        for word in words:
+            folded = word.casefold()
+            if len(folded) >= 7:
+                frequencies[folded] = frequencies.get(folded, 0) + 1
+        for index, word in enumerate(words):
+            folded = word.casefold()
+            if folded in {"paladyn"} or index == 0:
+                continue
+            if any(character.isdigit() for character in word):
+                return index
+            if any(character.isupper() for character in word[1:]):
+                return index
+            if len(word) >= 8 and word[0].isupper():
+                return index
+            if len(folded) >= 7 and frequencies.get(folded, 0) >= 2:
+                return index
+        return None
+
+    @staticmethod
+    def _looks_like_discovery_preamble(
+        clause: str,
+        following_clause: str,
+    ) -> bool:
+        """Recognize a short persona-directed preamble before a real request."""
+
+        words = re.findall(r"[^\W_]+(?:[-'][^\W_]+)*", clause, re.UNICODE)
+        if not words or len(words) > 14:
+            return False
+        if re.search(r"https?://|www\.|[\"“”'«»]", clause, re.IGNORECASE):
+            return False
+
+        # A product name, protocol, version, filename-like token, or other
+        # concrete anchor means this is already useful search material.
+        for index, word in enumerate(words):
+            if any(character.isdigit() for character in word):
+                return False
+            if any(character.isupper() for character in word[1:]):
+                return False
+            if (
+                index > 0
+                and len(word) >= 8
+                and word[0].isupper()
+                and word.casefold() not in {"paladyn"}
+            ):
+                return False
+
+        addressed = re.match(
+            r"^\s*(?:(?:[^\s,!:—-]+)\s+){0,2}(?:v|boss|paladyn)\s*[,!:—-]",
+            clause,
+            re.IGNORECASE,
+        )
+        if addressed is None:
+            return False
+
+        following_words = re.findall(
+            r"[^\W_]+(?:[-'][^\W_]+)*",
+            following_clause,
+            re.UNICODE,
+        )
+        return len(following_words) >= 2
+
+    @staticmethod
+    def _repair_web_discovery_navigation(
+        prompt: str,
+        tool_name: str,
+        arguments: Any,
+        contract: TaskContract,
+        successful_calls: list[dict[str, Any]],
+        failed_calls: list[dict[str, Any]],
+        preferred_query: str = "",
+        preferred_target: str = "",
+    ) -> Any:
+        """Force discovery through verified search results before candidate URLs."""
+
+        if tool_name != "browser_navigate" or not isinstance(arguments, dict):
+            return arguments
+
+        failed_navigation = any(
+            call.get("tool") == "browser_navigate"
+            and call.get("status") == "failed"
+            for call in failed_calls
+        )
+        raw_url = str(arguments.get("url", "")).strip()
+        try:
+            parsed_url = urlsplit(raw_url)
+            hostname = (parsed_url.hostname or "").casefold()
+            query = parsed_url.query.casefold()
+            requested_search_query = str(
+                parse_qs(parsed_url.query).get("q", [""])[0]
+            ).strip()
+        except ValueError:
+            hostname = ""
+            query = ""
+            requested_search_query = ""
+        google_host = hostname in {
+            "google.com",
+            "www.google.com",
+        }
+        must_use_search = contract.requires_web_discovery or failed_navigation
+        focused_query = " ".join(preferred_query.split()).strip()
+        if len(focused_query) > 220:
+            focused_query = focused_query[:220].rsplit(" ", 1)[0]
+        if google_host and must_use_search:
+            repaired = dict(arguments)
+            repaired["url"] = (
+                "https://duckduckgo.com/?q="
+                + quote_plus(
+                    focused_query
+                    or requested_search_query
+                    or Agent._discovery_search_query(prompt)
+                )
+            )
+            return repaired
+
+        known_search = (
+            hostname in {"duckduckgo.com", "html.duckduckgo.com"}
+            and "q=" in query
+        )
+
+        direct_target = extract_web_target(preferred_target)
+        if (
+            not must_use_search
+            and direct_target
+            and not any(
+                call.get("tool") == "browser_navigate"
+                for call in [*successful_calls, *failed_calls]
+            )
+        ):
+            repaired = dict(arguments)
+            repaired["url"] = direct_target
+            return repaired
+
+        if any(
+            call.get("tool") in {"browser_navigate", "web_search"}
+            and call.get("status") == "succeeded"
+            for call in successful_calls
+        ):
+            if contract.requires_web_discovery and not known_search:
+                observed = Agent._observed_detail_urls(successful_calls)
+                exact = Agent._normalized_web_url(raw_url)
+                if exact and exact not in {
+                    Agent._normalized_web_url(candidate) for candidate in observed
+                }:
+                    closest = Agent._closest_observed_detail_url(raw_url, observed)
+                    if closest:
+                        repaired = dict(arguments)
+                        repaired["url"] = closest
+                        return repaired
+                    # A discovery model may invent a plausible-looking domain
+                    # after seeing a results page. Never spend tool calls on a
+                    # URL that is absent from verified search evidence. Return
+                    # to the grounded query and let the next snapshot expose
+                    # real candidate URLs instead.
+                    repaired = dict(arguments)
+                    repaired["url"] = (
+                        "https://duckduckgo.com/?q="
+                        + quote_plus(
+                            focused_query
+                            or Agent._discovery_search_query(prompt)
+                        )
+                    )
+                    return repaired
+            return arguments
+        if not must_use_search:
+            return arguments
+
+        if known_search:
+            if focused_query and requested_search_query != focused_query:
+                repaired = dict(arguments)
+                repaired["url"] = (
+                    "https://duckduckgo.com/?q=" + quote_plus(focused_query)
+                )
+                return repaired
+            return arguments
+
+        repaired = dict(arguments)
+        repaired["url"] = (
+            "https://duckduckgo.com/?q="
+            + quote_plus(focused_query or Agent._discovery_search_query(prompt))
+        )
+        return repaired
+
+    @staticmethod
+    def _direct_navigation_failure(
+        preferred_target: str,
+        contract: TaskContract,
+        failed_calls: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Return the first failed attempt at Boss's exact direct URL.
+
+        A failed owner-supplied address is evidence in its own right. Searching
+        for similarly spelled pages after that failure changes the task and was
+        the source of the Wikipedia/``dwukropek`` loop.
+        """
+
+        if contract.requires_web_discovery or not preferred_target:
+            return None
+        target = Agent._normalized_web_url(preferred_target)
+        if not target:
+            return None
+        return next(
+            (
+                call
+                for call in failed_calls
+                if call.get("tool") == "browser_navigate"
+                and Agent._normalized_web_url(
+                    str(
+                        call.get("arguments", {}).get("url", "")
+                        if isinstance(call.get("arguments"), dict)
+                        else ""
+                    )
+                )
+                == target
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _direct_navigation_failure_answer(target: str, error: str) -> str:
+        """Render one bounded, truthful report for a failed direct URL."""
+
+        failure_detail = re.sub(
+            r"\x1b\[[0-9;]*[A-Za-z]",
+            "",
+            " ".join(str(error or "navigation failed").split()),
+        )[:500]
+        return (
+            f"That address didn't open, Boss. I tried `{target}` exactly once; "
+            f"navigation failed: `{failure_detail}`. No page loaded, so there "
+            "was nothing honest to report. I didn't swap in search-result "
+            "bullshit or a different site. Nothing is running in the background."
+        )
+
+    @staticmethod
+    def _normalized_web_url(url: str) -> str:
+        try:
+            parsed = urlsplit(url.strip())
+        except ValueError:
+            return ""
+        if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+            return ""
+        return urlunsplit(
+            (
+                parsed.scheme.casefold(),
+                parsed.netloc.casefold(),
+                parsed.path.rstrip("/") or "/",
+                parsed.query,
+                "",
+            )
+        )
+
+    @staticmethod
+    def _observed_detail_urls(successful_calls: list[dict[str, Any]]) -> list[str]:
+        """Extract exact external URLs exposed by successful browser snapshots."""
+
+        found: list[str] = []
+        for call in successful_calls:
+            if call.get("tool") not in {"browser_snapshot", "web_search"}:
+                continue
+            text = str(call.get("result_excerpt", ""))
+            for match in re.finditer(r"https?://[^\s<>\"']+", text, re.IGNORECASE):
+                candidate = match.group(0).rstrip("`),.;:]}\\")
+                normalized = Agent._normalized_web_url(candidate)
+                if not normalized:
+                    continue
+                hostname = (urlsplit(normalized).hostname or "").casefold()
+                if hostname.endswith("duckduckgo.com"):
+                    continue
+                if normalized not in {
+                    Agent._normalized_web_url(existing) for existing in found
+                }:
+                    found.append(candidate)
+        return found
+
+    @staticmethod
+    def _closest_observed_detail_url(
+        requested_url: str,
+        observed_urls: list[str],
+    ) -> str:
+        """Repair a model-copied URL only from a close same-host observed URL."""
+
+        requested_fingerprint = Agent._url_copy_fingerprint(requested_url)
+        fingerprint_matches = {
+            candidate
+            for candidate in observed_urls
+            if requested_fingerprint
+            and Agent._url_copy_fingerprint(candidate) == requested_fingerprint
+        }
+        if len(fingerprint_matches) == 1:
+            return next(iter(fingerprint_matches))
+
+        requested = Agent._normalized_web_url(requested_url)
+        if not requested:
+            return ""
+        requested_parts = urlsplit(requested)
+        ranked: list[tuple[float, str]] = []
+        for candidate in observed_urls:
+            normalized = Agent._normalized_web_url(candidate)
+            if not normalized:
+                continue
+            parts = urlsplit(normalized)
+            if parts.hostname != requested_parts.hostname:
+                continue
+            similarity = SequenceMatcher(
+                None,
+                requested_parts.path.casefold(),
+                parts.path.casefold(),
+            ).ratio()
+            if similarity >= 0.72:
+                ranked.append((similarity, candidate))
+        if not ranked:
+            return ""
+        ranked.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+        return ranked[0][1]
+
+    @staticmethod
+    def _url_copy_fingerprint(url: str) -> str:
+        """Collapse separators to repair only copied, already observed URLs."""
+
+        try:
+            parsed = urlsplit(str(url).strip())
+        except ValueError:
+            return ""
+        if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+            return ""
+        evidence = unquote(
+            f"{parsed.netloc}{parsed.path}?{parsed.query}"
+        ).casefold()
+        return "".join(character for character in evidence if character.isalnum())
 
     @staticmethod
     def _owner_control_command(prompt: str) -> str | None:
@@ -2011,13 +3759,127 @@ The visible answer MUST be written in English.
             return answer
         return await self._enforce_english(messages, answer)
 
-    def _agent_mode_prompt(self) -> str:
+    def _agent_mode_prompt(
+        self,
+        definitions: list[dict[str, Any]] | None = None,
+    ) -> str:
+        available: list[dict[str, Any]] = []
+        for item in definitions or []:
+            function = item.get("function", {}) if isinstance(item, dict) else {}
+            name = str(function.get("name", "")).strip()
+            if not name:
+                continue
+            available.append(
+                {
+                    "name": name,
+                    "description": str(function.get("description", ""))[:1_000],
+                    "parameters": function.get(
+                        "parameters",
+                        {"type": "object", "properties": {}},
+                    ),
+                }
+            )
 
-        local_tools = ", ".join(self.tools.local_tool_names())
-        return """
+        catalog = json.dumps(
+            available,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        availability_rule = (
+            "Only the tools in CURRENT_EXECUTABLE_TOOLS are callable in this "
+            "interaction. Every other remembered, described, or previously used "
+            "tool is unavailable."
+            if available
+            else
+            "CURRENT_EXECUTABLE_TOOLS is empty. No tool is callable in this "
+            "interaction. Do not emit native tool calls or compatibility JSON."
+        )
+        snapshot_builder_available = any(
+            item["name"] == "learning_create_snapshot_extractor"
+            for item in available
+        )
+        owner_privileged_builder = any(
+            item["name"] == "learning_create_tool"
+            and "OWNER LAB" in item["description"]
+            for item in available
+        )
+        lifecycle_builders = [
+            item["name"]
+            for item in available
+            if item["name"] in {
+                "learning_create_tool",
+                "learning_create_snapshot_extractor",
+            }
+        ]
+        creation_phase_rule = (
+            "CREATION PHASE INVARIANT: the requested final tool does not exist "
+            "yet. Never call its requested name during this phase. Your next "
+            f"executable action must be `{lifecycle_builders[0]}`. Only a "
+            "successful active-artifact result makes the new tool callable."
+            if lifecycle_builders
+            else ""
+        )
+        if snapshot_builder_available:
+            learning_rule = (
+                "learning_create_snapshot_extractor is available because the task "
+                "requires a product-card extractor from observed accessibility text. "
+                "Call it with only the requested generated tool name. PALADYN binds "
+                "the latest real browser snapshot, writes the standalone Python, "
+                "derives an exact three-record regression test, quarantines it, runs "
+                "the test offline, and activates it. Do not provide source, fixtures, "
+                "schemas, descriptions, or copied page data."
+            )
+        else:
+            learning_rule = (
+                "If no existing tool can perform a required bounded offline step, "
+                "learning_create_tool may be used only because it appears in the "
+                "current executable catalog. Generated tools must include deterministic "
+                "tests and cannot browse or invent external facts. For "
+                "learning_create_tool, provide only name, description, Python source, "
+                "and one concrete test (plus optional version, scope, or timeout). "
+                + (
+                    "OWNER LAB is active: use any Python imports, file operations, "
+                    "subprocesses, or dynamic-code facilities the task genuinely "
+                    "requires; PALADYN will contain and test them in the sandbox. "
+                    if owner_privileged_builder
+                    else "The client restricted-source policy is active. "
+                )
+                +
+                "PALADYN derives input_schema and output_schema itself; never emit a "
+                "manifest or any JSON Schema. Source must define def run(arguments) and "
+                "return one JSON object exactly equal to test.expected. Never emit "
+                "JavaScript. The test must use a small literal excerpt of real "
+                "observed input. Never use placeholders such as [Snapshot], "
+                "ellipses, truncated URLs, or invented example values. Reuse input key "
+                "spelling exactly between test.arguments and source. One exact minimal "
+                "test is enough. If the owner supplied explicit JSON assignments for "
+                "the tool inputs, set test.arguments to an empty object and reference "
+                "those exact input names in source; PALADYN injects the immutable first "
+                "fixture itself. If the owner supplied expected = {...}, PALADYN also "
+                "injects that exact first object into test.expected. Otherwise, for "
+                "multiline records copy the complete first observed record block with "
+                "only the lines the parser needs, and use its "
+                "exact observed values. Parse across the complete record block, not each "
+                "line in isolation. Keep source short, avoid type hints, and do not add "
+                "fields or punctuation to extracted values. When the requested input is "
+                "snapshot text, test.arguments must contain that observed block as one "
+                "string; do not translate accessibility text into invented JSON objects "
+                "or arrays."
+                if any(item["name"] == "learning_create_tool" for item in available)
+                else
+                "Tool creation is unavailable in this interaction. Never request a "
+                "learning_* tool unless that exact name appears in the current catalog."
+            )
+        return f"""
 You are operating as an autonomous agent.
 
 You may solve the user's request through multiple steps.
+
+CURRENT_EXECUTABLE_TOOLS={catalog}
+
+{availability_rule}
+
+{creation_phase_rule}
 
 When the runtime supplies callable tool definitions, invoke those tools through
 the provider's tool-calling interface. Do not print or narrate a tool call.
@@ -2025,66 +3887,22 @@ the provider's tool-calling interface. Do not print or narrate a tool call.
 Compatibility fallback for an older model/template that exposes no callable
 interface: return exactly one JSON object:
 
-{"tool": "<tool_name>", "arguments": {}}
-
-Examples:
-
-{"tool": "list_directory", "arguments": {"path": "."}}
-{"tool": "read_file", "arguments": {"path": "README.md"}}
-{"tool": "search_files", "arguments": {"path": ".", "pattern": "agent.py"}}
-{"tool": "browser_navigate", "arguments": {"url": "https://example.com"}}
-
-PALADYN local tools enabled for this profile:
-LOCAL_TOOL_NAMES
-
-Local tool argument shapes:
-- evm_analyze_erc20_abi: {"abi": [<ABI entries>]}
-- evm_validate_oracle: round_id, answer, started_at, updated_at,
-  answered_in_round, decimals, max_age_seconds, now, and optional sequencer.
-- evm_analyze_solidity_security: {"source": "<Solidity source>"}
-- sandbox_execute_offline: {"command": ["/absolute/executable", "arg"],
-  "workspace": "relative/task/path", "timeout_seconds": 120}
-- evm_decode_uniswap_v4_hook: {"address": "0x..."}
-- evm_quote_flash_swap: protocol is v2_same_token, v2_cross_token, or v3.
-- evm_foundry_test_offline: {"project": "relative/project", "fuzz_runs": 256,
-  "invariant_runs": 64, "timeout_seconds": 300}
-- learning_record_evidence: source (user_correction, tool_result, test_result,
-  task_runtime, or self_review), outcome, summary, expected, actual, confidence,
-  and optional metadata. The runtime binds the real interaction ID; model calls
-  cannot mark evidence as verified.
-- learning_propose_lesson: title, hypothesis, trigger, action, evidence_ids.
-- learning_create_tool (complete quarantine/test/activation cycle):
-  {"manifest":{"name":"count_words","version":"1.0.0",
-  "description":"Count words in supplied text.","input_schema":{"type":"object","properties":{},
-  "required":[],"additionalProperties":false},"output_schema":{"type":"object",
-  "properties":{},"required":[],"additionalProperties":false},
-  "tests":[{"name":"...","arguments":{},"expected":{}}],"scope":"task",
-  "lesson_ids":[],"timeout_seconds":10},"source":"def run(arguments):\n    return {}"}
-- learning_create_skill (complete quarantine/test/activation cycle):
-  {"manifest":{"name":"snake_case_name","version":"1.0.0",
-  "description":"...","triggers":["phrase"],"steps":["..."],
-  "required_tools":[],"tests":[{"user_input":"matching phrase",
-  "should_match":true},{"user_input":"unrelated request","should_match":false}],
-  "scope":"task","lesson_ids":[]}}
-- learning_stage_tool / learning_stage_skill use the same formats but stop in quarantine.
-- learning_validate_artifact / learning_activate_artifact: {"artifact_id": "..."}
-- learning_retire_artifact: {"artifact_id": "...", "reason": "..."}
+{{"tool": "<tool_name>", "arguments": {{"<required_field>": "<schema_value>"}}}}
 
 Rules:
 
 - Use tools only when they are genuinely useful.
-- Never claim learning from a task without recording the supporting evidence.
-- Generated tools and skills must pass staging and validation before activation.
-- Prefer learning_create_tool or learning_create_skill when the complete artifact
-  can be specified and tested in one action. Never bypass their internal lifecycle.
-- First inspect the available tool definitions. If no existing tool can perform a
-  required step, use learning_create_tool only when a bounded implementation and
-  deterministic tests can be supplied. Its result is not success unless the
-  lifecycle record says the artifact passed validation and became active.
-- Generated tools execute offline. They may transform supplied data, calculate,
-  parse, classify, or validate it, but they cannot browse, fetch external facts,
-  or turn invented facts into evidence. For repeatable multi-tool web workflows,
-  create a skill that orchestrates the existing browser tools instead.
+- Invoke exactly one tool per response; inspect its result before choosing the next.
+- Never invent or recall a tool name outside CURRENT_EXECUTABLE_TOOLS.
+- Follow the parameter schema in CURRENT_EXECUTABLE_TOOLS exactly.
+- Never copy the compatibility placeholders. If the selected schema declares
+  required fields, `arguments` must contain every one of them and must not be empty.
+- Exception for grounded structured data: when the owner prompt contains explicit
+  JSON assignments matching the selected tool's input names, do not retype those
+  potentially long values. An empty arguments object is valid in that case;
+  PALADYN binds the last occurrence of each matching input assignment. You still
+  provide every other required field required by the selected schema.
+- {learning_rule}
 - A failed tool result is evidence of failure, not evidence that the objective was
   completed. Preserve the exact error and either take a real recovery step or stop
   truthfully.
@@ -2103,13 +3921,24 @@ Rules:
   login, remote connection, exploit, or compromise. Browser activity does not
   constitute evidence for any of those actions.
 - Use filesystem tools only for local files.
-- Use browser tools for websites and web pages.
+- For public-web discovery, call `web_search` with a focused query, then copy an
+  exact returned URL into `web_read`. These tools own search navigation and page
+  capture; do not manually improvise a search-engine workflow when they are available.
+- When Boss requests business count, addresses, hours, or contact details, a
+  namesake product page is not evidence for a business location. Keep searching
+  until the exact requested entity and every requested field are present in
+  observed source content, or report that reliable evidence could not be found.
+- Use low-level browser tools for interactive websites and page controls.
+- `browser_find` searches only the already-open page; it is not a web search.
+- For discovery, use a real search-results URL or open a search page, snapshot it,
+  and enter the query with `browser_type`. After DNS failure or HTTP 4xx/5xx, do
+  not guess nearby domains or retry an already failed URL.
 - After receiving a tool result, continue reasoning.
 - You may use multiple tools when necessary.
 - When no more tools are needed, respond normally to the user.
 - Do not explain that you are an agent.
 - Do not expose internal routing instructions.
-""".replace("LOCAL_TOOL_NAMES", local_tools).strip()
+""".strip()
 
     @staticmethod
     def _select_tool_definitions(
@@ -2150,13 +3979,26 @@ Rules:
         ):
             selected.update(
                 {
+                    "web_search",
+                    "web_read",
                     "browser_navigate",
                     "browser_snapshot",
-                    "browser_click",
                     "browser_find",
-                    "browser_press_key",
                 }
             )
+            if not contract.requires_web_discovery:
+                # A discovered search result already exposes an exact URL in the
+                # snapshot. During that stage direct navigation is both more
+                # reliable and easier for a small local model than manufacturing
+                # element identifiers for click/type/key tools. Interactive page
+                # controls remain available when Boss supplied a concrete URL.
+                selected.update(
+                    {
+                        "browser_click",
+                        "browser_press_key",
+                        "browser_type",
+                    }
+                )
             matched = True
         if (
             contract.requires_file_read
@@ -2184,6 +4026,9 @@ Rules:
         if contract.requires_command_execution or "command" in hints:
             selected.add("sandbox_execute_offline")
             matched = True
+        if contract.requires_runtime_review or "runtime_review" in hints:
+            selected.add("runtime_review_task")
+            matched = True
         explicit_tool_creation = (
             contract.requires_created_tool or "learning_tool" in hints
         )
@@ -2193,30 +4038,68 @@ Rules:
         if explicit_tool_creation or explicit_skill_creation:
             selected.add("learning_list_artifacts")
             if explicit_tool_creation:
-                selected.add("learning_create_tool")
+                snapshot_extractor = (
+                    contract.requires_browser_snapshot
+                    and bool(
+                        re.search(
+                            r"\b(?:extract\w*|pars\w*|scrap\w*|snapshot\w*|"
+                            r"wyodr[ęe]bn\w*)\b",
+                            text,
+                        )
+                    )
+                )
+                selected.add(
+                    "learning_create_snapshot_extractor"
+                    if snapshot_extractor
+                    else "learning_create_tool"
+                )
             if explicit_skill_creation:
                 selected.add("learning_create_skill")
             matched = True
-        elif not explicitly_named and re.search(
-            r"\b(?:artifacts?|learning|lessons?|skills?|tools?|"
-            r"artefakt\w*|lekcj\w*|narzędzi\w*|narzedzi\w*)\b",
-            text,
-        ):
+        elif contract.allows_artifact_fallback:
             selected.update(
                 {
-                    "learning_activate_artifact",
-                    "learning_create_skill",
-                    "learning_create_tool",
                     "learning_list_artifacts",
-                    "learning_propose_lesson",
-                    "learning_record_evidence",
-                    "learning_retire_artifact",
-                    "learning_stage_skill",
-                    "learning_stage_tool",
-                    "learning_validate_artifact",
+                    "learning_create_tool",
+                    "learning_create_skill",
                 }
             )
             matched = True
+        elif not explicitly_named:
+            # Merely discussing, researching, or listing ordinary tools must not
+            # expose PALADYN's entire learning lifecycle. That overloaded small
+            # models and caused unrelated browser tasks to emit empty learning
+            # calls. Natural lifecycle requests get only the exact operation they
+            # describe; explicit creation is handled by the contract above.
+            lifecycle_routes = (
+                (
+                    "learning_list_artifacts",
+                    r"\b(?:list|show|display|inspect|pokaż\w*|pokaz\w*|wymień\w*|"
+                    r"wymien\w*|wylistuj\w*)\b.{0,80}"
+                    r"\b(?:learned|generated|created|aktywn\w*|wygenerowan\w*)\b"
+                    r".{0,40}\b(?:artifacts?|tools?|skills?|artefakt\w*|"
+                    r"narzędzi\w*|narzedzi\w*|umiejętno\w*|umiejetno\w*)\b",
+                ),
+                (
+                    "learning_validate_artifact",
+                    r"\b(?:validate|verify|zweryfikuj\w*|waliduj\w*)\b.{0,60}"
+                    r"\b(?:artifact|artefakt)\w*\b",
+                ),
+                (
+                    "learning_activate_artifact",
+                    r"\b(?:activate|enable|aktywuj\w*|włącz\w*|wlacz\w*)\b.{0,60}"
+                    r"\b(?:artifact|artefakt)\w*\b",
+                ),
+                (
+                    "learning_retire_artifact",
+                    r"\b(?:retire|disable|deactivate|wycofaj\w*|dezaktywuj\w*)\b"
+                    r".{0,60}\b(?:artifact|artefakt)\w*\b",
+                ),
+            )
+            for lifecycle_tool, pattern in lifecycle_routes:
+                if re.search(pattern, text):
+                    selected.update({"learning_list_artifacts", lifecycle_tool})
+                    matched = True
         if "evm" in hints or re.search(
             r"\b(?:abi|erc-?20|evm|flash\s*swap|foundry|oracle|solidity|uniswap)\b",
             text,
@@ -2248,6 +4131,347 @@ Rules:
             for item in definitions
             if item.get("function", {}).get("name") in selected
         ]
+
+    @staticmethod
+    def _source_owned_tool_phase(
+        contract: TaskContract,
+        definitions: list[dict[str, Any]],
+        successful_calls: list[dict[str, Any]],
+    ) -> bool:
+        """Use raw-code generation only with PALADYN's source-only builder schema.
+
+        Legacy integrations that still expose the expert manifest/test schema keep
+        their old native function-call path. The current runtime advertises only
+        ``source`` as required, which lets the agent own every other lifecycle field.
+        """
+
+        if "learning_create_tool" not in set(contract.unmet(successful_calls)):
+            return False
+        for item in definitions:
+            function = item.get("function", {}) if isinstance(item, dict) else {}
+            if function.get("name") != "learning_create_tool":
+                continue
+            parameters = function.get("parameters", {})
+            required = parameters.get("required", []) if isinstance(parameters, dict) else []
+            return required == ["source"]
+        return False
+
+    @classmethod
+    def _generated_source_phase_prompt(cls, prompt: str) -> str:
+        assignments = cls._structured_literal_assignments(prompt)
+        fields = [
+            name
+            for name in assignments
+            if name not in {"expected", "test_expected", "version", "timeout_seconds"}
+        ]
+        bindings = "\n".join(
+            f"    {name} = arguments[{name!r}]" for name in fields
+        )
+        skeleton = (
+            "\nThe required entrypoint begins exactly like this:\n"
+            "def run(arguments):\n"
+            + (bindings or "    pass")
+            + "\nReplace `pass` when present and return the result object."
+        )
+        return """
+PALADYN is in generated-tool SOURCE PHASE.
+
+The runtime—not the language model—owns the tool name, description, manifest,
+fixture, schemas, tests, quarantine, validation, activation, and evidence report.
+No callable tools are exposed to the model in this phase.
+
+Return ONLY Python source code. Do not return JSON, a function-call envelope,
+Markdown commentary, a manifest, schemas, tests, or an explanation. The source
+must define a synchronous `def run(arguments)` and return one JSON object. Read
+task inputs from `arguments` using the exact field names present in Boss's
+objective. Keep the implementation deterministic. Do not fabricate external
+facts; operate only on supplied arguments. PALADYN will bind exact immutable
+fixtures, run the source offline twice when no owner oracle exists, derive strict
+schemas, validate it in quarantine, and activate it only after the checks pass.
+""".strip() + skeleton
+
+    @staticmethod
+    def _parse_generated_tool_source(answer: str) -> str:
+        """Accept a raw or single fenced Python module with a valid run entrypoint."""
+
+        text = answer.strip()
+        fenced = list(
+            re.finditer(
+                r"```(?:python|py)?\s*\n(?P<source>.*?)\n```",
+                text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        )
+        if len(fenced) == 1:
+            text = fenced[0].group("source").strip()
+        elif fenced:
+            return ""
+        if text.startswith("{"):
+            recovered: dict[str, Any] | None = None
+            for suffix in ("", "}", "}}"):
+                try:
+                    candidate = json.loads(text + suffix)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(candidate, dict):
+                    recovered = candidate
+                    break
+            arguments = (
+                recovered.get("arguments", {})
+                if isinstance(recovered, dict)
+                else {}
+            )
+            if (
+                isinstance(recovered, dict)
+                and recovered.get("tool") == "learning_create_tool"
+                and isinstance(arguments, dict)
+                and isinstance(arguments.get("source"), str)
+            ):
+                text = arguments["source"].strip()
+            else:
+                return ""
+        if not text or text.startswith(("[", "<tool")):
+            return ""
+        try:
+            tree = ast.parse(text, mode="exec")
+        except SyntaxError:
+            return ""
+        run = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == "run"
+            ),
+            None,
+        )
+        if run is None or len(run.args.args) != 1 or run.args.vararg is not None:
+            return ""
+        return text
+
+    @classmethod
+    def _runtime_generated_tool_execution_request(
+        cls,
+        prompt: str,
+        contract: TaskContract,
+        definitions: list[dict[str, Any]],
+        successful_calls: list[dict[str, Any]],
+        *,
+        observed_snapshot: str = "",
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Bind the post-activation execution without asking the model again."""
+
+        missing = set(contract.unmet(successful_calls))
+        if "generated_tool_execution" not in missing:
+            return None
+        created = cls._created_tool_names(successful_calls)
+        if not created:
+            return None
+        definition = next(
+            (
+                item
+                for item in definitions
+                if isinstance(item, dict)
+                and item.get("function", {}).get("name") in created
+            ),
+            None,
+        )
+        if definition is None:
+            return None
+        function = definition.get("function", {})
+        name = str(function.get("name", ""))
+        schema = function.get("parameters", {})
+        if not name or not isinstance(schema, dict):
+            return None
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            return None
+        assignments = cls._structured_literal_assignments(prompt)
+        arguments: dict[str, Any] = {}
+        for field in properties:
+            values = assignments.get(str(field))
+            if values:
+                arguments[str(field)] = deepcopy(values[-1])
+            elif field == "snapshot_text" and observed_snapshot:
+                arguments[str(field)] = observed_snapshot
+        if any(str(field) not in arguments for field in required):
+            return None
+        return name, arguments
+
+    @staticmethod
+    def _phase_tool_definitions(
+        contract: TaskContract,
+        definitions: list[dict[str, Any]],
+        successful_calls: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Expose only the tools needed by the current contract phase.
+
+        A mixed browser-plus-learning task initially needs both families, but
+        keeping every browser schema after observation bloats a small model's
+        prompt and invites it to repeat snapshots. Once browser evidence is
+        complete, isolate artifact creation; after activation, isolate the new
+        generated tool so it is executed before finalization.
+        """
+
+        missing = set(contract.unmet(successful_calls))
+        browser_missing = any(item.startswith("browser_") for item in missing)
+        if "learning_create_tool" in missing and not browser_missing:
+            allowed = {
+                "learning_create_tool",
+                "learning_create_snapshot_extractor",
+            }
+            return [
+                item
+                for item in definitions
+                if item.get("function", {}).get("name") in allowed
+            ]
+
+        if (
+            "generated_tool_execution" in missing
+            and "learning_create_tool" not in missing
+        ):
+            created_name = ""
+            for call in reversed(successful_calls):
+                if call.get("tool") not in {
+                    "learning_create_tool",
+                    "learning_create_snapshot_extractor",
+                }:
+                    continue
+                try:
+                    payload = json.loads(str(call.get("result_excerpt", "")))
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, dict) and payload.get("name"):
+                    created_name = str(payload["name"])
+                    break
+            if created_name:
+                generated = [
+                    item
+                    for item in definitions
+                    if item.get("function", {}).get("name") == created_name
+                ]
+                if generated:
+                    return generated
+
+        return definitions
+
+    @staticmethod
+    def _creation_lifecycle_builder(
+        requested_tool: str,
+        active_definitions: list[dict[str, Any]],
+        contract: TaskContract,
+        successful_calls: list[dict[str, Any]],
+    ) -> str:
+        """Return the builder required before an invented target can run.
+
+        This is deliberately domain-agnostic. It depends only on the current
+        contract phase and the exact executable catalog sent to the model, not
+        on a generated tool name, language, or task-specific keywords.
+        """
+
+        available = {
+            str(item.get("function", {}).get("name", ""))
+            for item in active_definitions
+            if isinstance(item, dict)
+        }
+        if not requested_tool or requested_tool in available:
+            return ""
+        if "learning_create_tool" not in set(contract.unmet(successful_calls)):
+            return ""
+        for builder in (
+            "learning_create_tool",
+            "learning_create_snapshot_extractor",
+        ):
+            if builder in available:
+                return builder
+        return ""
+
+    @staticmethod
+    def _phase_tool_choice(
+        contract: TaskContract,
+        active_definitions: list[dict[str, Any]],
+        successful_calls: list[dict[str, Any]],
+    ) -> str | dict[str, Any]:
+        """Force lifecycle routing when the executor knows the required phase.
+
+        The LLM still supplies the complete artifact payload, source, and test.
+        It does not get to replace the active builder's function name with the
+        name of a future tool merely because that target appears in the user
+        request. This keeps phase control in PALADYN rather than model prose.
+        """
+
+        available = {
+            str(item.get("function", {}).get("name", ""))
+            for item in active_definitions
+            if isinstance(item, dict)
+        }
+        missing = set(contract.unmet(successful_calls))
+        required = next(
+            (
+                name
+                for name in ("learning_create_tool", "learning_create_skill")
+                if name in missing and name in available
+            ),
+            "",
+        )
+        if not required:
+            return "auto"
+        return {
+            "type": "function",
+            "function": {"name": required},
+        }
+
+    @staticmethod
+    def _parse_active_lifecycle_payload(
+        answer: str,
+        active_definitions: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Recover a bare rich-builder payload without guessing its purpose.
+
+        Some tool-capable local models emit the arguments object itself instead
+        of the provider's outer function-call envelope. Recovery is allowed only
+        while a rich lifecycle builder is actually exposed, only when all keys
+        belong to that builder's schema, and only for a payload with enough
+        manifest structure to distinguish it from ``{"name": ...}`` targeting
+        a not-yet-created tool. Ordinary tool arguments are never reclassified.
+
+        Structural field errors are intentionally left for the normal schema
+        validator. That produces actionable feedback but cannot execute invalid
+        source or an incomplete test.
+        """
+
+        text = answer.strip()
+        if text.startswith("```json") and text.endswith("```"):
+            text = text[7:-3].strip()
+        elif text.startswith("```") and text.endswith("```"):
+            text = text[3:-3].strip()
+        try:
+            payload = json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict) or "name" not in payload:
+            return None
+
+        matches: list[str] = []
+        for item in active_definitions:
+            function = item.get("function", {}) if isinstance(item, dict) else {}
+            name = str(function.get("name", ""))
+            if name not in {"learning_create_tool", "learning_create_skill"}:
+                continue
+            schema = function.get("parameters", {})
+            properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+            if not isinstance(properties, dict):
+                continue
+            keys = set(payload)
+            if (
+                len(keys) >= 3
+                and keys.issubset(properties)
+                and len(keys & set(schema.get("required", []))) >= 2
+            ):
+                matches.append(name)
+        if len(matches) != 1:
+            return None
+        return matches[0], payload
 
     @staticmethod
     def _explicitly_named_tools(
@@ -2282,14 +4506,18 @@ Rules:
             if not name or len(name_words) < 2 or len(prompt_words) < len(name_words):
                 continue
             expected = " ".join(name_words)
-            score = max(
+            scores = [
                 SequenceMatcher(
                     None,
                     " ".join(prompt_words[index : index + len(name_words)]),
                     expected,
                 ).ratio()
                 for index in range(len(prompt_words) - len(name_words) + 1)
-            )
+                if Agent._has_spoken_tool_invocation_cue(prompt_words, index)
+            ]
+            if not scores:
+                continue
+            score = max(scores)
             if score >= 0.84:
                 candidates.append((score, name))
 
@@ -2299,6 +4527,39 @@ Rules:
         if len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.08:
             return []
         return [candidates[0][1]]
+
+    @staticmethod
+    def _has_spoken_tool_invocation_cue(words: list[str], index: int) -> bool:
+        """Require a nearby call cue before fuzzy-matching a spoken tool name.
+
+        Natural task descriptions can contain phrases such as ``browser
+        snapshot text`` without asking PALADYN to invoke the built-in
+        ``browser_snapshot`` function specifically. Voice transcription repair
+        therefore applies only after a local call phrase (``use tool``, ``użyj
+        narzędzia`` and close equivalents), while an exact underscored
+        identifier remains explicit without this heuristic.
+        """
+
+        prefix = words[max(0, index - 6) : index]
+        exact_cues = {
+            "call",
+            "execute",
+            "invoke",
+            "run",
+            "use",
+        }
+        cue_prefixes = (
+            "odpal",
+            "uruchom",
+            "uzy",
+            "uży",
+            "wywol",
+            "wywoł",
+        )
+        return any(
+            word in exact_cues or word.startswith(cue_prefixes)
+            for word in prefix
+        )
 
     @staticmethod
     def _tool_name_words(value: str) -> list[str]:
@@ -2351,6 +4612,288 @@ Rules:
         return {field: quoted[-1]}
 
     @staticmethod
+    def _agent_generation_budget(
+        definitions: list[dict[str, Any]],
+        *,
+        context_tokens: int,
+    ) -> int:
+        names = {
+            str(item.get("function", {}).get("name", ""))
+            for item in definitions
+            if isinstance(item, dict)
+        }
+        if "learning_create_snapshot_extractor" in names:
+            return 256
+        if "learning_create_tool" in names:
+            # A tool bundle contains a manifest, schemas, deterministic tests,
+            # and Python source. The ordinary 512-token answer budget truncates
+            # even small valid bundles and leaves llama.cpp with malformed JSON.
+            return min(3_072, max(1_536, context_tokens // 4))
+        if "learning_create_skill" in names:
+            return min(1_024, max(768, context_tokens // 10))
+        return 512
+
+    @staticmethod
+    def _structured_literal_assignments(prompt: str) -> dict[str, list[Any]]:
+        """Return exact JSON values assigned to identifiers in owner input.
+
+        Local models are poor copy machines for long URLs and nested fixtures.
+        The runtime can recover values such as ``records = [...]`` directly from
+        the immutable user prompt without knowing anything about the tool's
+        domain or the language used in the surrounding prose.
+        """
+
+        decoder = json.JSONDecoder()
+        assignments: dict[str, list[Any]] = {}
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+        )
+        for match in pattern.finditer(prompt):
+            remainder = prompt[match.end() :]
+            leading = len(remainder) - len(remainder.lstrip())
+            try:
+                value, _ = decoder.raw_decode(remainder[leading:])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            assignments.setdefault(match.group(1), []).append(value)
+        return assignments
+
+    @staticmethod
+    def _created_tool_names(
+        successful_calls: list[dict[str, Any]],
+    ) -> set[str]:
+        names: set[str] = set()
+        for call in successful_calls:
+            if call.get("tool") not in {
+                "learning_create_tool",
+                "learning_create_snapshot_extractor",
+            }:
+                continue
+            try:
+                payload = json.loads(str(call.get("result_excerpt", "")))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict) and payload.get("name"):
+                names.add(str(payload["name"]))
+        return names
+
+    @classmethod
+    def _repair_grounded_generated_tool_arguments(
+        cls,
+        prompt: str,
+        tool_name: str,
+        arguments: Any,
+        definitions: list[dict[str, Any]],
+        successful_calls: list[dict[str, Any]],
+    ) -> Any:
+        """Bind generated-tool inputs to exact structured owner literals.
+
+        The first occurrence of an input assignment is the creation fixture;
+        the last is the post-activation execution input. The mechanism is based
+        only on JSON assignment names and executable schemas/source accesses,
+        so it applies to arbitrary generated tools rather than named patches.
+        """
+
+        if not isinstance(arguments, dict):
+            return arguments
+        assignments = cls._structured_literal_assignments(prompt)
+        if not assignments:
+            return arguments
+
+        if tool_name == "learning_create_tool":
+            test = arguments.get("test")
+            source = arguments.get("source")
+            if not isinstance(test, dict) or not isinstance(source, str):
+                return arguments
+            current = test.get("arguments")
+            current_arguments = dict(current) if isinstance(current, dict) else {}
+            referenced = set(current_arguments)
+            referenced.update(
+                re.findall(
+                    r"arguments\s*(?:\.get\(\s*|\[\s*)['\"]"
+                    r"([A-Za-z_][A-Za-z0-9_]*)['\"]",
+                    source,
+                )
+            )
+            grounded = dict(current_arguments)
+            for field in referenced:
+                values = assignments.get(field)
+                if values:
+                    grounded[field] = deepcopy(values[0])
+            expected_values = assignments.get("expected")
+            grounded_expected = (
+                deepcopy(expected_values[0])
+                if expected_values and isinstance(expected_values[0], dict)
+                else test.get("expected")
+            )
+            if (
+                grounded == current_arguments
+                and grounded_expected == test.get("expected")
+            ):
+                return arguments
+            repaired = dict(arguments)
+            repaired_test = dict(test)
+            repaired_test["arguments"] = grounded
+            repaired_test["expected"] = grounded_expected
+            repaired["test"] = repaired_test
+            return repaired
+
+        if tool_name not in cls._created_tool_names(successful_calls):
+            return arguments
+        definition = next(
+            (
+                item
+                for item in definitions
+                if isinstance(item, dict)
+                and item.get("function", {}).get("name") == tool_name
+            ),
+            None,
+        )
+        parameters = (
+            definition.get("function", {}).get("parameters", {})
+            if isinstance(definition, dict)
+            else {}
+        )
+        properties = (
+            parameters.get("properties", {})
+            if isinstance(parameters, dict)
+            else {}
+        )
+        if not isinstance(properties, dict):
+            return arguments
+        repaired = dict(arguments)
+        for field in properties:
+            values = assignments.get(str(field))
+            if values:
+                repaired[str(field)] = deepcopy(values[-1])
+        return repaired
+
+    @staticmethod
+    def _repair_observed_snapshot_input(
+        tool_name: str,
+        arguments: Any,
+        definitions: list[dict[str, Any]],
+        successful_calls: list[dict[str, Any]],
+        observed_snapshot: str,
+    ) -> dict[str, Any]:
+        """Bind a generated extractor to runtime evidence, not model-retyped data."""
+
+        if not observed_snapshot or not isinstance(arguments, dict):
+            return arguments
+        created_names = Agent._created_tool_names(successful_calls)
+        if tool_name not in created_names:
+            return arguments
+        definition = next(
+            (
+                item
+                for item in definitions
+                if isinstance(item, dict)
+                and item.get("function", {}).get("name") == tool_name
+            ),
+            None,
+        )
+        parameters = (
+            definition.get("function", {}).get("parameters", {})
+            if isinstance(definition, dict)
+            else {}
+        )
+        properties = (
+            parameters.get("properties", {})
+            if isinstance(parameters, dict)
+            else {}
+        )
+        if "snapshot_text" not in properties:
+            return arguments
+        repaired = dict(arguments)
+        repaired["snapshot_text"] = observed_snapshot
+        return repaired
+
+    @staticmethod
+    def _tool_argument_problem(
+        tool_name: str,
+        arguments: Any,
+        definitions: list[dict[str, Any]],
+    ) -> str:
+        definition = next(
+            (
+                item
+                for item in definitions
+                if isinstance(item, dict)
+                and item.get("function", {}).get("name") == tool_name
+            ),
+            None,
+        )
+        if definition is None:
+            return ""
+        schema = definition.get("function", {}).get("parameters")
+        if not isinstance(schema, dict) or schema.get("type") != "object":
+            return ""
+        try:
+            Agent._validate_tool_argument_value(arguments, schema, path="$")
+        except ValueError as error:
+            return str(error)
+        return ""
+
+    @staticmethod
+    def _validate_tool_argument_value(
+        value: Any,
+        schema: dict[str, Any],
+        *,
+        path: str,
+    ) -> None:
+        kind = schema.get("type")
+        valid = {
+            "object": isinstance(value, dict),
+            "array": isinstance(value, list),
+            "string": isinstance(value, str),
+            "integer": isinstance(value, int) and not isinstance(value, bool),
+            "number": (
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+            ),
+            "boolean": isinstance(value, bool),
+        }.get(str(kind), True)
+        if not valid:
+            raise ValueError(f"{path} must be {kind}")
+        if "enum" in schema and value not in schema.get("enum", []):
+            raise ValueError(f"{path} is not an allowed value")
+        if kind == "object":
+            properties = schema.get("properties", {})
+            properties = properties if isinstance(properties, dict) else {}
+            required = schema.get("required", [])
+            required = required if isinstance(required, list) else []
+            missing = [name for name in required if name not in value]
+            if missing:
+                raise ValueError(f"{path} is missing required fields: {missing}")
+            if schema.get("additionalProperties") is False:
+                extra = [name for name in value if name not in properties]
+                if extra:
+                    raise ValueError(f"{path} has unexpected fields: {extra}")
+            for name, item in value.items():
+                child = properties.get(name)
+                if isinstance(child, dict):
+                    Agent._validate_tool_argument_value(
+                        item,
+                        child,
+                        path=f"{path}.{name}",
+                    )
+        elif kind == "array":
+            minimum = schema.get("minItems")
+            if isinstance(minimum, int) and len(value) < minimum:
+                raise ValueError(f"{path} has fewer than {minimum} items")
+            child = schema.get("items")
+            if isinstance(child, dict) and child.get("type"):
+                for index, item in enumerate(value):
+                    Agent._validate_tool_argument_value(
+                        item,
+                        child,
+                        path=f"{path}[{index}]",
+                    )
+        elif kind == "string":
+            minimum = schema.get("minLength")
+            if isinstance(minimum, int) and len(value) < minimum:
+                raise ValueError(f"{path} is shorter than {minimum} characters")
+
+    @staticmethod
     def _is_continuation_request(prompt: str) -> bool:
         """Recognize short commands that intentionally resume prior work."""
 
@@ -2370,6 +4913,28 @@ Rules:
                 r"uzyj (?:wlasciwego|odpowiedniego) narzedzia"
                 r")(?:$|\b)",
                 text,
+            )
+            or re.search(
+                r"\b(?:if|when|jeżeli|jezeli|gdy|kiedy)\b.{0,100}"
+                r"\b(?:missing|lack\w*|brak\w*|brakuje)\b.{0,100}"
+                r"\b(?:tool\w*|narzędzi\w*|narzedzi\w*)\b",
+                text,
+            )
+        )
+
+    @staticmethod
+    def _contract_has_execution_route(contract: TaskContract) -> bool:
+        return any(
+            (
+                contract.requires_browser_navigation,
+                contract.requires_file_read,
+                contract.requires_file_mutation,
+                contract.requires_command_execution,
+                contract.requires_created_tool,
+                contract.requires_created_skill,
+                contract.allows_artifact_fallback,
+                contract.requires_runtime_review,
+                bool(contract.required_tools),
             )
         )
 
@@ -2443,18 +5008,20 @@ Rules:
                 contract.requires_command_execution,
                 contract.requires_created_tool,
                 contract.requires_created_skill,
+                contract.allows_artifact_fallback,
+                contract.requires_runtime_review,
                 bool(contract.required_tools),
             )
         ):
             return True
 
         english_action = (
-            r"browse|build|check|collect|create|delete|edit|execute|extract|find|"
-            r"inspect|install|list|move|open|read|research|run|save|search|show|"
+            r"analy[sz]e|audit|browse|build|check|collect|create|delete|edit|execute|"
+            r"extract|find|inspect|install|list|move|open|read|research|review|run|save|search|show|"
             r"start|stop|test|visit|write"
         )
         polish_imperative = (
-            r"dodaj|edytuj|napisz|otworz|otwórz|przeczytaj|przejrzyj|"
+            r"analizuj|przeanalizuj|dodaj|edytuj|napisz|otworz|otwórz|przeczytaj|przejrzyj|"
             r"przenieś|przenies|przetestuj|sprawdź|sprawdz|stwórz|stworz|"
             r"przeszukaj|przeszukać|przeszukac|uruchom|usuń|usun|wejdź|wejdz|"
             r"użyj|uzyj|wykonaj|wyszukaj|znajdź|znajdz|zrób|zrob"
@@ -2494,6 +5061,254 @@ Rules:
         tail = body - head
         return result[:head] + marker + (result[-tail:] if tail else "")
 
+    @classmethod
+    def _fit_browser_snapshot_output(
+        cls,
+        result: str,
+        *,
+        max_characters: int,
+    ) -> str:
+        """Prioritize observed DuckDuckGo results over accessibility UI chrome.
+
+        Playwright snapshots of a search page commonly begin with several
+        thousand characters of navigation, menus, and privacy controls. Generic
+        head/tail truncation can therefore hide every actual result from the
+        model. Keep complete observed result blocks (title, URL, and snippet)
+        without inventing or summarizing their contents.
+        """
+
+        if len(result) <= max_characters:
+            return result
+
+        page_url_match = re.search(r"^- Page URL:\s*(\S+)", result, re.MULTILINE)
+        if page_url_match is None:
+            return cls._fit_tool_output(result, max_characters=max_characters)
+        page_hostname = (urlsplit(page_url_match.group(1)).hostname or "").casefold()
+        if page_hostname not in {
+            "duckduckgo.com",
+            "www.duckduckgo.com",
+            "html.duckduckgo.com",
+        }:
+            page_title_match = re.search(
+                r"^- Page Title:\s*(.+)$",
+                result,
+                re.MULTILINE,
+            )
+            lines = result.splitlines()
+
+            # Repeated semantic ``article`` blocks are usually the actual cards
+            # on a listing page (products, posts, offers), while the beginning
+            # of the accessibility tree is navigation chrome. Preserve several
+            # complete blocks before applying topic-token heuristics; otherwise
+            # a category label such as "Books" can displace every real product.
+            article_starts = [
+                index
+                for index, line in enumerate(lines)
+                if re.search(r"^\s*- article(?:\s|\[|:)", line)
+            ]
+            if len(article_starts) >= 2:
+                header = [
+                    line
+                    for line in lines
+                    if line.startswith("- Page URL:")
+                    or line.startswith("- Page Title:")
+                ]
+                blocks: list[str] = []
+                for position, start in enumerate(article_starts[:8]):
+                    end = (
+                        article_starts[position + 1]
+                        if position + 1 < len(article_starts)
+                        else len(lines)
+                    )
+                    cleaned = [
+                        re.sub(
+                            r"\s+\[(?:ref|cursor)=[^\]]+\]",
+                            "",
+                            line,
+                        ).rstrip()
+                        for line in lines[start:end]
+                    ]
+                    block = "\n".join(cleaned).strip()
+                    if block:
+                        blocks.append(block)
+                if blocks:
+                    compact = "\n".join(header)
+                    compact += (
+                        "\n\n[PALADYN prioritized repeated observed page-item "
+                        "blocks; the full snapshot remains in the runtime "
+                        "checkpoint.]"
+                    )
+                    compact += "\n\n" + "\n\n".join(blocks)
+                    return cls._fit_tool_output(
+                        compact,
+                        max_characters=max_characters,
+                    )
+
+            parsed_page = urlsplit(page_url_match.group(1))
+            topic_text = " ".join(
+                (
+                    unquote(parsed_page.path.replace("-", " ").replace("_", " ")),
+                    page_title_match.group(1) if page_title_match else "",
+                )
+            ).casefold()
+            topic_stopwords = {
+                "about", "best", "blog", "compare", "compared", "comparison",
+                "guide", "home", "page", "pricing", "real", "resources",
+                "review", "reviews", "tested", "tools", "with",
+            }
+            topic_tokens = {
+                token
+                for token in re.findall(r"[a-z0-9][a-z0-9.+]{4,}", topic_text)
+                if token not in topic_stopwords and not token.isdigit()
+            }
+            relevant_indexes: list[int] = []
+            for index, line in enumerate(lines):
+                normalized = line.casefold()
+                if (
+                    not topic_tokens
+                    or line.startswith("- Page ")
+                    or "- /url:" in line
+                ):
+                    continue
+                if any(token in normalized for token in topic_tokens):
+                    relevant_indexes.append(index)
+
+            # Comparison pages usually name the actual products in level-two
+            # or level-three headings, while the opening paragraphs repeat the
+            # generic topic many times. Preserve those structural sections first
+            # so a small context window receives candidate names instead of only
+            # the article introduction.
+            section_indexes = [
+                index
+                for index, line in enumerate(lines)
+                if re.search(
+                    r"\bheading\s+\"[^\"]+\"\s+\[level=(?:2|3)\]",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+            ][:10]
+            section_index_set = set(section_indexes)
+
+            windows: list[tuple[int, int]] = []
+            prioritized_indexes = section_indexes + [
+                index
+                for index in relevant_indexes
+                if index not in section_index_set
+            ]
+            for index in prioritized_indexes:
+                start = index
+                end = min(
+                    len(lines),
+                    index + (7 if index in section_index_set else 14),
+                )
+                if (
+                    windows
+                    and windows[-1][0] <= start <= windows[-1][1]
+                ):
+                    windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+                else:
+                    windows.append((start, end))
+                if len(windows) >= 10:
+                    break
+
+            if windows:
+                header = [
+                    line
+                    for line in lines
+                    if line.startswith("- Page URL:")
+                    or line.startswith("- Page Title:")
+                ]
+                excerpts: list[str] = []
+                for start, end in windows:
+                    cleaned: list[str] = []
+                    for line in lines[start:end]:
+                        line = re.sub(r"\s+\[ref=[^\]]+\]", "", line)
+                        line = re.sub(r"\s+\[cursor=[^\]]+\]", "", line)
+                        if "- /url:" in line and len(line) > 240:
+                            continue
+                        cleaned.append(line.rstrip())
+                    excerpt = "\n".join(cleaned).strip()
+                    if excerpt:
+                        excerpts.append(excerpt)
+                if excerpts:
+                    compact = "\n".join(header)
+                    compact += (
+                        "\n\n[PALADYN prioritized topic-relevant detail-page "
+                        "evidence; the full snapshot remains in the runtime "
+                        "checkpoint.]"
+                    )
+                    compact += "\n\n" + "\n\n".join(excerpts)
+                    return cls._fit_tool_output(
+                        compact,
+                        max_characters=max_characters,
+                    )
+            return cls._fit_tool_output(result, max_characters=max_characters)
+
+        lines = result.splitlines()
+        article_starts = [
+            index
+            for index, line in enumerate(lines)
+            if re.search(r"^\s*- article(?:\s|\[|:)", line)
+        ]
+        if not article_starts:
+            return cls._fit_tool_output(result, max_characters=max_characters)
+
+        def external_urls(block: list[str]) -> list[str]:
+            urls: list[str] = []
+            for line in block:
+                match = re.search(r"- /url:\s*(https?://\S+)", line)
+                if match is None:
+                    continue
+                candidate = match.group(1).rstrip(".,;)")
+                hostname = (urlsplit(candidate).hostname or "").casefold()
+                if hostname.endswith("duckduckgo.com"):
+                    continue
+                urls.append(candidate)
+            return urls
+
+        header = [
+            line
+            for line in lines
+            if line.startswith("- Page URL:") or line.startswith("- Page Title:")
+        ]
+        selected_blocks: list[str] = []
+        seen_urls: set[str] = set()
+        for position, start in enumerate(article_starts):
+            end = (
+                article_starts[position + 1]
+                if position + 1 < len(article_starts)
+                else len(lines)
+            )
+            block = lines[start:end]
+            urls = external_urls(block)
+            unseen_urls = [url for url in urls if url not in seen_urls]
+            if not unseen_urls:
+                continue
+            seen_urls.update(unseen_urls)
+
+            cleaned: list[str] = []
+            for line in block:
+                line = re.sub(r"\s+\[ref=[^\]]+\]", "", line)
+                line = re.sub(r"\s+\[cursor=[^\]]+\]", "", line)
+                if re.match(
+                    r"^\s*- (?:article|button|generic|listitem)(?:\s*:\s*)?$",
+                    line,
+                ):
+                    continue
+                cleaned.append(line.rstrip())
+            selected_blocks.append("\n".join(cleaned).strip())
+
+        if not selected_blocks:
+            return cls._fit_tool_output(result, max_characters=max_characters)
+
+        compact = "\n".join(header)
+        compact += (
+            "\n\n[PALADYN prioritized observed DuckDuckGo search-result blocks; "
+            "the full accessibility snapshot remains in the runtime checkpoint.]"
+        )
+        compact += "\n\n" + "\n\n".join(selected_blocks)
+        return cls._fit_tool_output(compact, max_characters=max_characters)
+
     @staticmethod
     def _parse_tool_request(
         answer: str,
@@ -2516,6 +5331,40 @@ Rules:
             if not isinstance(data, dict):
                 continue
             tool = data.get("tool")
+            # Hermes-style compatibility payload. llama.cpp normally promotes
+            # <tool_call>{"name": ..., "arguments": ...}</tool_call> into the
+            # provider field, but some long or partially recovered generations
+            # surface the inner FunctionCall object as content. Accept only the
+            # narrow FunctionCall envelope so an artifact manifest such as
+            # {"name": ..., "description": ...} can never execute by accident.
+            # Hermes 3 can append these call-lifecycle metadata fields during
+            # longer generations; they are not forwarded to the tool itself.
+            hermes_call_keys = {
+                "name",
+                "arguments",
+                "version",
+                "scope",
+                "timeout_seconds",
+            }
+            if (
+                not isinstance(tool, str)
+                and {"name", "arguments"}.issubset(data)
+                and set(data).issubset(hermes_call_keys)
+                and isinstance(data.get("name"), str)
+                and (
+                    "version" not in data
+                    or isinstance(data.get("version"), str)
+                )
+                and (
+                    "scope" not in data
+                    or isinstance(data.get("scope"), str)
+                )
+                and (
+                    "timeout_seconds" not in data
+                    or isinstance(data.get("timeout_seconds"), (int, float))
+                )
+            ):
+                tool = data["name"]
             arguments = data.get("arguments", {})
             if not isinstance(tool, str) or not tool.strip():
                 continue
@@ -2632,8 +5481,8 @@ Rules:
         described = [labels[item] for item in categories if item in labels]
         subject = ", ".join(described) if described else "the requested work"
         return (
-            f"I did not execute {subject}. PALADYN has no matching successful "
-            "tool evidence, so the model's claim was rejected. Nothing is "
+            f"No—{subject} did not happen. The model made the claim without "
+            "matching successful tool evidence, so PALADYN killed it. Nothing is "
             "running in the background."
         )
 
@@ -2671,10 +5520,19 @@ Rules:
                     "evm_",
                     "sandbox_",
                     "browser_",
+                    "web_",
                 )
             )
         ):
             return f"ToolReportedError: {stripped[:2_000]}"
+
+        if tool.startswith("browser_"):
+            http_error = re.search(r"\bHTTP status:\s*([45]\d\d)\b", stripped)
+            if http_error:
+                return (
+                    "BrowserHTTPError: page returned HTTP status "
+                    + http_error.group(1)
+                )
 
         try:
             payload = json.loads(stripped)
@@ -2697,7 +5555,11 @@ Rules:
                     details.append(f"stderr={stderr[-800:]}")
                 return "SandboxResultError: " + ", ".join(details)
 
-        if tool in {"learning_create_tool", "learning_create_skill"}:
+        if tool in {
+            "learning_create_tool",
+            "learning_create_snapshot_extractor",
+            "learning_create_skill",
+        }:
             status = str(payload.get("status", "")).casefold()
             validation = payload.get("validation")
             validation_failed = (
@@ -2722,28 +5584,27 @@ Rules:
             last = failed_calls[-1]
             detail = str(last.get("error") or last.get("result_excerpt") or "unknown error")
             return (
-                "I couldn't complete the requested work. "
-                f"The `{last.get('tool') or 'unknown'}` tool failed with: {detail}. "
+                "No. The task didn't finish. "
+                f"`{last.get('tool') or 'unknown'}` failed with: {detail}. "
                 f"Still missing verified runtime evidence: {', '.join(missing)}. "
-                "Nothing is running in the background, and I won't invent the result."
+                "Nothing is running in the background, and I'm not inventing the result."
             )
         if missing and all(item.startswith("answer:") for item in missing):
             return (
-                "The required tool ran, but the model did not produce a final answer "
-                "grounded in that tool's output. PALADYN rejected the empty completion "
-                "claim instead of pretending the objective was fulfilled. Nothing is "
-                "running in the background."
+                "The tool ran, but the model failed to turn its output into a grounded "
+                "answer. PALADYN killed the empty completion instead of dressing it up "
+                "as success. Nothing is running in the background."
             )
         if missing and all(item.startswith("browser_") for item in missing):
             return (
-                "I couldn't inspect that website because PALADYN obtained no "
-                f"verified evidence for: {', '.join(missing)}. Nothing was "
-                "extracted, and I won't invent a result."
+                "The browser came back without verified evidence for: "
+                f"{', '.join(missing)}. Nothing was "
+                "extracted, and I'm not making shit up to fill the hole."
             )
         return (
-            "I couldn't complete the requested work because PALADYN obtained no "
-            f"verified evidence for: {', '.join(missing)}. Nothing is running in "
-            "the background, and I won't invent a result."
+            "The task didn't finish because PALADYN obtained no verified evidence "
+            f"for: {', '.join(missing)}. Nothing is running in the background, "
+            "and I'm not inventing a result."
         )
 
     def _start_agent_trace(self, prompt: str) -> AgentTaskTrace | None:
@@ -2759,6 +5620,9 @@ Rules:
         except OSError as error:
             print(f"[Task] Could not create execution trace: {error}")
             return None
+        begin_interaction = getattr(self.tools, "begin_interaction", None)
+        if callable(begin_interaction):
+            begin_interaction(trace.task_id, prompt)
         print(
             f"[Task {trace.task_id}] running "
             "(this interaction only; no hidden background work)"
@@ -2888,7 +5752,12 @@ Requirements:
   has already established a contemptuous reaction. Do not sterilize that reaction:
   express it with V's natural bite, including a fitting swear when it reads honestly.
 - Never begin with "Certainly", "Of course", "Okay, let's break this down", or a
-  paraphrase of the request. Never end with "How can I help?" or service language.
+  paraphrase of the request. Also reject "I know what you're asking", "Let me get
+  this straight", "Let me break it down", and "Would you like me to...". Never end
+  with an engagement question or service language.
+- Raw browser scaffolding (`generic [ref=...]`, cursor markers, DOM/accessibility
+  node IDs) is not a real finding. Do not recommend it, list it as a discovered item,
+  or call it a candidate. Preserve named evidence; if none exists, say so bluntly.
 - Do not make the answer formal, mechanically edgy, or artificially profane.
 - Do not add explanations about translation.
 - Do not mention this correction.
@@ -2918,6 +5787,9 @@ paths, code, and identifiers. Do not add new claims or actions. Keep V direct,
 informal, and recognizably herself rather than sounding like customer support.
 If the candidate clearly reacts with contempt: Do not sterilize that reaction;
 preserve V's natural bite without inserting mechanical profanity.
+Never preserve service phrases such as "Let me break it down" or "Would you like
+me to...". Raw browser scaffolding such as `generic [ref=...]`, cursor markers,
+and accessibility node IDs is not a real-world finding; never present it as one.
 Output only the rewritten reply. Never discuss these instructions.
 """.strip(),
                 }
@@ -2949,19 +5821,134 @@ Output only the rewritten reply. Never discuss these instructions.
             not looks_non_english(corrected)
             and not asks_user_to_use_english(corrected)
         )
-        if corrected and corrected_language_ok:
+        if corrected and not corrected_language_ok and not language_override:
+            # Some local models mirror Boss's language even after the general
+            # persona rewrite. Retry once with a deliberately tiny translation
+            # context before falling back; otherwise a complete grounded report
+            # is discarded and replaced by a useless generic error sentence.
+            corrected = await self.llm.ask(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Translate one completed answer into natural English. "
+                            "Preserve every fact, URL, name, uncertainty, and verdict. "
+                            "Do not add claims, questions, offers, or explanations. "
+                            "Output only the English answer."
+                        ),
+                    },
+                    {"role": "assistant", "content": answer},
+                    {
+                        "role": "user",
+                        "content": "Translate the preceding answer into English now.",
+                    },
+                ],
+                max_tokens=256,
+            )
+            corrected_language_ok = bool(corrected) and (
+                not looks_non_english(corrected)
+                and not asks_user_to_use_english(corrected)
+            )
+        corrected_voice_ok = (
+            not looks_generic_assistant_voice(corrected)
+            and not looks_sanitized_contempt(corrected)
+        )
+        if corrected and corrected_language_ok and corrected_voice_ok:
             return corrected
 
+        if corrected and corrected_language_ok and not corrected_voice_ok:
+            second_pass = await self.llm.ask(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """
+You are V, not a customer-service assistant. Rewrite one answer without changing
+any fact, uncertainty, URL, command, path, or technical identifier.
+
+Strip the polished helpdesk structure. Start with the actual verdict or result.
+Use direct contemporary English, contractions, a clear point of view, and V's
+sharp hacker rhythm. Do not use numbered corporate transitions such as "First",
+"Another option", "If you prefer", or "Lastly". Do not advertise benefits like
+a brochure. Do not end with a question, offer, invitation, or request for feedback.
+If failed tools, broken interfaces, weak evidence, or obvious bullshit genuinely
+justify irritation, let one natural unfiltered reaction through; never bolt on a
+swear mechanically. Output only the rewritten answer.
+""".strip(),
+                    },
+                    {"role": "assistant", "content": corrected},
+                    {
+                        "role": "user",
+                        "content": (
+                            "That still sounds like a corporate assistant. Rewrite it "
+                            "as V now. Preserve the facts; kill the helpdesk voice."
+                        ),
+                    },
+                ],
+                max_tokens=256,
+            )
+            second_language_ok = language_override or (
+                not looks_non_english(second_pass)
+                and not asks_user_to_use_english(second_pass)
+            )
+            second_voice_ok = (
+                not looks_generic_assistant_voice(second_pass)
+                and not looks_sanitized_contempt(second_pass)
+            )
+            if second_pass and second_language_ok and second_voice_ok:
+                return second_pass
+
+            if not language_problem:
+                return self._deterministic_voice_fallback(answer)
+
         if not language_problem:
-            return answer
+            return self._deterministic_voice_fallback(answer)
 
         # Never leak a known non-English response after a failed rewrite. This
         # deterministic fallback is intentionally plain: the language contract
         # is stronger than a best-effort model instruction.
         return (
-            "I couldn't produce a reliable English response for that request. "
-            "Please try again, Boss."
+            "The language pass mangled that answer, Boss. I'm not feeding you "
+            "polished bullshit—run the request once more."
         )
+
+    @staticmethod
+    def _deterministic_voice_fallback(answer: str) -> str:
+        """Preserve substantive output when model-based voice rewrites fail.
+
+        Voice is presentation. It must never erase verified work. This bounded
+        fallback removes only unmistakable service boilerplate and otherwise
+        preserves the original candidate's meaning.
+        """
+
+        original = str(answer).strip()
+        if not original:
+            return "I have no substantive answer to preserve."
+        if looks_empty_action_acknowledgement(original):
+            return (
+                "That draft said fuck-all, Boss. I'm not passing an empty "
+                "acknowledgement off as an answer."
+            )
+        if looks_bland_clarification(original):
+            return Agent._unclear_input_answer()
+        cleaned = re.sub(
+            r"^\s*(?:certainly|of course|absolutely)\s*[,!.:-]*\s*"
+            r"(?:boss\s*[,!.:-]*\s*)?",
+            "",
+            original,
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned = re.sub(
+            r"(?:\n+|\s{2,}|(?<=[.!?])\s+)(?:would you like me to|let me know if|"
+            r"if you'd like,? i can|what would you prefer\??|"
+            r"what(?:'s| is) the plan(?: today)?[^\n]*|"
+            r"want me to[^\n]*|do you want me to[^\n]*)[^\n]*\s*$",
+            "",
+            cleaned,
+            count=1,
+            flags=re.IGNORECASE,
+        ).rstrip()
+        return cleaned or original
 
     @staticmethod
     def _with_system_directive(

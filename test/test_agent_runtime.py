@@ -36,6 +36,8 @@ from v_core.persona.language import (
 )
 from v_core.persona.voice import (
     VoiceProfile,
+    looks_bland_clarification,
+    looks_empty_action_acknowledgement,
     looks_generic_assistant_voice,
     looks_sanitized_contempt,
 )
@@ -43,8 +45,8 @@ from v_core.relationship import RelationshipState
 import v_core.main as main_module
 
 
-def test_public_version_is_2_0_0() -> None:
-    assert v_core.__version__ == "2.0.0"
+def test_public_version_is_3_0_0() -> None:
+    assert v_core.__version__ == "3.0.0"
 
 
 def test_tool_request_accepts_structured_json() -> None:
@@ -58,9 +60,167 @@ def test_tool_request_accepts_structured_json() -> None:
     )
 
 
+def test_tool_request_accepts_exact_hermes_function_call_envelope() -> None:
+    assert Agent._parse_tool_request(
+        '{"name":"read_file","arguments":{"path":"README.md"}}'
+    ) == ("read_file", {"path": "README.md"})
+
+
+def test_tool_request_accepts_hermes_envelope_with_lifecycle_metadata() -> None:
+    assert Agent._parse_tool_request(
+        '{"name":"read_file","arguments":{"path":"README.md"},'
+        '"version":"","scope":"task","timeout_seconds":120}'
+    ) == ("read_file", {"path": "README.md"})
+
+
+def test_tool_request_rejects_hermes_envelope_with_unknown_metadata() -> None:
+    assert Agent._parse_tool_request(
+        '{"name":"read_file","arguments":{"path":"README.md"},'
+        '"description":"not a call envelope"}'
+    ) is None
+
+
+def test_tool_request_does_not_mistake_artifact_manifest_for_call() -> None:
+    assert Agent._parse_tool_request(
+        '{"name":"count_words","description":"Count words",'
+        '"arguments":{},"source":"def run(arguments): return {}"}'
+    ) is None
+
+
 def test_tool_request_rejects_invalid_arguments() -> None:
     assert Agent._parse_tool_request(
         '{"tool":"read_file","arguments":["README.md"]}'
+    ) is None
+
+
+def test_bare_active_tool_builder_payload_is_recovered() -> None:
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "learning_create_tool",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "source": {"type": "string"},
+                        "test": {"type": "object"},
+                    },
+                    "required": ["name", "description", "source", "test"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    request = Agent._parse_active_lifecycle_payload(
+        '{"name":"count_words","description":"Count words",'
+        '"source":"def run(arguments): return {}","test":{}}',
+        definitions,
+    )
+
+    assert request == (
+        "learning_create_tool",
+        {
+            "name": "count_words",
+            "description": "Count words",
+            "source": "def run(arguments): return {}",
+            "test": {},
+        },
+    )
+
+
+def test_bare_payload_recovery_rejects_unknown_fields_and_short_names() -> None:
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "learning_create_tool",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "source": {"type": "string"},
+                        "test": {"type": "object"},
+                    },
+                    "required": ["name", "description", "source", "test"],
+                },
+            },
+        }
+    ]
+
+    assert Agent._parse_active_lifecycle_payload(
+        '{"name":"count_words"}', definitions
+    ) is None
+
+
+def test_source_phase_recovers_source_from_one_unclosed_compatibility_wrapper() -> None:
+    wrapped = (
+        '{"tool":"learning_create_tool","arguments":'
+        '{"source":"def run(arguments):\\n    '
+        'return {\\"count\\": len(arguments[\\"items\\"])}"}'
+    )
+
+    assert Agent._parse_generated_tool_source(wrapped) == (
+        'def run(arguments):\n    return {"count": len(arguments["items"])}'
+    )
+
+
+def test_source_phase_prompt_binds_runtime_fixture_fields() -> None:
+    prompt = Agent._generated_source_phase_prompt(
+        'items = [1, 2] scale = 3 expected = {"values": [3, 6]}'
+    )
+
+    assert "def run(arguments):" in prompt
+    assert "items = arguments['items']" in prompt
+    assert "scale = arguments['scale']" in prompt
+    assert "expected = arguments" not in prompt
+
+
+def test_creation_phase_forces_required_builder_tool_choice() -> None:
+    contract = TaskContract(requires_created_tool=True)
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "learning_create_tool",
+                "parameters": {"type": "object"},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "learning_create_snapshot_extractor",
+                "parameters": {"type": "object"},
+            },
+        },
+    ]
+
+    assert Agent._phase_tool_choice(contract, definitions, []) == {
+        "type": "function",
+        "function": {"name": "learning_create_tool"},
+    }
+
+
+def test_phase_tool_choice_is_auto_without_required_active_builder() -> None:
+    contract = TaskContract(requires_created_tool=True)
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "learning_create_snapshot_extractor",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+    assert Agent._phase_tool_choice(contract, definitions, []) == "auto"
+    assert Agent._parse_active_lifecycle_payload(
+        '{"name":"count_words","description":"Count",'
+        '"source":"pass","unexpected":true}',
+        definitions,
     ) is None
 
 
@@ -93,6 +253,133 @@ def test_tool_request_rejects_multiple_tool_objects_as_ambiguous() -> None:
     ) is None
 
 
+def test_web_search_extracts_grounded_duckduckgo_results() -> None:
+    snapshot = """
+- Page URL: https://duckduckgo.com/?q=cud+malina&ia=web
+- link "https://example.com › bakery":
+  - /url: https://example.com/bakery
+- heading [level=2]:
+  - link "Cud Malina — official page":
+    - /url: https://example.com/bakery
+- link "Search domain directory.example":
+  - /url: /?q=cud+malina+site%3Adirectory.example
+- heading [level=2]:
+  - link "Cud Malina in the business directory":
+    - /url: https://directory.example/cud-malina
+"""
+
+    results = MCPTools._search_results_from_snapshot(snapshot, limit=5)
+
+    assert results == [
+        {
+            "rank": 1,
+            "title": "Cud Malina — official page",
+            "url": "https://example.com/bakery",
+        },
+        {
+            "rank": 2,
+            "title": "Cud Malina in the business directory",
+            "url": "https://directory.example/cud-malina",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_web_search_and_read_form_a_grounded_high_level_flow() -> None:
+    tools = object.__new__(MCPTools)
+    tools._web_discovered_urls = {}
+    tools._web_search_performed = False
+    browser_calls: list[tuple[str, dict]] = []
+
+    async def browser_call(tool: str, arguments: dict) -> str:
+        browser_calls.append((tool, arguments))
+        if tool == "browser_navigate":
+            return f"- Page URL: {arguments['url']}"
+        if len(browser_calls) == 2:
+            return (
+                "- Page URL: https://duckduckgo.com/?q=cud+malina&ia=web\n"
+                '- link "Cud Malina official":\n'
+                "  - /url: https://example.com/cud-malina\n"
+            )
+        return (
+            "- Page URL: https://example.com/cud-malina\n"
+            "- Page Title: Cud Malina\n"
+            "- heading \"Contact\" [level=2]\n"
+        )
+
+    tools.browser_call = browser_call
+
+    search_payload = json.loads(await tools.web_search("Cud Malina", 5))
+    read_payload = json.loads(
+        await tools.web_read(search_payload["results"][0]["url"])
+    )
+
+    assert search_payload["result_count"] == 1
+    assert search_payload["results"][0]["title"] == "Cud Malina official"
+    assert read_payload["url"] == "https://example.com/cud-malina"
+    assert "Contact" in read_payload["content"]
+    assert [name for name, _ in browser_calls] == [
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_navigate",
+        "browser_snapshot",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_web_read_rejects_url_absent_from_search_evidence() -> None:
+    tools = object.__new__(MCPTools)
+    tools._web_discovered_urls = {
+        "https://example.com/verified": "https://example.com/verified"
+    }
+    tools._web_search_performed = True
+
+    payload = json.loads(await tools.web_read("https://invented.invalid/result"))
+
+    assert "absent from web_search evidence" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_web_read_repairs_unique_model_copy_error_from_search_evidence() -> None:
+    tools = object.__new__(MCPTools)
+    official = "https://warszawa.miodmalina.eu/kontakt/"
+    tools._web_discovered_urls = {
+        MCPTools._normalized_web_url(official): official,
+    }
+    tools._web_search_performed = True
+    browser_calls: list[tuple[str, dict]] = []
+
+    async def browser_call(tool: str, arguments: dict) -> str:
+        browser_calls.append((tool, arguments))
+        if tool == "browser_navigate":
+            return f"- Page URL: {arguments['url']}"
+        return f"- Page URL: {official}\n- Page Title: Kontakt | Miód Malina"
+
+    tools.browser_call = browser_call
+    payload = json.loads(
+        await tools.web_read("https://warszawa.miodmalina eu/kontakt/")
+    )
+
+    assert payload["corrected_url"] == official
+    assert browser_calls[0] == ("browser_navigate", {"url": official})
+
+
+@pytest.mark.asyncio
+async def test_web_read_does_not_guess_between_ambiguous_observed_urls() -> None:
+    tools = object.__new__(MCPTools)
+    tools._web_discovered_urls = {
+        "https://foo-bar.example/result": "https://foo-bar.example/result",
+        "https://foobar.example/result": "https://foobar.example/result",
+    }
+    tools._web_search_performed = True
+
+    payload = json.loads(
+        await tools.web_read("https://foo_bar.example/result")
+    )
+
+    assert "absent from web_search evidence" in payload["error"]
+
+
 def test_legacy_tool_request_remains_supported() -> None:
     assert Agent._parse_tool_request("TOOL:cat:README.md") == (
         "cat",
@@ -117,6 +404,16 @@ def test_capability_questions_and_tool_actions_use_multi_step_agent_loop() -> No
         "V, czy potrafisz stworzyć własne narzędzia?"
     ) == dispatcher.CHAT
     assert dispatcher.dispatch("Przeczytaj plik README.md") == dispatcher.CHAT
+
+
+def test_url_plus_generated_tool_work_uses_multi_step_agent_loop() -> None:
+    dispatcher = CapabilityDispatcher()
+    prompt = (
+        "Visit https://books.toscrape.com/. Then create and activate a "
+        "task-scoped offline tool named extract_book_cards. Then use it."
+    )
+
+    assert dispatcher.dispatch(prompt) == dispatcher.CHAT
     assert dispatcher.dispatch("Create a generated skill for CSV files") == (
         dispatcher.CHAT
     )
@@ -516,7 +813,10 @@ async def test_light_conversation_streams_and_skips_expensive_memory() -> None:
             assert "never insert a swear" in (
                 messages[0]["content"]
             )
-            assert "dangerous to badly designed systems" in messages[-2]["content"]
+            assert any(
+                "mildly offended by the world's bad code" in message["content"]
+                for message in messages
+            )
             for chunk in (
                 "Hey, Boss. I'm doing pretty damn well — ",
                 "awake, sharp, and ready. How are you?",
@@ -784,6 +1084,60 @@ async def test_agent_rejects_fake_background_work_and_requests_real_tool() -> No
 
 
 @pytest.mark.asyncio
+async def test_agent_rejects_empty_action_acknowledgement_before_tool_use() -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict | str]] = []
+
+        async def call(self, tool: str, arguments: dict | str) -> str:
+            self.calls.append((tool, arguments))
+            return "three records extracted"
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.responses = iter(
+                (
+                    "I know exactly what you want. Let's do it.",
+                    '{"tool":"extract_records","arguments":'
+                    '{"url":"https://example.com"}}',
+                    "Three records. Extracted and verified, Boss.",
+                )
+            )
+
+        async def ask(self, **kwargs) -> str:
+            return next(self.responses)
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    async def passthrough(messages, answer: str) -> str:
+        return answer
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.MAX_AGENT_STEPS = 4
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent._enforce_english = passthrough
+
+    answer = await agent._run_agent_loop("Extract the records from example.com")
+
+    assert agent.tools.calls == [
+        ("extract_records", {"url": "https://example.com"}),
+    ]
+    assert answer == "Three records. Extracted and verified, Boss."
+    assert "Let's do it" not in answer
+
+
+@pytest.mark.asyncio
 async def test_agent_blocks_fabricated_phone_call_and_remote_exploit(
     tmp_path: Path,
 ) -> None:
@@ -845,7 +1199,7 @@ async def test_agent_blocks_fabricated_phone_call_and_remote_exploit(
     answer = await agent._run_agent_loop("No to zadzwoń do niego")
     await asyncio.gather(*agent._memory_tasks)
 
-    assert answer.startswith("I did not execute")
+    assert answer.startswith("No—")
     assert "remote-system access" in answer
     assert "on the line" not in answer
     assert agent.memory.execution is not None
@@ -1033,7 +1387,7 @@ async def test_website_task_waits_for_owner_instead_of_hallucinating_without_evi
     answer = await agent._run_agent_loop("Przejrzyj stronę onehack.st")
     await asyncio.gather(*agent._memory_tasks)
 
-    assert answer.startswith("I reached the current batch limit")
+    assert answer.startswith("Batch limit:")
     assert "/continue" in answer
     assert "/stop" in answer
     assert "goldmine" not in answer
@@ -1064,12 +1418,15 @@ async def test_owner_continue_resumes_same_checkpoint_and_prior_evidence(
 
         async def openai_tool_definitions(self) -> list[dict]:
             return [
-                {"type": "function", "function": {"name": "read_file"}}
+                {"type": "function", "function": {"name": name}}
+                for name in ("read_file", "sandbox_execute_offline")
             ]
 
         async def call(self, tool: str, arguments: dict) -> str:
             self.calls.append((tool, arguments))
-            return "# PALADYN\nVerified local content"
+            if tool == "read_file":
+                return "# PALADYN\nVerified local content"
+            return json.dumps({"exit_code": 0, "stdout": "371 passed", "stderr": ""})
 
     class LLMStub:
         config = SimpleNamespace(context=8_192)
@@ -1089,9 +1446,21 @@ async def test_owner_continue_resumes_same_checkpoint_and_prior_evidence(
                         )
                     ]
                 )
-            assert "SAME-TASK OWNER RESUME" in kwargs["messages"][0]["content"]
-            assert "Verified local content" in kwargs["messages"][0]["content"]
-            return LLMResponse(content="The verified heading is `# PALADYN`, Boss.")
+            if self.calls == 2:
+                assert "SAME-TASK OWNER RESUME" in kwargs["messages"][0]["content"]
+                assert "Verified local content" in kwargs["messages"][0]["content"]
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "tests_1",
+                            "sandbox_execute_offline",
+                            {"command": ["pytest"], "workspace": "tests"},
+                        )
+                    ]
+                )
+            return LLMResponse(
+                content="The heading is `# PALADYN`; the verified test run passed."
+            )
 
     class MemoryStub:
         def __init__(self) -> None:
@@ -1115,13 +1484,15 @@ async def test_owner_continue_resumes_same_checkpoint_and_prior_evidence(
     agent.MAX_AGENT_STEPS = 1
     agent._build_system_prompt = lambda prompt, agent_mode: "system"
 
-    paused = await agent.run("Read README.md and report its heading")
+    paused = await agent.run(
+        "Read README.md, run the tests, and report its heading and test result."
+    )
     checkpoint_root = agent._agent_trace_root / "checkpoints"
     checkpoints = list(checkpoint_root.glob("*.json"))
     assert len(checkpoints) == 1
     task_id = json.loads(checkpoints[0].read_text(encoding="utf-8"))["task_id"]
     assert "/continue" in paused
-    assert "What I found:" in paused
+    assert "Verified findings:" in paused
     assert "Verified local content" in paused
     paused_payload = json.loads(checkpoints[0].read_text(encoding="utf-8"))
     assert "progress_summary" in paused_payload["owner_checkpoint"]
@@ -1129,19 +1500,119 @@ async def test_owner_continue_resumes_same_checkpoint_and_prior_evidence(
     answer = await agent.run("/continue")
     await asyncio.gather(*agent._memory_tasks)
 
-    assert answer == "The verified heading is `# PALADYN`, Boss."
-    assert agent.tools.calls == [("read_file", {"path": "README.md"})]
+    assert answer == "The heading is `# PALADYN`; the verified test run passed."
+    assert agent.tools.calls == [
+        ("read_file", {"path": "README.md"}),
+        (
+            "sandbox_execute_offline",
+            {"command": ["pytest"], "workspace": "tests"},
+        ),
+    ]
     assert len(list(checkpoint_root.glob("*.json"))) == 1
     payload = json.loads(checkpoints[0].read_text(encoding="utf-8"))
     assert payload["task_id"] == task_id
     assert payload["status"] == "completed"
-    assert [call["sequence"] for call in payload["tool_calls"]] == [1]
+    assert [call["sequence"] for call in payload["tool_calls"]] == [1, 2]
     journal = (
         agent._agent_trace_root / "journal" / f"{task_id}.jsonl"
     ).read_text(encoding="utf-8")
     assert "task_awaiting_owner" in journal
     assert "task_resumed_by_owner" in journal
     assert "task_completed" in journal
+
+
+def test_owner_progress_report_filters_raw_browser_scaffolding() -> None:
+    report = Agent._owner_progress_report(
+        {
+            "findings": [
+                '### Result No matches found for "Firecrawl alternatives".',
+                (
+                    "browser_click: browser_click requires an element identifier."
+                ),
+                (
+                    "### Ran Playwright code `await page.goto(...)` "
+                    "### Page - Page URL: https://thunderbit.com/blog "
+                    "- Page Title: Web Scraper Tips & Web Automation Guides "
+                    "| Thunderbit - Console: 0 errors, 1 warnings "
+                    '- heading "Crawl4AI" [level=2] '
+                    '- heading "Crawlee" [level=2] '
+                    "### Snapshot ```yaml - generic [active] [ref=f10e1]"
+                ),
+            ],
+            "open_questions": [
+                "Inspect a verified Firecrawl alternative detail page"
+            ],
+            "next_steps": [],
+        },
+        [
+            {
+                "tool": "browser_find",
+                "status": "succeeded",
+                "result_excerpt": (
+                    '### Result No matches found for "Firecrawl alternatives".'
+                ),
+            },
+            {
+                "tool": "browser_snapshot",
+                "status": "succeeded",
+                "result_excerpt": (
+                    "### Ran Playwright code `await page.goto(...)` "
+                    "### Page - Page URL: https://thunderbit.com/blog "
+                    "- Page Title: Web Scraper Tips & Web Automation Guides "
+                    "| Thunderbit - Console: 0 errors, 1 warnings "
+                    '- heading "Crawl4AI" [level=2] '
+                    '- heading "Crawlee" [level=2] '
+                    "### Snapshot ```yaml - generic [active] [ref=f10e1]"
+                ),
+            }
+        ],
+        [],
+    )
+
+    assert "No match for “Firecrawl alternatives”" in report
+    assert "Source: https://thunderbit.com/blog" in report
+    assert "Verified sections: Crawl4AI; Crawlee" in report
+    assert "browser_click requires" not in report
+    assert "Ran Playwright" not in report
+    assert "generic [" not in report
+    assert "[ref=" not in report
+
+
+def test_owner_progress_report_merges_rich_ledger_after_bounded_rollover() -> None:
+    report = Agent._owner_progress_report(
+        {
+            "findings": [
+                (
+                    "browser_snapshot: - Page URL: "
+                    "https://thunderbit.com/pl/blog/open-source-firecrawl-alternatives "
+                    "- Page Title: Loading https://thunderbit.com"
+                )
+            ],
+            "open_questions": [],
+            "next_steps": ["Continue the original objective using real tools."],
+        },
+        [
+            {
+                "tool": "browser_snapshot",
+                "status": "succeeded",
+                "result_excerpt": (
+                    "- Page URL: "
+                    "https://thunderbit.com/pl/blog/open-source-firecrawl-alternatives\n"
+                    "- Page Title: Open-source Firecrawl alternatives\n"
+                    '[PALADYN prioritized topic-relevant detail-page evidence]\n'
+                    '- heading "1. Scrapy: large-scale Python crawling" [level=2]\n'
+                    '- heading "2. Apache Nutch: enterprise search" [level=2]'
+                ),
+            }
+        ],
+        [],
+    )
+
+    assert report.count(
+        "Source: https://thunderbit.com/pl/blog/open-source-firecrawl-alternatives"
+    ) == 1
+    assert "Verified candidates: Scrapy; Apache Nutch" in report
+    assert "Continue the original objective" not in report
 
 
 @pytest.mark.asyncio
@@ -1154,7 +1625,8 @@ async def test_owner_stop_closes_checkpoint_without_another_model_call(
 
         async def openai_tool_definitions(self) -> list[dict]:
             return [
-                {"type": "function", "function": {"name": "read_file"}}
+                {"type": "function", "function": {"name": name}}
+                for name in ("browser_navigate", "browser_snapshot")
             ]
 
         async def call(self, tool: str, arguments: dict) -> str:
@@ -1170,7 +1642,11 @@ async def test_owner_stop_closes_checkpoint_without_another_model_call(
             self.calls += 1
             return LLMResponse(
                 tool_calls=[
-                    LLMToolCall("read_1", "read_file", {"path": "README.md"})
+                    LLMToolCall(
+                        "navigate_1",
+                        "browser_navigate",
+                        {"url": "https://duckduckgo.com/?q=paladyn"},
+                    )
                 ]
             )
 
@@ -1196,7 +1672,7 @@ async def test_owner_stop_closes_checkpoint_without_another_model_call(
     agent.MAX_AGENT_STEPS = 1
     agent._build_system_prompt = lambda prompt, agent_mode: "system"
 
-    await agent.run("Read README.md and continue analysing it")
+    await agent.run("Search the internet for PALADYN alternatives and report them")
     assert agent.llm.calls == 1
 
     answer = await agent.run("/stop")
@@ -1237,7 +1713,10 @@ async def test_owner_continuous_authorization_crosses_silent_batch_boundaries(
             self.calls.append(tool)
             if tool == "browser_navigate":
                 return "Opened the antiques marketplace"
-            return "Verified offer: Prussian WWI helmet, seller page inspected"
+            return (
+                "Search result: https://antiques.example/prussian-helmet. "
+                "Verified offer: Prussian WWI helmet, seller page inspected"
+            )
 
     class LLMStub:
         config = SimpleNamespace(context=8_192)
@@ -1253,7 +1732,7 @@ async def test_owner_continuous_authorization_crosses_silent_batch_boundaries(
                         LLMToolCall(
                             "navigate_1",
                             "browser_navigate",
-                            {"url": "https://antiques.example"},
+                            {"url": "https://duckduckgo.com/?q=prussian+wwi+helmet"},
                         )
                     ]
                 )
@@ -1261,6 +1740,22 @@ async def test_owner_continuous_authorization_crosses_silent_batch_boundaries(
                 return LLMResponse(
                     tool_calls=[
                         LLMToolCall("snapshot_1", "browser_snapshot", {})
+                    ]
+                )
+            if self.calls == 3:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "navigate_detail",
+                            "browser_navigate",
+                            {"url": "https://antiques.example/prussian-helmet"},
+                        )
+                    ]
+                )
+            if self.calls == 4:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall("snapshot_detail", "browser_snapshot", {})
                     ]
                 )
             return LLMResponse(
@@ -1300,7 +1795,12 @@ async def test_owner_continuous_authorization_crosses_silent_batch_boundaries(
     assert answer == (
         "I found and inspected a verified Prussian helmet offer, Boss."
     )
-    assert agent.tools.calls == ["browser_navigate", "browser_snapshot"]
+    assert agent.tools.calls == [
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_navigate",
+        "browser_snapshot",
+    ]
     checkpoint = next(
         (agent._agent_trace_root / "checkpoints").glob("*.json")
     )
@@ -1315,10 +1815,13 @@ async def test_owner_continuous_authorization_crosses_silent_batch_boundaries(
 
 
 @pytest.mark.asyncio
-async def test_continuous_task_cannot_override_identical_tool_loop_guard(
+async def test_contract_finalization_blocks_identical_calls_before_continuous_mode(
     tmp_path: Path,
 ) -> None:
     class ToolsStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
         def begin_interaction(self, interaction_id: str, prompt: str) -> None:
             return None
 
@@ -1326,6 +1829,7 @@ async def test_continuous_task_cannot_override_identical_tool_loop_guard(
             return [{"type": "function", "function": {"name": "read_file"}}]
 
         async def call(self, tool: str, arguments: dict) -> str:
+            self.calls += 1
             return "Verified initial content"
 
     class LLMStub:
@@ -1353,9 +1857,10 @@ async def test_continuous_task_cannot_override_identical_tool_loop_guard(
         async def process(self, *args, **kwargs) -> None:
             return None
 
+    tools = ToolsStub()
     agent = object.__new__(Agent)
     agent.llm = LLMStub()
-    agent.tools = ToolsStub()
+    agent.tools = tools
     agent.memory = MemoryStub()
     agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
     agent.capabilities = CapabilityDispatcher()
@@ -1368,21 +1873,22 @@ async def test_continuous_task_cannot_override_identical_tool_loop_guard(
     agent.MAX_AGENT_STEPS = 1
     agent._build_system_prompt = lambda prompt, agent_mode: "system"
 
-    await agent.run("Read README.md and analyse it")
-    answer = await agent.run("/continue --continuous")
+    answer = await agent.run("Read README.md and analyse it")
     await asyncio.gather(*agent._memory_tasks)
 
-    assert "detected execution loop" in answer
-    assert agent.llm.calls == 4
+    assert "I killed that loop" in answer
+    assert "runtime-verified result" in answer
+    assert tools.calls == 1
+    assert agent.llm.calls == 3
     checkpoint = next(
         (agent._agent_trace_root / "checkpoints").glob("*.json")
     )
     payload = json.loads(checkpoint.read_text(encoding="utf-8"))
-    assert payload["status"] == "blocked"
+    assert payload["status"] == "completed"
     journal = (
         agent._agent_trace_root / "journal" / f"{payload['task_id']}.jsonl"
     ).read_text(encoding="utf-8")
-    assert "repeated_tool_loop_detected" in journal
+    assert journal.count("post_contract_tool_call_rejected") == 2
 
 
 @pytest.mark.asyncio
@@ -1464,6 +1970,495 @@ async def test_identical_tool_call_loop_is_rejected_and_paused_early(
         agent._agent_trace_root / "journal" / f"{payload['task_id']}.jsonl"
     ).read_text(encoding="utf-8")
     assert "repeated_tool_loop_detected" in journal
+
+
+@pytest.mark.asyncio
+async def test_direct_url_failure_prevents_alternating_guessed_domains(
+    tmp_path: Path,
+) -> None:
+    urls = (
+        "https://missing-one.invalid",
+        "https://missing-two.invalid",
+    )
+
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {"type": "function", "function": {"name": "browser_navigate"}}
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append(arguments["url"])
+            raise RuntimeError("NS_ERROR_UNKNOWN_HOST")
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            sequence = (urls[0], urls[1], urls[0], urls[1], urls[0], urls[0])
+            url = sequence[min(self.calls, len(sequence) - 1)]
+            self.calls += 1
+            return LLMResponse(
+                tool_calls=[
+                    LLMToolCall(
+                        f"navigate_{self.calls}",
+                        "browser_navigate",
+                        {"url": url},
+                    )
+                ]
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._agent_trace_root = tmp_path / "interactive"
+    agent._last_execution_context = None
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent.MAX_AGENT_STEPS = 10
+
+    answer = await agent._run_agent_loop(
+        "Inspect https://missing-one.invalid and report a verified result"
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert "tried `https://missing-one.invalid` exactly once" in answer
+    assert tools.calls == [urls[0]]
+    assert agent.llm.calls == 1
+    checkpoint = next(
+        (agent._agent_trace_root / "checkpoints").glob("*.json")
+    )
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert len(payload["tool_calls"]) == 1
+    assert payload["tool_calls"][0]["status"] == "failed"
+
+
+def test_browser_request_identity_normalizes_root_slash_and_fragment() -> None:
+    first = Agent._tool_request_identity(
+        "browser_navigate", {"url": "HTTPS://EXAMPLE.COM/"}
+    )
+    second = Agent._tool_request_identity(
+        "browser_navigate", {"url": "https://example.com#section"}
+    )
+
+    assert first == second
+
+
+def test_initial_web_discovery_replaces_unverified_model_domain() -> None:
+    prompt = "Search the internet for a Firecrawl alternative and report it."
+    contract = TaskContract.from_prompt(prompt)
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {"url": "https://invented-marketplace.invalid"},
+        contract,
+        [],
+        [],
+    )
+
+    assert repaired["url"].startswith("https://duckduckgo.com/?q=")
+    assert "Firecrawl" in repaired["url"]
+
+
+def test_spoken_direct_url_replaces_model_search_or_wikipedia_guess() -> None:
+    prompt = (
+        "Otwórz HTTPS, dwukropek, łamane, łamane, this, minus, domain, "
+        "minus, definitely, minus, those, minus, not, minus, exist, "
+        "kropka, invalid. I powiedz co znalazłaś."
+    )
+    target = "https://this-domain-definitely-those-not-exist.invalid"
+    contract = TaskContract.from_prompt(prompt)
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {"url": "https://pl.wikipedia.org/wiki/Dwukropek"},
+        contract,
+        [],
+        [],
+        preferred_target=target,
+    )
+
+    assert repaired == {"url": target}
+
+
+def test_discovery_query_excludes_conditional_artifact_workflow() -> None:
+    prompt = (
+        "V, przeszukaj sieć w celu znalezienia alternatywy dla Firecrawlera. "
+        "Jeżeli nic nie znajdziesz, stwórz własne narzędzie."
+    )
+    contract = TaskContract.from_prompt(prompt)
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {"url": "https://invented.example"},
+        contract,
+        [],
+        [],
+    )
+
+    assert "Firecrawlera" in repaired["url"]
+    assert "Je%C5%BCeli" not in repaired["url"]
+    assert "stw%C3%B3rz" not in repaired["url"]
+
+
+def test_discovery_query_skips_persona_directed_greeting_sentence() -> None:
+    prompt = (
+        "Cześć V, mam dla Ciebie zadanie. "
+        "Znajdź proszę Cię alternatywę dla Firecrawlera. "
+        "Jeżeli nie znajdziesz alternatywy, stwórz podobne narzędzie."
+    )
+    contract = TaskContract.from_prompt(prompt).merged(
+        TaskContract(
+            requires_browser_navigation=True,
+            requires_browser_snapshot=True,
+            requires_web_discovery=True,
+            requires_distinct_detail_page=True,
+            requires_evidence_report=True,
+        )
+    )
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {"url": "https://marketplace.dify.ai"},
+        contract,
+        [],
+        [],
+    )
+
+    assert "Firecrawlera" in repaired["url"]
+    assert "Cze%C5%9B%C4%87" not in repaired["url"]
+    assert "mam+dla+Ciebie+zadanie" not in repaired["url"]
+    assert "Je%C5%BCeli" not in repaired["url"]
+
+
+def test_discovery_query_skips_generic_task_importance_preamble() -> None:
+    prompt = (
+        "Mam dla Ciebie bardzo ważne zadanie. "
+        "Znajdź w sieci alternatywę dla Firecrawlera. "
+        "Jeżeli nie znajdziesz alternatywy, stwórz podobne narzędzie."
+    )
+
+    query = Agent._discovery_search_query(prompt)
+
+    assert query == "Znajdź w sieci alternatywę dla Firecrawlera"
+    assert "ważne zadanie" not in query
+    assert "stwórz" not in query
+
+
+def test_runtime_recovers_public_fact_search_with_new_focused_query() -> None:
+    prompt = (
+        "Sprawdź ile jest w Warszawie cukierni Cud Malina i podaj wszystkie "
+        "adresy oraz numery telefonów."
+    )
+    contract = SemanticIntent(
+        action_requested=True,
+        capabilities=("browser",),
+        requires_report=True,
+    ).to_contract(prompt)
+    successful = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "arguments": {"query": "Cukiernia Cud Malina Warszawa"},
+            "result_excerpt": "Cud malina — tort, cena 120 zł",
+        },
+        {
+            "tool": "web_read",
+            "status": "succeeded",
+            "arguments": {"url": "https://example.test/cud-malina-tort"},
+            "result_excerpt": "Cud malina. Torty. Telefon 698 314 125.",
+        },
+    ]
+    definitions = [
+        {"type": "function", "function": {"name": "web_search"}},
+        {"type": "function", "function": {"name": "web_read"}},
+    ]
+
+    recovered = Agent._public_fact_recovery_request(
+        prompt,
+        contract,
+        successful,
+        definitions,
+        preferred_query="Cukiernie Cud Malina w Warszawie",
+    )
+
+    assert recovered is not None
+    assert recovered[0] == "web_search"
+    assert recovered[1]["max_results"] == 10
+    assert "address" in recovered[1]["query"]
+    assert "Cud Malina" in recovered[1]["query"]
+    assert recovered[1]["query"] != "Cukiernia Cud Malina Warszawa"
+
+
+def test_public_fact_recovery_does_not_repeat_exhausted_queries() -> None:
+    prompt = "Find the address and phone number for Acme Bakery."
+    contract = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+        requires_evidence_report=True,
+        required_public_fields=("address", "contact"),
+    )
+    definitions = [
+        {"type": "function", "function": {"name": "web_search"}},
+    ]
+    variants = (
+        "Acme Bakery address phone contact",
+        '"Acme Bakery" address phone contact official',
+        '"Acme Bakery" address phone contact business directory',
+        '"Acme Bakery" address phone contact map listing',
+    )
+    successful = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "arguments": {"query": query},
+            "result_excerpt": "No verified address in these results.",
+        }
+        for query in variants
+    ]
+
+    recovered = Agent._public_fact_recovery_request(
+        prompt,
+        contract,
+        successful,
+        definitions,
+        preferred_query="Acme Bakery",
+    )
+
+    assert recovered is None
+
+
+def test_semantic_web_query_overrides_model_search_query() -> None:
+    prompt = "Bonjour V. Trouve une alternative à Firecrawler."
+    contract = TaskContract.from_prompt(prompt).merged(
+        TaskContract(
+            requires_browser_navigation=True,
+            requires_browser_snapshot=True,
+            requires_web_discovery=True,
+        )
+    )
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {"url": "https://duckduckgo.com/?q=Bonjour+V"},
+        contract,
+        [],
+        [],
+        preferred_query="alternative à Firecrawler",
+    )
+
+    assert repaired["url"] == (
+        "https://duckduckgo.com/?q=alternative+%C3%A0+Firecrawler"
+    )
+
+
+def test_model_copied_detail_url_is_repaired_from_search_evidence() -> None:
+    prompt = "Znajdź w internecie alternatywę dla Firecrawlera."
+    contract = TaskContract.from_prompt(prompt)
+    successful = [
+        {
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "arguments": {"url": "https://duckduckgo.com/?q=firecrawler"},
+        },
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "arguments": {},
+            "result_excerpt": (
+                "Result URL: https://thunderbit.com/pl/blog/"
+                "open-source-firecrawl-alternatives\n"
+                "Another: https://www.minibase.md/pl/blog/firecrawl-alternatives/"
+            ),
+        },
+    ]
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {
+            "url": (
+                "https://thunderbit.com/pl/blog/"
+                "open-source_firecrawl_alternatives"
+            )
+        },
+        contract,
+        successful,
+        [],
+    )
+
+    assert repaired["url"] == (
+        "https://thunderbit.com/pl/blog/open-source-firecrawl-alternatives"
+    )
+
+
+def test_model_corrupted_hostname_is_repaired_from_high_level_search_evidence() -> None:
+    prompt = "Znajdź adres i godziny otwarcia cukierni Miód Malina."
+    contract = TaskContract.from_prompt(prompt).merged(
+        TaskContract(
+            requires_browser_navigation=True,
+            requires_browser_snapshot=True,
+            requires_web_discovery=True,
+            requires_distinct_detail_page=True,
+        )
+    )
+    official = "https://warszawa.miodmalina.eu/kontakt/"
+    successful = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "arguments": {"query": "Miód Malina Warszawa"},
+            "result_excerpt": json.dumps(
+                {"results": [{"title": "Kontakt", "url": official}]}
+            ),
+        }
+    ]
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {"url": "https://warszawa.miodmalina e_u/kontakt/"},
+        contract,
+        successful,
+        [],
+    )
+
+    assert repaired["url"] == official
+
+
+def test_unobserved_detail_url_returns_to_grounded_search() -> None:
+    prompt = (
+        "Mam dla Ciebie bardzo ważne zadanie. "
+        "Znajdź w sieci alternatywę dla Firecrawlera."
+    )
+    contract = TaskContract.from_prompt(prompt)
+    successful = [
+        {
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "arguments": {
+                "url": "https://duckduckgo.com/?q=Firecrawler+alternative"
+            },
+        },
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "arguments": {},
+            "result_excerpt": (
+                "Result URL: https://example.org/real-firecrawl-alternative"
+            ),
+        },
+    ]
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {"url": "https://github.com/firecrawlers/firecrawler"},
+        contract,
+        successful,
+        [],
+    )
+
+    assert repaired["url"] == (
+        "https://duckduckgo.com/?q="
+        "Znajd%C5%BA+w+sieci+alternatyw%C4%99+dla+Firecrawlera"
+    )
+
+
+def test_long_single_sentence_query_focuses_on_repeated_product() -> None:
+    prompt = (
+        "Cześć V, słuchaj mam dla Ciebie takie zadanko małe, weź proszę Cię "
+        "znajdź alternatywę dla Firecrawlera i jeżeli nie uda Ci się znaleźć "
+        "dla niego alternatywy darmowej, spróbuj stworzyć narzędzie podobne "
+        "do Firecrawlera."
+    )
+
+    query = Agent._discovery_search_query(prompt)
+
+    assert query == "znajdź alternatywę dla Firecrawlera"
+    assert "zadanko" not in query
+    assert "stworzyć" not in query
+
+
+def test_failed_direct_navigation_falls_back_to_duckduckgo() -> None:
+    prompt = "Inspect https://missing.invalid and report the result."
+    contract = TaskContract.from_prompt(prompt)
+    failure = {
+        "tool": "browser_navigate",
+        "status": "failed",
+        "arguments": {"url": "https://missing.invalid"},
+    }
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {"url": "https://another-invented.invalid"},
+        contract,
+        [],
+        [failure],
+    )
+
+    assert repaired["url"].startswith("https://duckduckgo.com/?q=")
+
+
+def test_discovery_never_returns_to_google_after_successful_duckduckgo() -> None:
+    prompt = "Search the internet for a Firecrawl alternative."
+    contract = TaskContract.from_prompt(prompt)
+    success = {
+        "tool": "browser_navigate",
+        "status": "succeeded",
+        "arguments": {"url": "https://duckduckgo.com/?q=firecrawl"},
+    }
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {"url": "https://www.google.com/search?q=firecrawler+alternative"},
+        contract,
+        [success],
+        [],
+    )
+
+    assert repaired["url"] == (
+        "https://duckduckgo.com/?q=firecrawler+alternative"
+    )
+
+
+def test_owner_supplied_google_url_is_not_rewritten_without_failure() -> None:
+    prompt = "Inspect https://www.google.com and report its title."
+    contract = TaskContract.from_prompt(prompt)
+
+    unchanged = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {"url": "https://www.google.com"},
+        contract,
+        [],
+        [],
+    )
+
+    assert unchanged == {"url": "https://www.google.com"}
 
 
 @pytest.mark.asyncio
@@ -1669,6 +2664,7 @@ async def test_llm_respond_preserves_native_tool_calls() -> None:
     )
 
     assert completions.request["tools"] == definitions
+    assert completions.request["parallel_tool_calls"] is False
     assert response.content == ""
     assert response.finish_reason == "tool_calls"
     assert response.tool_calls == [
@@ -1678,6 +2674,236 @@ async def test_llm_respond_preserves_native_tool_calls() -> None:
             arguments={"path": "README.md"},
             raw_arguments='{"path":"README.md"}',
         )
+    ]
+    assert response.native_tools_enabled is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"name":"read_file","arguments":{"path":"README.md"}}',
+        (
+            '<tool_call>\n{"name":"read_file","arguments":'
+            '{"path":"README.md"}}\n</tool_call>'
+        ),
+    ],
+)
+async def test_llm_promotes_exact_allowed_textual_tool_call(content: str) -> None:
+    class CompletionsStub:
+        async def create(self, **kwargs):
+            message = SimpleNamespace(content=content, tool_calls=[])
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message, finish_reason="stop")]
+            )
+
+    llm = object.__new__(LLM)
+    llm.config = SimpleNamespace(model="local", temperature=0.2, top_p=0.9)
+    llm.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=CompletionsStub())
+    )
+    llm._native_tools_supported = None
+    response = await llm.respond(
+        messages=[{"role": "user", "content": "Read README"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    )
+
+    assert response.content == ""
+    assert response.native_tools_enabled is False
+    assert response.tool_calls == [
+        LLMToolCall(
+            call_id="compatibility_call_1",
+            name="read_file",
+            arguments={"path": "README.md"},
+            raw_arguments='{"path":"README.md"}',
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        '<tool_call>{"name":"read_file","arguments":{}}',
+        '{"name":"browser_navigate","arguments":{"url":"https://example.com"}}',
+        (
+            'Explanation first. <tool_call>{"name":"read_file",'
+            '"arguments":{"path":"README.md"}}</tool_call>'
+        ),
+    ],
+)
+async def test_llm_rejects_incomplete_unlisted_or_narrated_textual_call(
+    content: str,
+) -> None:
+    class CompletionsStub:
+        async def create(self, **kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=content, tool_calls=[]),
+                        finish_reason="stop",
+                    )
+                ]
+            )
+
+    llm = object.__new__(LLM)
+    llm.config = SimpleNamespace(model="local", temperature=0.2, top_p=0.9)
+    llm.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=CompletionsStub())
+    )
+    llm._native_tools_supported = None
+    response = await llm.respond(
+        messages=[{"role": "user", "content": "Read README"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    )
+
+    assert response.content == content
+    assert response.tool_calls == []
+
+
+@pytest.mark.asyncio
+async def test_llm_gives_local_artifact_generation_a_longer_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CompletionsStub:
+        def __init__(self) -> None:
+            self.request: dict = {}
+
+        async def create(self, **kwargs):
+            self.request = kwargs
+            message = SimpleNamespace(content="done", tool_calls=[])
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message, finish_reason="stop")]
+            )
+
+    monkeypatch.setenv("V_CORE_TIMEOUT", "120")
+    monkeypatch.setenv("V_CORE_ARTIFACT_TIMEOUT", "900")
+    completions = CompletionsStub()
+    llm = object.__new__(LLM)
+    llm.config = SimpleNamespace(model="local", temperature=0.2, top_p=0.9)
+    llm.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    llm._native_tools_supported = None
+
+    await llm.respond(
+        messages=[{"role": "user", "content": "Create a tool"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "learning_create_tool",
+                    "description": "Create a tool",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    )
+
+    assert completions.request["timeout"] == 900.0
+
+
+def test_agent_narrows_mixed_task_to_tool_creation_after_browser_evidence() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": name}}
+        for name in (
+            "browser_navigate",
+            "browser_snapshot",
+            "learning_list_artifacts",
+            "learning_create_tool",
+        )
+    ]
+    contract = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+        requires_created_tool=True,
+        requires_created_tool_execution=True,
+    )
+    calls = [
+        {"tool": "browser_navigate", "status": "succeeded"},
+        {"tool": "browser_snapshot", "status": "succeeded"},
+    ]
+
+    selected = Agent._phase_tool_definitions(contract, definitions, calls)
+
+    assert {item["function"]["name"] for item in selected} == {
+        "learning_create_tool",
+    }
+
+
+def test_agent_narrows_post_creation_phase_to_generated_tool() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": name}}
+        for name in (
+            "browser_snapshot",
+            "learning_create_tool",
+            "extract_book_cards",
+        )
+    ]
+    contract = TaskContract(
+        requires_created_tool=True,
+        requires_created_tool_execution=True,
+    )
+    calls = [
+        {
+            "tool": "learning_create_tool",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {"name": "extract_book_cards", "status": "active"}
+            ),
+        }
+    ]
+
+    selected = Agent._phase_tool_definitions(contract, definitions, calls)
+
+    assert [item["function"]["name"] for item in selected] == [
+        "extract_book_cards"
+    ]
+
+
+def test_agent_narrows_post_template_creation_to_generated_tool() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": name}}
+        for name in (
+            "browser_snapshot",
+            "learning_create_snapshot_extractor",
+            "extract_book_cards",
+        )
+    ]
+    contract = TaskContract(
+        requires_created_tool=True,
+        requires_created_tool_execution=True,
+    )
+    calls = [
+        {
+            "tool": "learning_create_snapshot_extractor",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {"name": "extract_book_cards", "status": "active"}
+            ),
+        }
+    ]
+
+    selected = Agent._phase_tool_definitions(contract, definitions, calls)
+
+    assert [item["function"]["name"] for item in selected] == [
+        "extract_book_cards"
     ]
 
 
@@ -1726,10 +2952,9 @@ async def test_llm_respond_falls_back_when_template_rejects_tools() -> None:
     assert "tools" in completions.requests[0]
     assert "tools" not in completions.requests[1]
     assert llm._native_tools_supported is False
-    assert Agent._parse_tool_request(response.content) == (
-        "read_file",
-        {"path": "README.md"},
-    )
+    assert response.content == ""
+    assert response.tool_calls[0].name == "read_file"
+    assert response.tool_calls[0].arguments == {"path": "README.md"}
 
 
 @pytest.mark.asyncio
@@ -1790,13 +3015,16 @@ async def test_llm_retries_malformed_native_tool_arguments_as_compact_json() -> 
     assert "tools" in completions.requests[0]
     assert "tools" not in completions.requests[1]
     assert completions.requests[1]["temperature"] == 0.1
-    assert "malformed or truncated JSON" in completions.requests[1]["messages"][-1]["content"]
+    repair_prompt = completions.requests[1]["messages"][-1]["content"]
+    assert "malformed or truncated JSON" in repair_prompt
+    assert '"<required_field>":"<schema_value>"' in repair_prompt
+    assert "every required field" in repair_prompt
+    assert '"arguments":{}' not in repair_prompt
     assert llm._native_tools_supported is None
     assert response.native_tools_enabled is False
-    assert Agent._parse_tool_request(response.content) == (
-        "browser_navigate",
-        {"url": "https://example.com"},
-    )
+    assert response.content == ""
+    assert response.tool_calls[0].name == "browser_navigate"
+    assert response.tool_calls[0].arguments == {"url": "https://example.com"}
 
 
 @pytest.mark.asyncio
@@ -1895,6 +3123,28 @@ def test_unclear_action_does_not_expose_the_entire_tool_catalog() -> None:
     assert selected == []
 
 
+def test_runtime_log_review_exposes_only_read_only_auditor() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": name}}
+        for name in (
+            "runtime_review_task",
+            "browser_navigate",
+            "read_file",
+            "learning_record_evidence",
+            "learning_create_tool",
+        )
+    ]
+    prompt = "Przeanalizuj swoje logi z ostatniej sesji i pokaż błędy."
+    contract = TaskContract.from_prompt(prompt)
+
+    selected = Agent._select_tool_definitions(prompt, contract, definitions)
+
+    assert [item["function"]["name"] for item in selected] == [
+        "runtime_review_task"
+    ]
+    assert Agent._requests_runtime_action(prompt, contract) is True
+
+
 def test_polish_w_internecie_action_gets_only_web_related_schemas() -> None:
     definitions = [
         {"type": "function", "function": {"name": name}}
@@ -1902,6 +3152,7 @@ def test_polish_w_internecie_action_gets_only_web_related_schemas() -> None:
             "browser_navigate",
             "browser_snapshot",
             "browser_click",
+            "browser_type",
             "read_file",
             "sandbox_execute_offline",
             "evm_validate_oracle",
@@ -1920,8 +3171,31 @@ def test_polish_w_internecie_action_gets_only_web_related_schemas() -> None:
     assert {item["function"]["name"] for item in selected} == {
         "browser_navigate",
         "browser_snapshot",
-        "browser_click",
     }
+
+
+def test_explicit_web_address_keeps_interactive_browser_controls() -> None:
+    names = (
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_click",
+        "browser_find",
+        "browser_press_key",
+        "browser_type",
+    )
+    definitions = [
+        {"type": "function", "function": {"name": name}}
+        for name in names
+    ]
+    prompt = "Open https://example.com, use its search form, and report the result."
+
+    selected = Agent._select_tool_definitions(
+        prompt,
+        TaskContract.from_prompt(prompt),
+        definitions,
+    )
+
+    assert {item["function"]["name"] for item in selected} == set(names)
 
 
 @pytest.mark.parametrize(
@@ -2039,6 +3313,78 @@ def test_spoken_tool_name_typo_uniquely_selects_existing_tool() -> None:
     assert Agent._explicitly_named_tools(prompt, definitions) == ["count_words"]
 
 
+def test_descriptive_browser_snapshot_phrase_is_not_an_explicit_tool_call() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": "browser_snapshot"}},
+        {"type": "function", "function": {"name": "learning_create_tool"}},
+    ]
+    prompt = (
+        "Create an offline tool that accepts the observed browser snapshot "
+        "text, then use the newly created tool on that data."
+    )
+
+    assert Agent._explicitly_named_tools(prompt, definitions) == []
+
+
+def test_snapshot_extraction_creation_selects_deterministic_builder() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": "browser_navigate"}},
+        {"type": "function", "function": {"name": "browser_snapshot"}},
+        {"type": "function", "function": {"name": "learning_create_tool"}},
+        {
+            "type": "function",
+            "function": {"name": "learning_create_snapshot_extractor"},
+        },
+        {"type": "function", "function": {"name": "learning_list_artifacts"}},
+    ]
+    prompt = (
+        "Visit https://books.toscrape.com/, inspect the listing, then create an "
+        "offline tool named extract_book_cards for the observed browser snapshot "
+        "text and use it."
+    )
+    contract = TaskContract.from_prompt(prompt)
+
+    selected = Agent._select_tool_definitions(prompt, contract, definitions)
+
+    assert "learning_create_snapshot_extractor" in {
+        item["function"]["name"] for item in selected
+    }
+    assert "learning_create_tool" not in {
+        item["function"]["name"] for item in selected
+    }
+
+
+def test_generated_snapshot_tool_receives_runtime_observation() -> None:
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "extract_book_cards",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"snapshot_text": {"type": "string"}},
+                    "required": ["snapshot_text"],
+                },
+            },
+        }
+    ]
+    created = {
+        "tool": "learning_create_snapshot_extractor",
+        "status": "succeeded",
+        "result_excerpt": '{"name":"extract_book_cards","status":"active"}',
+    }
+
+    repaired = Agent._repair_observed_snapshot_input(
+        "extract_book_cards",
+        {"snapshot_text": "model-corrupted copy"},
+        definitions,
+        [created],
+        "runtime-observed snapshot",
+    )
+
+    assert repaired == {"snapshot_text": "runtime-observed snapshot"}
+
+
 def test_ambiguous_spoken_tool_name_does_not_guess() -> None:
     definitions = [
         {"type": "function", "function": {"name": "count_words"}},
@@ -2106,6 +3452,202 @@ def test_argument_repair_does_not_guess_multiple_required_fields() -> None:
     ) == {}
 
 
+def test_structured_literal_assignments_preserve_repeated_json_exactly() -> None:
+    first_url = "http://abcdefghijklmnopabcdefghijklmnopabcdefghijklmnopabcd.onion/a"
+    second_url = "http://zyxwvutsrqponmlkzyxwvutsrqponmlkzyxwvutsrqponmlkzyxw.onion/b"
+    prompt = (
+        f'observations = [{{"url":"{first_url}","text":"escrow"}}]\n'
+        'keywords = ["escrow", "bitcoin"]\n'
+        f'observations = [{{"url":"{second_url}","text":"wallet"}}]\n'
+        'keywords = ["ransomware", "wallet"]'
+    )
+
+    assignments = Agent._structured_literal_assignments(prompt)
+
+    assert assignments["observations"] == [
+        [{"url": first_url, "text": "escrow"}],
+        [{"url": second_url, "text": "wallet"}],
+    ]
+    assert assignments["keywords"] == [
+        ["escrow", "bitcoin"],
+        ["ransomware", "wallet"],
+    ]
+
+
+def test_tool_creation_grounds_first_fixture_without_domain_patch() -> None:
+    prompt = (
+        'records = [{"url":"http://aaaaaaaaaaaaaaaa.onion/a?x=1",'
+        '"text":"escrow"}]\n'
+        'keywords = ["escrow"]\n'
+        'expected = {"records":[{"url":"http://aaaaaaaaaaaaaaaa.onion/a"}]}\n'
+        'records = [{"url":"http://bbbbbbbbbbbbbbbb.onion/b",'
+        '"text":"wallet"}]\n'
+        'keywords = ["wallet"]\n'
+        'expected = {"records":[{"url":"http://bbbbbbbbbbbbbbbb.onion/b"}]}'
+    )
+    arguments = {
+        "name": "index_observations",
+        "description": "Index supplied observations.",
+        "source": (
+            "def run(arguments):\n"
+            "    records = arguments.get('records', [])\n"
+            "    keywords = arguments['keywords']\n"
+            "    return {'records': records, 'keywords': keywords}"
+        ),
+        "test": {
+            "name": "fixture",
+            "arguments": {
+                "records": [{"url": "model corrupted", "text": "escrow"}],
+                "keywords": ["wrong"],
+            },
+            "expected": {"records": [], "keywords": []},
+        },
+    }
+
+    repaired = Agent._repair_grounded_generated_tool_arguments(
+        prompt,
+        "learning_create_tool",
+        arguments,
+        [],
+        [],
+    )
+
+    assert repaired["test"]["arguments"] == {
+        "records": [
+            {
+                "url": "http://aaaaaaaaaaaaaaaa.onion/a?x=1",
+                "text": "escrow",
+            }
+        ],
+        "keywords": ["escrow"],
+    }
+    assert repaired["test"]["expected"] == {
+        "records": [{"url": "http://aaaaaaaaaaaaaaaa.onion/a"}]
+    }
+    assert arguments["test"]["arguments"]["records"][0]["url"] == "model corrupted"
+
+
+def test_tool_creation_can_ground_empty_fixture_from_source_accesses() -> None:
+    prompt = 'items = [{"value": 3}]\nmultiplier = 2'
+    arguments = {
+        "name": "multiply_items",
+        "description": "Multiply item values.",
+        "source": (
+            "def run(arguments):\n"
+            "    items = arguments.get(\"items\", [])\n"
+            "    multiplier = arguments.get(\"multiplier\", 1)\n"
+            "    return {'values': [x['value'] * multiplier for x in items]}"
+        ),
+        "test": {
+            "name": "fixture",
+            "arguments": {},
+            "expected": {"values": [6]},
+        },
+    }
+
+    repaired = Agent._repair_grounded_generated_tool_arguments(
+        prompt,
+        "learning_create_tool",
+        arguments,
+        [],
+        [],
+    )
+
+    assert repaired["test"]["arguments"] == {
+        "items": [{"value": 3}],
+        "multiplier": 2,
+    }
+
+
+def test_tool_creation_repairs_expected_when_arguments_are_already_exact() -> None:
+    arguments = {
+        "name": "sum_values",
+        "description": "Sum supplied values.",
+        "source": (
+            "def run(arguments):\n"
+            "    return {'total': sum(arguments['values'])}"
+        ),
+        "test": {
+            "name": "fixture",
+            "arguments": {"values": [1, 2, 3]},
+            "expected": {"total": 999},
+        },
+    }
+
+    repaired = Agent._repair_grounded_generated_tool_arguments(
+        'values = [1,2,3]\nexpected = {"total":6}',
+        "learning_create_tool",
+        arguments,
+        [],
+        [],
+    )
+
+    assert repaired["test"] == {
+        "name": "fixture",
+        "arguments": {"values": [1, 2, 3]},
+        "expected": {"total": 6},
+    }
+
+
+def test_new_generated_tool_grounds_last_fixture_from_runtime_schema() -> None:
+    prompt = (
+        'records = [{"value": 1}]\nkeywords = ["first"]\n'
+        'records = [{"value": 2}]\nkeywords = ["second"]'
+    )
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "index_observations",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "records": {"type": "array"},
+                        "keywords": {"type": "array"},
+                    },
+                    "required": ["records", "keywords"],
+                },
+            },
+        }
+    ]
+    created = [
+        {
+            "tool": "learning_create_tool",
+            "status": "succeeded",
+            "result_excerpt": (
+                '{"name":"index_observations","status":"active"}'
+            ),
+        }
+    ]
+
+    repaired = Agent._repair_grounded_generated_tool_arguments(
+        prompt,
+        "index_observations",
+        {"records": [], "keywords": []},
+        definitions,
+        created,
+    )
+
+    assert repaired == {
+        "records": [{"value": 2}],
+        "keywords": ["second"],
+    }
+
+
+def test_structured_literal_repair_leaves_unrelated_tools_unchanged() -> None:
+    arguments = {"query": "model-selected"}
+
+    repaired = Agent._repair_grounded_generated_tool_arguments(
+        'query = "owner literal"',
+        "web_search",
+        arguments,
+        [],
+        [],
+    )
+
+    assert repaired is arguments
+
+
 @pytest.mark.parametrize(
     "prompt",
     [
@@ -2113,8 +3655,11 @@ def test_argument_repair_does_not_guess_multiple_required_fields() -> None:
         "No to dawaj.",
         "Dobrze, przyjacielu, w takim razie do dzieła.",
         "Spróbuj jeszcze raz, tylko użyj odpowiedniego narzędzia.",
+        "Jeżeli brakuje Ci do wykonania zadania narzędzia, to je stwórz.",
+        "Jeżeli brakuje Ci do wykonania zadania narzędzia, to jest tłuszcz.",
         "Go ahead.",
         "Try again using the proper tool.",
+        "If the task is missing a tool, create it.",
     ],
 )
 def test_agent_recognizes_short_continuation_requests(prompt: str) -> None:
@@ -2131,6 +3676,481 @@ def test_agent_recognizes_short_continuation_requests(prompt: str) -> None:
 )
 def test_agent_does_not_treat_ordinary_conversation_as_continuation(prompt: str) -> None:
     assert not Agent._is_continuation_request(prompt)
+
+
+def test_agent_mode_prompt_contains_only_selected_executable_tools() -> None:
+    agent = object.__new__(Agent)
+    prompt = agent._agent_mode_prompt(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "browser_navigate",
+                    "description": "Navigate to a URL.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"url": {"type": "string"}},
+                        "required": ["url"],
+                    },
+                },
+            }
+        ]
+    )
+
+    assert '"name":"browser_navigate"' in prompt
+    assert '"required":["url"]' in prompt
+    assert '"<required_field>": "<schema_value>"' in prompt
+    assert '"arguments": {}' not in prompt
+    assert "learning_record_evidence" not in prompt
+    assert "learning_create_tool may be used" not in prompt
+
+
+def test_agent_mode_prompt_exposes_owner_privileged_generated_code() -> None:
+    agent = object.__new__(Agent)
+    prompt = agent._agent_mode_prompt(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "learning_create_tool",
+                    "description": (
+                        "OWNER LAB: generated code may use arbitrary Python imports, "
+                        "dynamic code, subprocesses, and file operations inside the "
+                        "isolated sandbox."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
+            }
+        ]
+    )
+
+    assert "OWNER LAB is active" in prompt
+    assert "subprocesses" in prompt
+    assert "client restricted-source policy" not in prompt
+
+
+def test_browser_http_error_is_not_counted_as_successful_evidence() -> None:
+    assert Agent._tool_result_error(
+        "Page URL: https://example.com/missing\nHTTP status: 404",
+        tool="browser_navigate",
+    ) == "BrowserHTTPError: page returned HTTP status 404"
+
+
+def test_research_about_tools_does_not_expose_learning_lifecycle() -> None:
+    names = (
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_find",
+        "learning_create_tool",
+        "learning_record_evidence",
+        "learning_propose_lesson",
+        "learning_list_artifacts",
+    )
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": name,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for name in names
+    ]
+    contract = TaskContract.from_prompt(
+        "Sprawdź stronę marketplace i powiedz, jakie narzędzia są użyteczne."
+    )
+
+    selected = Agent._select_tool_definitions(
+        "Sprawdź stronę marketplace i powiedz, jakie narzędzia są użyteczne.",
+        contract,
+        definitions,
+        capability_hints={"browser"},
+    )
+    selected_names = {item["function"]["name"] for item in selected}
+
+    assert selected_names == {
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_find",
+    }
+
+
+def test_learning_creation_receives_larger_generation_budget() -> None:
+    definitions = [
+        {
+            "type": "function",
+            "function": {"name": "learning_create_tool"},
+        }
+    ]
+
+    assert Agent._agent_generation_budget(
+        definitions,
+        context_tokens=12_000,
+    ) == 3_000
+    assert Agent._agent_generation_budget([], context_tokens=12_000) == 512
+
+
+@pytest.mark.asyncio
+async def test_generic_find_information_action_uses_semantic_browser_route(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": name,
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+                for name in (
+                    "browser_navigate",
+                    "browser_snapshot",
+                    "learning_record_evidence",
+                )
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append(tool)
+            if tool == "browser_navigate":
+                return "Navigated to a public search result"
+            return (
+                "Result URL: https://example.com/public-profile. "
+                "Verified public search result"
+            )
+
+    class IntentRouterStub:
+        def __init__(self) -> None:
+            self.called = False
+
+        async def classify(self, prompt: str, **kwargs) -> SemanticIntent:
+            self.called = True
+            return SemanticIntent(
+                action_requested=True,
+                capabilities=("browser",),
+                requires_report=True,
+            )
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            offered = {
+                item["function"]["name"] for item in (kwargs.get("tools") or [])
+            }
+            if self.turn <= 4:
+                assert offered == {"browser_navigate", "browser_snapshot"}
+            else:
+                assert offered == set()
+            assert "learning_record_evidence" not in kwargs["messages"][0]["content"]
+            if self.turn == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "navigate",
+                            "browser_navigate",
+                            {"url": "https://example.com/search?q=public"},
+                        )
+                    ]
+                )
+            if self.turn == 2:
+                return LLMResponse(
+                    tool_calls=[LLMToolCall("snapshot", "browser_snapshot", {})]
+                )
+            if self.turn == 3:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "navigate_detail",
+                            "browser_navigate",
+                            {"url": "https://example.com/public-profile"},
+                        )
+                    ]
+                )
+            if self.turn == 4:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall("snapshot_detail", "browser_snapshot", {})
+                    ]
+                )
+            return LLMResponse(content="I found one verified public result, Boss.")
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    router = IntentRouterStub()
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.intent_router = router
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.context_window = ContextWindowManager()
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = None
+    agent._memory_tasks = set()
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop(
+        "V, znajdź mi wszystkie informacje, jakie zdołasz, na temat tej osoby."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert router.called is True
+    assert tools.calls == [
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_navigate",
+        "browser_snapshot",
+    ]
+    assert answer == "I found one verified public result, Boss."
+
+
+@pytest.mark.asyncio
+async def test_business_hours_lookup_recovers_after_false_chat_intent(
+    tmp_path: Path,
+) -> None:
+    prompt = (
+        "Cześć mi. Słuchaj, sprawdź mi ile w Warszawie jest cukierni "
+        "Cud Malina i sprawdź mi również godziny otwarcia. "
+        "I sprawdź mi również gdzie. Podaj mi tylko sprawdzone informacje."
+    )
+
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": name,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query" if name == "web_search" else "url": {
+                                    "type": "string"
+                                }
+                            },
+                        },
+                    },
+                }
+                for name in ("web_search", "web_read")
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            if tool == "web_search":
+                return json.dumps(
+                    {
+                        "query": arguments["query"],
+                        "engine": "duckduckgo",
+                        "results": [
+                            {
+                                "title": "Cud Malina Warsaw",
+                                "url": "https://example.com/cud-malina",
+                            }
+                        ],
+                    }
+                )
+            return json.dumps(
+                {
+                    "url": "https://example.com/cud-malina",
+                    "title": "Cud Malina Warsaw",
+                    "content": "Cud Malina. Address: Warsaw. Hours: 09:00-18:00.",
+                }
+            )
+
+    class IntentRouterStub:
+        async def classify(self, prompt: str, **kwargs):
+            return None
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            offered = {
+                item["function"]["name"] for item in (kwargs.get("tools") or [])
+            }
+            if self.turn == 1:
+                assert offered == {"web_search", "web_read"}
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "search",
+                            "web_search",
+                            {"query": "Cud Malina Warszawa godziny otwarcia"},
+                        )
+                    ]
+                )
+            if self.turn == 2:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "read",
+                            "web_read",
+                            {"url": "https://example.com/cud-malina"},
+                        )
+                    ]
+                )
+            return LLMResponse(
+                content=(
+                    "One verified Cud Malina location, Boss: Warsaw, "
+                    "open 09:00-18:00. Source: https://example.com/cud-malina"
+                )
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.intent_router = IntentRouterStub()
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.context_window = ContextWindowManager()
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = None
+    agent._memory_tasks = set()
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop(prompt)
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert [name for name, _ in tools.calls] == ["web_search", "web_read"]
+    assert "open 09:00-18:00" in answer
+
+
+@pytest.mark.asyncio
+async def test_explicit_existing_tool_overrides_semantic_creation_guess(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "count_words",
+                        "description": "Count words.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                            "required": ["text"],
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "learning_create_tool",
+                        "description": "Create a tool.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            return '{"word_count": 6}'
+
+    class IntentRouterStub:
+        async def classify(self, prompt: str, **kwargs) -> SemanticIntent:
+            return SemanticIntent(
+                action_requested=True,
+                capabilities=("learning_tool",),
+            )
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            offered = [
+                item["function"]["name"] for item in (kwargs.get("tools") or [])
+            ]
+            assert offered == (["count_words"] if self.turn == 1 else [])
+            assert "learning_create_tool" not in kwargs["messages"][0]["content"]
+            if self.turn == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "count",
+                            "count_words",
+                            {"text": "V umie robić swoje własne narzędzia."},
+                        )
+                    ]
+                )
+            return LLMResponse(content="The sentence has six words.")
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.intent_router = IntentRouterStub()
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.context_window = ContextWindowManager()
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = None
+    agent._memory_tasks = set()
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop(
+        "Użyj narzędzia CANT WORDS na zdaniu V umie robić swoje własne narzędzia."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert tools.calls == [
+        (
+            "count_words",
+            {"text": "V umie robić swoje własne narzędzia."},
+        )
+    ]
+    assert answer == "The sentence has six words."
 
 
 def test_latest_action_context_skips_empty_follow_up_checkpoint(tmp_path: Path) -> None:
@@ -2264,8 +4284,9 @@ async def test_agent_continuation_inherits_browser_contract_and_tool_routing(
     ]
     assert all(
         {"browser_navigate", "browser_snapshot"}.issubset(names)
-        for names in llm.offered_tools
+        for names in llm.offered_tools[:-1]
     )
+    assert llm.offered_tools[-1] == set()
     checkpoint = AgentTaskTrace.latest_context(tmp_path)
     assert checkpoint is not None
     assert checkpoint["requirements"]["requires_browser_navigation"] is True
@@ -2379,10 +4400,11 @@ async def test_agent_uses_semantic_browser_intent_for_hungarian_request(
     await asyncio.gather(*agent._memory_tasks)
 
     assert "Example Domain" in answer
-    assert tools.calls == [
-        ("browser_navigate", {"url": "https://example.com"}),
-        ("browser_snapshot", {}),
-    ]
+    assert tools.calls[0][0] == "browser_navigate"
+    assert tools.calls[0][1]["url"].startswith(
+        "https://duckduckgo.com/?q=Keress+az+interneten"
+    )
+    assert tools.calls[1] == ("browser_snapshot", {})
     assert all(
         names == {"browser_navigate", "browser_snapshot"}
         for names in llm.offered_tools
@@ -2448,7 +4470,10 @@ async def test_agent_rolls_context_and_continues_with_runtime_evidence(
                     ],
                     native_tools_enabled=True,
                 )
-            assert "PALADYN context rollover capsule" in kwargs["messages"][-1]["content"]
+            assert any(
+                "PALADYN context rollover capsule" in str(message.get("content", ""))
+                for message in kwargs["messages"]
+            )
             return LLMResponse(
                 content=(
                     "I checked the damn page. The verified snapshot contains "
@@ -2497,7 +4522,9 @@ async def test_agent_rolls_context_and_continues_with_runtime_evidence(
 
     assert "AlphaSignal" in answer
     assert tools.calls == ["browser_navigate", "browser_snapshot"]
-    assert llm.summary_calls >= 1
+    # Routine context bookkeeping belongs to PALADYN's deterministic runtime,
+    # not to an extra local-model generation between every tool call.
+    assert llm.summary_calls == 0
     checkpoint_path = next((tmp_path / "checkpoints").glob("*.json"))
     checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
     assert checkpoint["status"] == "completed"
@@ -2626,6 +4653,222 @@ async def test_non_action_conversation_skips_tool_schema_discovery() -> None:
     assert "not hijack" in answer
 
 
+@pytest.mark.asyncio
+async def test_stale_subject_classification_asks_for_repeat_without_guessing(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def begin_interaction(self, interaction_id: str, prompt: str) -> None:
+            return None
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            raise AssertionError("unclear input must not discover tools")
+
+    class LLMStub:
+        config = SimpleNamespace(context=12_000)
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            raise AssertionError("unclear input must not reach answer generation")
+
+    class RouterStub:
+        last_response = json.dumps(
+            {
+                "public_subject": "Cukiernia Cud Malina",
+                "web_query": "Cukiernia Cud Malina",
+            }
+        )
+        last_failure_reason = "current_message_grounding"
+
+        async def classify(self, prompt: str, **kwargs) -> None:
+            return None
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.intent_router = RouterStub()
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = {
+        "objective": "Find Cukiernia Cud Malina",
+        "status": "completed",
+        "requirements": {},
+    }
+    visible: list[str] = []
+
+    answer = await agent._run_agent_loop(
+        "Dupin i kamień i szupa.",
+        visible.append,
+    )
+
+    assert "brain just throw a syntax error" in answer
+    assert visible == [answer]
+    checkpoint = json.loads(next((tmp_path / "checkpoints").glob("*.json")).read_text())
+    assert checkpoint["context_rollovers"] == []
+    events = [
+        json.loads(line)["event"]
+        for line in next((tmp_path / "journal").glob("*.jsonl"))
+        .read_text()
+        .splitlines()
+    ]
+    assert "unclear_input_rejected" in events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "classified_intent",
+    [
+        SemanticIntent(message_clear=False),
+        SemanticIntent(message_clear=True, message_odd=True),
+    ],
+)
+async def test_semantically_unclear_chat_never_reaches_answer_model(
+    tmp_path: Path,
+    classified_intent: SemanticIntent,
+) -> None:
+    class ToolsStub:
+        def begin_interaction(self, interaction_id: str, prompt: str) -> None:
+            return None
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            raise AssertionError("word salad must not discover tools")
+
+    class LLMStub:
+        config = SimpleNamespace(context=12_000)
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            raise AssertionError("word salad must not reach answer generation")
+
+    class RouterStub:
+        last_response = ""
+        last_failure_reason = ""
+
+        async def classify(self, prompt: str, **kwargs) -> SemanticIntent:
+            return classified_intent
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.intent_router = RouterStub()
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = None
+
+    answer = await agent._run_agent_loop("Zupa strupa, dupa i kamieni kupa.")
+
+    assert "brain just throw a syntax error" in answer
+    checkpoint = json.loads(next((tmp_path / "checkpoints").glob("*.json")).read_text())
+    assert checkpoint["tool_calls"] == []
+    assert checkpoint["context_rollovers"] == []
+
+
+@pytest.mark.asyncio
+async def test_short_non_action_statement_uses_current_message_only_chat(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def begin_interaction(self, interaction_id: str, prompt: str) -> None:
+            return None
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            raise AssertionError("compact chat must not discover tools")
+
+    class LLMStub:
+        config = SimpleNamespace(context=12_000)
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.messages: list[dict] = []
+
+        async def ask(self, *, messages: list[dict], **kwargs) -> str:
+            self.calls += 1
+            self.messages = messages
+            assert kwargs["max_tokens"] == 96
+            return (
+                "Boss... you okay, or did your brain just throw a syntax "
+                "error? Try that again."
+            )
+
+    class RouterStub:
+        last_response = ""
+        last_failure_reason = ""
+
+        async def classify(self, prompt: str, **kwargs) -> SemanticIntent:
+            return SemanticIntent(message_clear=True)
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.relationship_state = RelationshipState()
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            raise AssertionError("ambiguous compact banter must not enter memory")
+
+    llm = LLMStub()
+    agent = object.__new__(Agent)
+    agent.llm = llm
+    agent.tools = ToolsStub()
+    agent.intent_router = RouterStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = {
+        "objective": "I've been repeating the same memory twice",
+        "status": "completed",
+        "requirements": {},
+    }
+
+    answer = await agent._run_agent_loop(
+        "Sralimuchy będzie wiosna, będzie trawka równorosła."
+    )
+
+    assert "brain just throw a syntax error" in answer
+    assert llm.calls == 1
+    encoded_messages = json.dumps(llm.messages, ensure_ascii=False)
+    assert "Sralimuchy będzie wiosna" in encoded_messages
+    assert "I've been repeating the same memory twice" not in encoded_messages
+    checkpoint = json.loads(next((tmp_path / "checkpoints").glob("*.json")).read_text())
+    assert checkpoint["context_rollovers"] == []
+
+
+def test_repetitive_banter_detector_is_language_neutral() -> None:
+    assert Agent._looks_like_repetitive_banter(
+        "Scooby-Dooja, Scooby-Doobie-Dooja, Scooby-Doobie-Dooja."
+    )
+    assert not Agent._looks_like_repetitive_banter(
+        "My uncle was shouted at on Sunday."
+    )
+
+
+@pytest.mark.asyncio
+async def test_repetitive_banter_bypasses_intent_and_answer_models(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def begin_interaction(self, interaction_id: str, prompt: str) -> None:
+            return None
+
+    class LLMStub:
+        async def respond(self, **kwargs) -> LLMResponse:
+            raise AssertionError("repetitive banter must not reach the LLM")
+
+    class RouterStub:
+        async def classify(self, prompt: str, **kwargs) -> SemanticIntent:
+            raise AssertionError("repetitive banter must not reach intent parsing")
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.intent_router = RouterStub()
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = None
+
+    answer = await agent._run_agent_loop(
+        "Scooby-Dooja, Scooby-Doobie-Dooja, Scooby-Doobie-Dooja."
+    )
+
+    assert "brain just throw a syntax error" in answer
+    checkpoint = json.loads(next((tmp_path / "checkpoints").glob("*.json")).read_text())
+    assert checkpoint["tool_calls"] == []
+
+
 def test_agent_bounds_tool_output_for_model_context() -> None:
     fitted = Agent._fit_tool_output("HEAD\n" + "x" * 20_000 + "\nTAIL", max_characters=2_000)
 
@@ -2633,6 +4876,121 @@ def test_agent_bounds_tool_output_for_model_context() -> None:
     assert fitted.startswith("HEAD")
     assert fitted.endswith("TAIL")
     assert "PALADYN omitted the middle" in fitted
+
+
+def test_agent_prioritizes_duckduckgo_results_in_long_browser_snapshot() -> None:
+    chrome = "\n".join(
+        f"          - generic [ref=menu{i}]: DuckDuckGo menu item {i}"
+        for i in range(300)
+    )
+    result = f"""### Page
+- Page URL: https://duckduckgo.com/?q=firecrawl+alternatives&ia=web
+- Page Title: firecrawl alternatives at DuckDuckGo
+### Snapshot
+```yaml
+{chrome}
+          - listitem [ref=e147]:
+            - article [ref=e148] [cursor=pointer]:
+              - generic [ref=e155]:
+                - link "https://example.org/firecrawl-alternatives" [ref=e162]:
+                  - /url: https://example.org/firecrawl-alternatives
+              - heading [level=2] [ref=e168]:
+                - link "Seven tested Firecrawl alternatives" [ref=e169]:
+                  - /url: https://example.org/firecrawl-alternatives
+              - generic [ref=e174]: Crawl4AI, Crawlee, and Trafilatura are compared.
+          - listitem [ref=e176]:
+            - article [ref=e177] [cursor=pointer]:
+              - heading [level=2] [ref=e197]:
+                - link "Official Crawl4AI documentation" [ref=e198]:
+                  - /url: https://docs.crawl4ai.com/
+              - generic [ref=e200]: Open-source crawling documentation and examples.
+```
+"""
+
+    fitted = Agent._fit_browser_snapshot_output(result, max_characters=2_000)
+
+    assert len(fitted) <= 2_000
+    assert "Seven tested Firecrawl alternatives" in fitted
+    assert "https://example.org/firecrawl-alternatives" in fitted
+    assert "Official Crawl4AI documentation" in fitted
+    assert "DuckDuckGo menu item 299" not in fitted
+    assert "prioritized observed DuckDuckGo search-result blocks" in fitted
+
+
+def test_agent_prioritizes_topic_evidence_on_long_detail_page() -> None:
+    chrome = "\n".join(
+        f"  - generic [ref=menu{i}]: Navigation item {i}"
+        for i in range(350)
+    )
+    result = f"""### Page
+- Page URL: https://www.tinyfish.ai/blog/firecrawl-alternatives
+- Page Title: 8 Best Firecrawl Alternatives in 2026: Real Reviews & Pricing
+### Snapshot
+```yaml
+{chrome}
+  - main [ref=body]:
+    - heading "8 Best Firecrawl Alternatives in 2026" [level=1] [ref=h1]
+    - paragraph [ref=p1]: Crawl4AI is free, open-source, and self-hosted.
+    - paragraph [ref=p2]: Spider.cloud and ScrapingBee are low-cost hosted options.
+    - heading "Crawl4AI" [level=2] [ref=h2]
+      - paragraph [ref=p3]: Local open-source crawler.
+    - heading "Crawlee" [level=2] [ref=h3]
+      - paragraph [ref=p4]: Browser automation and crawling framework.
+```
+"""
+
+    fitted = Agent._fit_browser_snapshot_output(result, max_characters=2_000)
+
+    assert len(fitted) <= 2_000
+    assert "Crawl4AI is free" in fitted
+    assert "Spider.cloud and ScrapingBee" in fitted
+    assert 'heading "Crawl4AI"' in fitted
+    assert 'heading "Crawlee"' in fitted
+    assert "Navigation item 349" not in fitted
+    assert "prioritized topic-relevant detail-page evidence" in fitted
+
+
+def test_agent_prioritizes_repeated_product_cards_on_listing_page() -> None:
+    chrome = "\n".join(
+        f"  - link \"Books category {index}\": /category/{index}"
+        for index in range(300)
+    )
+    cards = """
+      - article [ref=a1]:
+        - link [ref=l1]:
+          - /url: catalogue/a-light-in-the-attic_1000/index.html
+          - img "A Light in the Attic" [ref=i1]
+        - paragraph [ref=p1]: £51.77
+        - text: In stock
+      - article [ref=a2]:
+        - link [ref=l2]:
+          - /url: catalogue/tipping-the-velvet_999/index.html
+          - img "Tipping the Velvet" [ref=i2]
+        - paragraph [ref=p2]: £53.74
+        - text: In stock
+      - article [ref=a3]:
+        - link [ref=l3]:
+          - /url: catalogue/soumission_998/index.html
+          - img "Soumission" [ref=i3]
+        - paragraph [ref=p3]: £50.10
+        - text: In stock
+    """
+    result = f"""- Page URL: https://books.toscrape.com/
+- Page Title: All products | Books to Scrape - Sandbox
+{chrome}
+{cards}
+"""
+
+    fitted = Agent._fit_browser_snapshot_output(result, max_characters=2_000)
+
+    assert len(fitted) <= 2_000
+    assert "A Light in the Attic" in fitted
+    assert "Tipping the Velvet" in fitted
+    assert "Soumission" in fitted
+    assert "£51.77" in fitted
+    assert "In stock" in fitted
+    assert "Books category 299" not in fitted
+    assert "prioritized repeated observed page-item blocks" in fitted
 
 
 @pytest.mark.asyncio
@@ -2836,6 +5194,456 @@ async def test_agent_uses_controlled_tool_creation_for_explicit_missing_tool() -
 
 
 @pytest.mark.asyncio
+async def test_agent_repairs_empty_learning_call_before_tool_execution() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "manifest": {"type": "object", "additionalProperties": True},
+            "source": {"type": "string", "minLength": 1},
+        },
+        "required": ["manifest", "source"],
+        "additionalProperties": False,
+    }
+    valid_arguments = {
+        "manifest": {
+            "name": "count_words",
+            "version": "1.0.0",
+            "description": "Count words in bounded text.",
+            "input_schema": {},
+            "output_schema": {},
+            "tests": [],
+        },
+        "source": "def run(arguments):\n    return {'word_count': 0}",
+    }
+
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "learning_create_tool",
+                        "description": "Create and validate a tool.",
+                        "parameters": schema,
+                    },
+                }
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            return '{"status":"active","validation":{"passed":true}}'
+
+    class LLMStub:
+        config = SimpleNamespace(context=12_000)
+
+        def __init__(self) -> None:
+            self.turn = 0
+            self.budgets: list[int] = []
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            self.budgets.append(kwargs["max_tokens"])
+            if self.turn == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "bad-create",
+                            "learning_create_tool",
+                            {},
+                            raw_arguments="{}",
+                        )
+                    ]
+                )
+            if self.turn == 2:
+                assert "missing required fields" in str(kwargs["messages"][-1])
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "fixed-create",
+                            "learning_create_tool",
+                            valid_arguments,
+                            raw_arguments=json.dumps(valid_arguments),
+                        )
+                    ]
+                )
+            return LLMResponse(
+                content="The tool is active. Broken call repaired before execution, Boss."
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    llm = LLMStub()
+    agent = object.__new__(Agent)
+    agent.llm = llm
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop("Create a tool that counts words.")
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert "active" in answer
+    assert tools.calls == [("learning_create_tool", valid_arguments)]
+    assert llm.budgets == [3_000, 3_000, 256]
+
+
+@pytest.mark.asyncio
+async def test_agent_redirects_premature_generated_tool_to_learning_lifecycle() -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.active = False
+            self.calls: list[tuple[str, dict]] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            definitions = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "learning_create_tool",
+                        "description": "Create and activate a generated tool.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "description": {"type": "string"},
+                                "source": {"type": "string"},
+                                "test": {"type": "object"},
+                            },
+                            "required": ["name", "description", "source", "test"],
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "learning_list_artifacts",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+            ]
+            if self.active:
+                definitions.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "double_value",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"value": {"type": "integer"}},
+                                "required": ["value"],
+                            },
+                        },
+                    }
+                )
+            return definitions
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            if tool == "learning_create_tool":
+                self.active = True
+                return '{"name":"double_value","status":"active"}'
+            if tool == "double_value":
+                return '{"result":42}'
+            raise AssertionError(f"unexpected real call: {tool}")
+
+    class LLMStub:
+        config = SimpleNamespace(context=12_000)
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            available = {
+                item["function"]["name"] for item in kwargs.get("tools") or []
+            }
+            if self.turn == 1:
+                assert available == {"learning_create_tool"}
+                return LLMResponse(
+                    tool_calls=[LLMToolCall("too-early", "double_value", {})]
+                )
+            if self.turn == 2:
+                assert available == {"learning_create_tool"}
+                assert "PALADYN lifecycle correction" in str(kwargs["messages"][-1])
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "create",
+                            "learning_create_tool",
+                            {
+                                "name": "double_value",
+                                "description": "Double an integer.",
+                                "source": (
+                                    "def run(arguments):\n"
+                                    "    return {'result': arguments['value'] * 2}"
+                                ),
+                                "test": {
+                                    "name": "fixture",
+                                    "arguments": {"value": 2},
+                                    "expected": {"result": 4},
+                                },
+                            },
+                        )
+                    ]
+                )
+            if self.turn == 3:
+                assert available == {"double_value"}
+                return LLMResponse(
+                    tool_calls=[LLMToolCall("run", "double_value", {"value": 21})]
+                )
+            return LLMResponse(content="The generated tool returned 42, Boss.")
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop(
+        "Create a generated tool named double_value and execute it on 21."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert [name for name, _ in tools.calls] == [
+        "learning_create_tool",
+        "double_value",
+    ]
+    assert "42" in answer
+
+
+@pytest.mark.asyncio
+async def test_agent_gives_model_source_only_and_runtime_owns_tool_contract() -> None:
+    prompt = (
+        "Create a tool named double_value. "
+        'value = 2\nexpected = {"result": 4}\n'
+        "After activation execute it for value = 21."
+    )
+
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.active = False
+            self.calls: list[tuple[str, dict]] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            if not self.active:
+                return [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "learning_create_tool",
+                            "description": "Runtime-owned source lifecycle.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"source": {"type": "string"}},
+                                "required": ["source"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    }
+                ]
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "double_value",
+                        "description": "Double one value.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"value": {"type": "integer"}},
+                            "required": ["value"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            if tool == "learning_create_tool":
+                self.active = True
+                assert set(arguments) == {"source"}
+                return json.dumps(
+                    {
+                        "name": "double_value",
+                        "status": "active",
+                        "validation": {
+                            "passed": True,
+                            "tests": [
+                                {
+                                    "name": "owner-specified semantic oracle",
+                                    "passed": True,
+                                }
+                            ],
+                        },
+                    }
+                )
+            if tool == "double_value":
+                return json.dumps({"result": arguments["value"] * 2})
+            raise AssertionError(tool)
+
+    class LLMStub:
+        config = SimpleNamespace(context=12_000)
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            if self.turn == 1:
+                assert kwargs["tools"] is None
+                assert "SOURCE PHASE" in kwargs["messages"][0]["content"]
+                return LLMResponse(
+                    content=(
+                        "```python\n"
+                        "def run(arguments):\n"
+                        "    return {'result': arguments['value'] * 2}\n"
+                        "```"
+                    )
+                )
+            raise AssertionError(
+                "runtime-bound execution and evidence report must bypass the model"
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    llm = LLMStub()
+    agent = object.__new__(Agent)
+    agent.llm = llm
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop(prompt)
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert llm.turn == 1
+    assert tools.calls[0][0] == "learning_create_tool"
+    assert tools.calls[1] == ("double_value", {"value": 21})
+    assert '"result": 42' in answer
+
+
+@pytest.mark.asyncio
+async def test_source_phase_rejects_malformed_builder_json_then_accepts_code() -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "learning_create_tool",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"source": {"type": "string"}},
+                            "required": ["source"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            return json.dumps(
+                {
+                    "name": "count_words",
+                    "status": "active",
+                    "validation": {
+                        "passed": True,
+                        "tests": [
+                            {
+                                "name": "owner-specified semantic oracle",
+                                "passed": True,
+                            }
+                        ],
+                    },
+                }
+            )
+
+    class LLMStub:
+        config = SimpleNamespace(context=12_000)
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            assert kwargs["tools"] is None
+            if self.turn == 1:
+                return LLMResponse(
+                    content=(
+                        '{"tool":"learning_create_tool","arguments":'
+                        '{"source":"print(123)"}'
+                    )
+                )
+            if self.turn == 2:
+                assert "rejected that source draft" in str(kwargs["messages"][-1])
+                return LLMResponse(
+                    content=(
+                        "def run(arguments):\n"
+                        "    return {'count': len(arguments['text'].split())}"
+                    )
+                )
+            raise AssertionError("creation report must come from runtime evidence")
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    llm = LLMStub()
+    agent = object.__new__(Agent)
+    agent.llm = llm
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop(
+        "Create a tool named count_words. "
+        'text = "V builds tools" expected = {"count": 3}'
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert llm.turn == 2
+    assert len(tools.calls) == 1
+    assert set(tools.calls[0][1]) == {"source"}
+    assert "count_words" in answer
+    assert "validated" in answer
+
+
+@pytest.mark.asyncio
 async def test_agent_rejects_text_tool_call_outside_authoritative_catalog() -> None:
     class ToolsStub:
         def __init__(self) -> None:
@@ -2970,6 +5778,152 @@ async def test_newly_created_tool_is_callable_in_same_agent_task() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_grounds_creation_and_execution_from_distinct_fixtures() -> None:
+    prompt = (
+        "Create a task-scoped offline tool named multiply_values. Do not browse. "
+        'items = [{"value":3}]\nscale = 2\n'
+        "After it is active, really execute it on the second fixture. "
+        'items = [{"value":5},{"value":7}]\nscale = 3'
+    )
+
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.active = False
+            self.calls: list[tuple[str, dict]] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            definitions = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "learning_create_tool",
+                        "description": "Create and validate a tool.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "description": {"type": "string"},
+                                "source": {"type": "string"},
+                                "test": {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                },
+                            },
+                            "required": ["name", "description", "source", "test"],
+                        },
+                    },
+                }
+            ]
+            if self.active:
+                definitions.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "multiply_values",
+                            "description": "Multiply supplied values.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "items": {"type": "array"},
+                                    "scale": {"type": "integer"},
+                                },
+                                "required": ["items", "scale"],
+                            },
+                        },
+                    }
+                )
+            return definitions
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            if tool == "learning_create_tool":
+                self.active = True
+                return json.dumps(
+                    {"name": "multiply_values", "status": "active"}
+                )
+            if tool == "multiply_values":
+                return '{"values":[15,21]}'
+            raise AssertionError(tool)
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            if self.turn == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "create",
+                            "learning_create_tool",
+                            {
+                                "name": "multiply_values",
+                                "description": "Multiply supplied values.",
+                                "source": (
+                                    "def run(arguments):\n"
+                                    "    items = arguments.get('items', [])\n"
+                                    "    scale = arguments.get('scale', 1)\n"
+                                    "    return {'values': "
+                                    "[item['value'] * scale for item in items]}"
+                                ),
+                                "test": {
+                                    "name": "fixture",
+                                    "arguments": {
+                                        "items": [{"value": 999}],
+                                        "scale": 999,
+                                    },
+                                    "expected": {"values": [6]},
+                                },
+                            },
+                        )
+                    ]
+                )
+            if self.turn == 2:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "execute",
+                            "multiply_values",
+                            {"items": [], "scale": 0},
+                        )
+                    ]
+                )
+            return LLMResponse(content="The tool returned 15 and 21, Boss.")
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop(prompt)
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert tools.calls[0][0] == "learning_create_tool"
+    assert tools.calls[0][1]["test"]["arguments"] == {
+        "items": [{"value": 3}],
+        "scale": 2,
+    }
+    assert tools.calls[1] == (
+        "multiply_values",
+        {"items": [{"value": 5}, {"value": 7}], "scale": 3},
+    )
+    assert '"values": [15, 21]' in answer
+
+
+@pytest.mark.asyncio
 async def test_failed_sandbox_command_cannot_support_successful_test_claim(
     tmp_path: Path,
 ) -> None:
@@ -3067,7 +6021,7 @@ async def test_detail_page_contract_rejects_search_page_only_completion() -> Non
         async def call(self, tool: str, arguments: dict) -> str:
             self.calls.append((tool, arguments))
             if tool == "browser_snapshot" and len(self.calls) < 4:
-                return "First result: mikalv/awesome-i2p"
+                return "First result: https://github.com/mikalv/awesome-i2p"
             return "Repository heading: mikalv/awesome-i2p"
 
     class LLMStub:
@@ -3117,6 +6071,382 @@ async def test_detail_page_contract_rejects_search_page_only_completion() -> Non
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Search the internet for a Firecrawler alternative and report it.",
+        (
+            "Search the internet for a Firecrawler alternative and report it. "
+            "If none exists, create a tool or skill."
+        ),
+    ],
+)
+async def test_contract_satisfaction_closes_tools_and_forces_final_report(
+    tmp_path: Path,
+    prompt: str,
+) -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {"type": "function", "function": {"name": name}}
+                for name in (
+                    "browser_navigate",
+                    "browser_snapshot",
+                    "browser_find",
+                )
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append(tool)
+            if tool == "browser_snapshot":
+                return (
+                    "Result URL: https://scrapy.org. "
+                    "Verified Scrapy evidence from the observed page"
+                )
+            return "Navigation succeeded"
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+            self.final_tools: object = "unset"
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            if self.turn == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "search",
+                            "browser_navigate",
+                            {"url": "https://duckduckgo.com/?q=firecrawler"},
+                        )
+                    ]
+                )
+            if self.turn == 2:
+                return LLMResponse(
+                    tool_calls=[LLMToolCall("search-snapshot", "browser_snapshot", {})]
+                )
+            if self.turn == 3:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "detail",
+                            "browser_navigate",
+                            {"url": "https://scrapy.org"},
+                        )
+                    ]
+                )
+            if self.turn == 4:
+                return LLMResponse(
+                    tool_calls=[LLMToolCall("detail-snapshot", "browser_snapshot", {})]
+                )
+            self.final_tools = kwargs.get("tools")
+            if self.turn == 5:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall("unneeded", "browser_find", {"text": "more"})
+                    ]
+                )
+            return LLMResponse(
+                content="Scrapy is the verified alternative I inspected, Boss."
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    llm = LLMStub()
+    agent = object.__new__(Agent)
+    agent.llm = llm
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent._agent_trace_root = tmp_path / "interactive"
+    agent._last_execution_context = None
+
+    answer = await agent._run_agent_loop(prompt)
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert answer == "Scrapy is the verified alternative I inspected, Boss."
+    assert tools.calls == [
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_navigate",
+        "browser_snapshot",
+    ]
+    assert llm.final_tools is None
+    checkpoint = json.loads(
+        next((agent._agent_trace_root / "checkpoints").glob("*.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    journal = (
+        agent._agent_trace_root
+        / "journal"
+        / f"{checkpoint['task_id']}.jsonl"
+    ).read_text(encoding="utf-8")
+    assert "task_contract_satisfied" in journal
+    assert "post_contract_tool_call_rejected" in journal
+
+
+@pytest.mark.asyncio
+async def test_two_mangled_final_reports_fall_back_to_verified_evidence(
+    tmp_path: Path,
+) -> None:
+    exact_url = "https://example.test"
+
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {"type": "function", "function": {"name": name}}
+                for name in ("browser_navigate", "browser_snapshot")
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append(tool)
+            if tool == "browser_snapshot":
+                return (
+                    f"- Page URL: {exact_url}\n"
+                    "- Page Title: Verified Example\n"
+                    '- heading "Observed content" [level=2]'
+                )
+            return f"- Page URL: {exact_url}"
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            if self.turn == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "navigate",
+                            "browser_navigate",
+                            {"url": exact_url},
+                        )
+                    ]
+                )
+            if self.turn == 2:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall("snapshot", "browser_snapshot", {})
+                    ]
+                )
+            return LLMResponse(
+                content=(
+                    "I inspected https://example.tes and found Verified Example, "
+                    "Boss."
+                )
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    llm = LLMStub()
+    agent = object.__new__(Agent)
+    agent.llm = llm
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent._agent_trace_root = tmp_path / "interactive"
+    agent._last_execution_context = None
+
+    answer = await agent._run_agent_loop(
+        f"Inspect {exact_url} and report what is there."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert llm.turn == 4
+    assert tools.calls == ["browser_navigate", "browser_snapshot"]
+    assert "killed that rewrite loop" in answer
+    assert f"Source: {exact_url}" in answer
+    journal = next(
+        (agent._agent_trace_root / "journal").glob("*.jsonl")
+    ).read_text(encoding="utf-8")
+    assert "final_answer_loop_cut_off" in journal
+
+
+@pytest.mark.asyncio
+async def test_direct_url_failure_is_reported_after_one_attempt(tmp_path: Path) -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {"type": "function", "function": {"name": name}}
+                for name in ("browser_navigate", "browser_snapshot")
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append(tool)
+            assert tool == "browser_navigate"
+            return "Page returned HTTP status: 404"
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            if self.turn == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "bad-nav",
+                            "browser_navigate",
+                            {"url": "https://bad.example"},
+                        )
+                    ]
+                )
+            return LLMResponse(
+                tool_calls=[LLMToolCall("bad-snapshot", "browser_snapshot", {})]
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent._agent_trace_root = tmp_path / "interactive"
+    agent._last_execution_context = None
+    agent.MAX_AGENT_STEPS = 2
+
+    answer = await agent._run_agent_loop(
+        "Inspect https://bad.example and report it."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert tools.calls == ["browser_navigate"]
+    assert "tried `https://bad.example` exactly once" in answer
+    assert "didn't swap in search-result bullshit" in answer
+    checkpoint = json.loads(
+        next((agent._agent_trace_root / "checkpoints").glob("*.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert checkpoint["status"] == "failed"
+    assert len(checkpoint["tool_calls"]) == 1
+    assert checkpoint["tool_calls"][0]["tool"] == "browser_navigate"
+    assert checkpoint["tool_calls"][0]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_changed_snapshot_arguments_cannot_hide_identical_result_loop(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {"type": "function", "function": {"name": name}}
+                for name in ("browser_navigate", "browser_snapshot")
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            if tool == "browser_navigate":
+                return "Search page opened"
+            return "The same search listing with no new evidence"
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            if self.turn == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "nav",
+                            "browser_navigate",
+                            {"url": "https://duckduckgo.com/?q=firecrawler"},
+                        )
+                    ]
+                )
+            return LLMResponse(
+                tool_calls=[
+                    LLMToolCall(
+                        f"snapshot-{self.turn}",
+                        "browser_snapshot",
+                        {"target": f"variant-{self.turn}"},
+                    )
+                ]
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent._agent_trace_root = tmp_path / "interactive"
+    agent._last_execution_context = None
+    agent.MAX_AGENT_STEPS = 4
+
+    await agent._run_agent_loop(
+        "Search the internet for Firecrawler alternatives and report them."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    checkpoint = json.loads(
+        next((agent._agent_trace_root / "checkpoints").glob("*.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert checkpoint["tool_calls"][3]["status"] == "failed"
+    assert "RepeatedToolResultError" in checkpoint["tool_calls"][3]["error"]
+    journal = (
+        agent._agent_trace_root
+        / "journal"
+        / f"{checkpoint['task_id']}.jsonl"
+    ).read_text(encoding="utf-8")
+    assert "repeated_tool_result_detected" in journal
+
+
 def test_constitution_is_user_aligned_without_blind_obedience() -> None:
     text = Constitution().render()
 
@@ -3144,10 +6474,45 @@ def test_voice_contract_makes_profanity_expected_but_contextual() -> None:
         "Okay, let's break this down.",
         "I'm doing well. Ready when you are.",
         "How can I help?",
+        "I knew you wouldn't stop. Want me to do something?",
+        "You're back with the same old nonsense. What's the plan today?",
+        "I know exactly what you want. Let's do it.",
+        "You're speaking in code. What's the actual message?",
+        "I know what you're asking. Let me get this straight — I found some things.",
+        "I found 213 matches. Would you like me to extract more details?",
+        (
+            "V found a few alternatives, but none matched exactly. If you'd "
+            "like, I can explore more or build one. What would you prefer?"
+        ),
+        (
+            "Okay, I've checked a few places. First, **Scrapy** is a powerful "
+            "framework. Another option is **BeautifulSoup**, which works well "
+            "with Python. If you prefer a user-friendly interface, try Web "
+            "Scraper. Lastly, **Puppeteer** is a good choice. Would any of these "
+            "options work better for you?"
+        ),
     ],
 )
 def test_generic_assistant_voice_is_detected(text: str) -> None:
     assert looks_generic_assistant_voice(text)
+
+
+def test_empty_action_acknowledgement_is_detected_as_no_result() -> None:
+    assert looks_empty_action_acknowledgement(
+        "I know exactly what you want. Let's do it."
+    )
+    assert not looks_empty_action_acknowledgement(
+        "The tests pass. Fuck it, let's ship the patch."
+    )
+
+
+def test_bland_word_salad_clarification_is_detected() -> None:
+    assert looks_bland_clarification(
+        "You're speaking in code. What's the actual message?"
+    )
+    assert not looks_bland_clarification(
+        "Boss... you okay, or did your brain just throw a syntax error? Try that again."
+    )
 
 
 def test_natural_v_voice_is_not_marked_generic() -> None:
@@ -3205,6 +6570,124 @@ async def test_sanitized_contempt_is_rewritten_in_v_voice() -> None:
 
 
 @pytest.mark.asyncio
+async def test_voice_rewrite_is_rechecked_and_retried_when_still_corporate() -> None:
+    class LLMStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ask(self, *, messages: list[dict], **kwargs) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                return (
+                    "First, **Scrapy** is a powerful framework. Another option is "
+                    "**Puppeteer**. Would either option work for you?"
+                )
+            assert "kill the helpdesk voice" in messages[-1]["content"]
+            return (
+                "The clean candidates are **Scrapy** and **Puppeteer**, Boss. "
+                "No brochure bullshit: both still need source verification before "
+                "I recommend either one."
+            )
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+
+    answer = await agent._enforce_english(
+        [{"role": "user", "content": "Report what you found."}],
+        "Okay, I've checked a few places. Would any of these work for you?",
+    )
+
+    assert agent.llm.calls == 2
+    assert "No brochure bullshit" in answer
+    assert not looks_generic_assistant_voice(answer)
+
+
+@pytest.mark.asyncio
+async def test_failed_voice_rewrites_preserve_substantive_answer() -> None:
+    class LLMStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ask(self, **kwargs) -> str:
+            self.calls += 1
+            return (
+                "Certainly, Boss. The verified address is Domaniewska 31. "
+                "Would you like me to check anything else?"
+            )
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    original = (
+        "Certainly, Boss. The verified address is Domaniewska 31.  \n"
+        "Would you like me to check anything else?"
+    )
+
+    answer = await agent._enforce_english(
+        [{"role": "user", "content": "Report the address."}],
+        original,
+    )
+
+    assert agent.llm.calls == 2
+    assert "Domaniewska 31" in answer
+    assert "voice gate" not in answer
+    assert not answer.startswith("Certainly")
+    assert "Would you like" not in answer
+
+
+@pytest.mark.asyncio
+async def test_failed_voice_rewrite_does_not_preserve_empty_acknowledgement() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return "I know exactly what you want. Let's do it."
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+
+    answer = await agent._enforce_english(
+        [{"role": "user", "content": "Extract the records."}],
+        "I know exactly what you want. Let's do it.",
+    )
+
+    assert "fuck-all" in answer
+    assert "Let's do it" not in answer
+
+
+@pytest.mark.asyncio
+async def test_failed_voice_rewrite_repairs_bland_clarification_deterministically() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return "You're speaking in code. What's the actual message?"
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+
+    answer = await agent._enforce_english(
+        [{"role": "user", "content": "Supa dupa i kamieni kupa."}],
+        "You're speaking in code. What's the actual message?",
+    )
+
+    assert "brain just throw a syntax error" in answer
+    assert "actual message" not in answer
+
+
+@pytest.mark.asyncio
+async def test_failed_voice_rewrite_strips_service_question_from_v_reply() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return "Still awake, still dangerous. What's the plan, Boss?"
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+
+    answer = await agent._enforce_english(
+        [{"role": "user", "content": "Jak się masz?"}],
+        "Still awake, still dangerous. What's the plan, Boss?",
+    )
+
+    assert answer == "Still awake, still dangerous."
+
+
+@pytest.mark.asyncio
 async def test_research_stream_holds_sanitized_draft_for_voice_rewrite() -> None:
     class LLMStub:
         async def stream(self, **kwargs):
@@ -3259,6 +6742,14 @@ def test_runtime_persona_is_compact_and_preserves_core_contract() -> None:
     assert "Alignment is not blind obedience" in runtime
     assert "Okay, let's break this down" in runtime
     assert "If the\ndraft sounds like a polite generic assistant" in runtime
+
+
+def test_persona_examples_reject_browser_scaffolding_in_v_voice() -> None:
+    examples = PersonaRuntime.example_messages()
+    combined = "\n".join(item["content"] for item in examples)
+
+    assert "browser plumbing, not fucking tools" in combined
+    assert "Calling those nodes candidates would be bullshit" in combined
 
 
 @pytest.mark.parametrize(
@@ -3388,7 +6879,33 @@ async def test_failed_language_rewrite_never_leaks_polish_answer() -> None:
         "Cześć Boss, jak mogę ci pomóc?",
     )
 
-    assert answer.startswith("I couldn't produce a reliable English response")
+    assert answer.startswith("The language pass mangled that answer")
+    assert not looks_non_english(answer)
+
+
+@pytest.mark.asyncio
+async def test_non_english_language_rewrite_gets_compact_translation_retry() -> None:
+    class LLMStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ask(self, *, messages: list[dict], **kwargs) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                return "Crawl4AI jest darmową alternatywą, Boss."
+            assert "Translate one completed answer" in messages[0]["content"]
+            return "Crawl4AI is the verified free alternative, Boss."
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+
+    answer = await agent._enforce_english(
+        [{"role": "user", "content": "Znajdź darmową alternatywę."}],
+        "Znalazłam Crawl4AI jako darmową alternatywę, Boss.",
+    )
+
+    assert agent.llm.calls == 2
+    assert answer == "Crawl4AI is the verified free alternative, Boss."
     assert not looks_non_english(answer)
 
 
@@ -3401,7 +6918,7 @@ async def test_english_demand_is_rewritten_to_answer_boss_directly() -> None:
             assert sum(item["role"] == "system" for item in messages) == 1
             assert messages[-2]["role"] == "assistant"
             assert messages[-1]["role"] == "user"
-            return "I'm doing well, Boss. Ready when you are."
+            return "I'm good, Boss. Sharp enough to bite into whatever's broken."
 
     agent = object.__new__(Agent)
     agent.llm = LLMStub()
@@ -3411,7 +6928,7 @@ async def test_english_demand_is_rewritten_to_answer_boss_directly() -> None:
         "Please write to me in English so I can answer.",
     )
 
-    assert answer == "I'm doing well, Boss. Ready when you are."
+    assert answer == "I'm good, Boss. Sharp enough to bite into whatever's broken."
     assert not asks_user_to_use_english(answer)
 
 
@@ -3795,6 +7312,73 @@ async def test_bare_domain_research_records_real_browser_evidence(
 
 
 @pytest.mark.asyncio
+async def test_specialized_research_reports_direct_dns_failure_once(
+    tmp_path: Path,
+) -> None:
+    target = "https://missing-direct.invalid"
+
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def browser_call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            raise MCPToolExecutionError("NS_ERROR_UNKNOWN_HOST")
+
+    class LLMStub:
+        config = SimpleNamespace(system_prompt="You are V.", context=8_192)
+
+        async def ask(self, **kwargs) -> str:
+            raise AssertionError("A DNS failure must not ask the model for prose")
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+            self.relationship_state = RelationshipState()
+            self.manager = SimpleNamespace(load_all=lambda category: [])
+            self.execution: dict | None = None
+
+        async def process(
+            self,
+            prompt: str,
+            answer: str,
+            *,
+            execution: dict | None = None,
+        ) -> None:
+            self.execution = execution
+
+    tools = ToolsStub()
+    llm = LLMStub()
+    memory = MemoryStub()
+    agent = object.__new__(Agent)
+    agent.config = SimpleNamespace(autonomy_root=tmp_path / "autonomy")
+    agent._agent_trace_root = tmp_path / "autonomy" / "interactive"
+    agent.tools = tools
+    agent.llm = llm
+    agent.memory = memory
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.research = ResearchTask(SimpleNamespace(tools=tools, llm=llm))
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_research_task(
+        f"Inspect {target} and report what is there."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert tools.calls == [("browser_navigate", {"url": target})]
+    assert f"tried `{target}` exactly once" in answer
+    assert "didn't swap in search-result bullshit" in answer
+    checkpoint = json.loads(
+        next(
+            (agent._agent_trace_root / "checkpoints").glob("*.json")
+        ).read_text(encoding="utf-8")
+    )
+    assert checkpoint["status"] == "failed"
+    assert len(checkpoint["tool_calls"]) == 1
+    assert checkpoint["tool_calls"][0]["status"] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_research_result_passes_through_language_gate() -> None:
     class ResearchStub:
         async def run(self, *args, **kwargs) -> str:
@@ -3893,7 +7477,7 @@ async def test_research_promise_is_blocked_before_it_reaches_stream(
     )
     await asyncio.gather(*agent._memory_tasks)
 
-    assert "did not finish the requested extraction" in answer
+    assert "the extraction didn't finish" in answer
     assert "I'll extract" not in answer
     assert visible == [answer]
     checkpoint = next(
@@ -3992,6 +7576,30 @@ async def test_browser_mcp_error_is_not_reported_as_success() -> None:
 
     with pytest.raises(MCPToolExecutionError, match="DNS resolution failed"):
         await tools.browser_call("browser_navigate", {"url": "https://example.com"})
+
+
+@pytest.mark.asyncio
+async def test_browser_type_is_forwarded_with_structured_arguments() -> None:
+    calls: list[tuple[str, dict]] = []
+
+    async def browser_call(tool: str, arguments: dict) -> str:
+        calls.append((tool, arguments))
+        return "typed"
+
+    tools = object.__new__(MCPTools)
+    tools.learning = None
+    tools.browser_call = browser_call
+    arguments = {
+        "element": "GitHub search input",
+        "target": "ref=e42",
+        "text": "firecrawl alternative",
+        "submit": True,
+    }
+
+    result = await tools.call("browser_type", arguments)
+
+    assert result == "typed"
+    assert calls == [("browser_type", arguments)]
 
 
 @pytest.mark.asyncio

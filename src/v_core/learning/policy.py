@@ -66,6 +66,9 @@ _RESERVED_TOOL_NAMES = {
     "browser_navigate",
     "browser_press_key",
     "browser_snapshot",
+    "browser_type",
+    "web_search",
+    "web_read",
     "create_directory",
     "directory_tree",
     "edit_file",
@@ -83,11 +86,29 @@ _EXTERNAL_RETRIEVAL_CLAIM = re.compile(
     r"web\s+search|przegląd\w*\s+sie\w*|internet\w*)\b",
     re.IGNORECASE,
 )
+_PLACEHOLDER_FIXTURE = re.compile(
+    r"(?:\[(?:snapshot|input|data|fixture|example)(?:[^\]]*)\]|"
+    r"\.\.\.\s*\((?:rest|remainder|full|remaining)[^)]*\)|"
+    r"^\s*(?:-\s*)?\.\.\.(?:\s*\([^)]*\))?\s*$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_EXTRACTION_DESCRIPTION = re.compile(r"\b(?:extract|parse|wyodr[ęe]bn|parsuj)", re.I)
+
+
+def _text_leaves(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [item for child in value.values() for item in _text_leaves(child)]
+    if isinstance(value, (list, tuple)):
+        return [item for child in value for item in _text_leaves(child)]
+    return []
 
 
 @dataclass(slots=True)
 class ArtifactPolicy:
     authorization: AuthorizationGuard
+    privileged_generated_code: bool = False
 
     def may_stage(self, scope: ArtifactScope) -> None:
         self.authorization.require("create_task_tools")
@@ -104,8 +125,7 @@ class ArtifactPolicy:
         else:
             self.authorization.require("owner:activate_persistent_artifacts")
 
-    @staticmethod
-    def validate_tool_manifest(manifest: ToolManifest) -> None:
+    def validate_tool_manifest(self, manifest: ToolManifest) -> None:
         if manifest.name in _PLACEHOLDER_TOOL_NAMES:
             raise ArtifactPolicyError(
                 "generated tool name is still a placeholder; choose a concrete name"
@@ -121,7 +141,10 @@ class ArtifactPolicy:
             raise ArtifactPolicyError(
                 "generated tool description is still a placeholder"
             )
-        if _EXTERNAL_RETRIEVAL_CLAIM.search(manifest.description):
+        if (
+            not self.privileged_generated_code
+            and _EXTERNAL_RETRIEVAL_CLAIM.search(manifest.description)
+        ):
             raise ArtifactPolicyError(
                 "generated tools run offline and cannot claim internet or web retrieval; "
                 "use an existing browser tool and create a skill to orchestrate it"
@@ -134,6 +157,35 @@ class ArtifactPolicy:
             raise ArtifactPolicyError("generated tool output must be a JSON object")
         if len(manifest.tests) > 100:
             raise ArtifactPolicyError("generated tools may define at most 100 tests")
+        for case in manifest.tests:
+            fixture = json.dumps(
+                {"arguments": case.arguments, "expected": case.expected},
+                ensure_ascii=False,
+            )
+            if _PLACEHOLDER_FIXTURE.search(fixture):
+                raise ArtifactPolicyError(
+                    f"test {case.name!r} contains placeholder data; use one small "
+                    "literal input fixture and exact expected output"
+                )
+            if _EXTRACTION_DESCRIPTION.search(manifest.description):
+                observed = json.dumps(
+                    case.arguments,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).casefold()
+                absent = sorted(
+                    {
+                        item
+                        for item in _text_leaves(case.expected)
+                        if len(item.strip()) >= 3
+                        and item.casefold() not in observed
+                    }
+                )
+                if absent:
+                    raise ArtifactPolicyError(
+                        f"test {case.name!r} expects values absent from its extraction "
+                        f"fixture: {absent[:8]}"
+                    )
         encoded = json.dumps(manifest.to_dict(), ensure_ascii=False, allow_nan=False)
         if len(encoded.encode("utf-8")) > 2_000_000:
             raise ArtifactPolicyError("generated tool manifest exceeds 2 MB")
@@ -147,8 +199,7 @@ class ArtifactPolicy:
         if "\x00" in source:
             raise ArtifactPolicyError("generated tool source contains a NUL byte")
 
-    @staticmethod
-    def validate_tool_source(source: str) -> None:
+    def validate_tool_source(self, source: str) -> None:
         ArtifactPolicy.validate_tool_source_envelope(source)
         try:
             tree = ast.parse(source, mode="exec")
@@ -160,20 +211,28 @@ class ArtifactPolicy:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if node.name == "run":
                     has_run = True
-                if node.name.startswith("__") and node.name != "__init__":
+                if (
+                    not self.privileged_generated_code
+                    and node.name.startswith("__")
+                    and node.name != "__init__"
+                ):
                     raise ArtifactPolicyError("generated tool defines a protected dunder")
-            if isinstance(node, ast.Import):
+            if not self.privileged_generated_code and isinstance(node, ast.Import):
                 for alias in node.names:
                     ArtifactPolicy._validate_import(alias.name)
-            if isinstance(node, ast.ImportFrom):
+            if not self.privileged_generated_code and isinstance(node, ast.ImportFrom):
                 if node.level:
                     raise ArtifactPolicyError("relative imports are not allowed")
                 ArtifactPolicy._validate_import(node.module or "")
-            if isinstance(node, ast.Call):
+            if not self.privileged_generated_code and isinstance(node, ast.Call):
                 name = ArtifactPolicy._call_name(node.func)
                 if name in _FORBIDDEN_CALLS:
                     raise ArtifactPolicyError(f"forbidden generated-tool call: {name}")
-            if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+            if (
+                not self.privileged_generated_code
+                and isinstance(node, ast.Attribute)
+                and node.attr.startswith("__")
+            ):
                 raise ArtifactPolicyError("dunder attribute access is not allowed")
 
         if not has_run:

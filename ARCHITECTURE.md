@@ -313,6 +313,16 @@ the persona constitution only when their deterministic trigger tests match the
 current request. Neither artifact type can modify its own validator, the
 authorization model, persona, or emergency controls.
 
+The autonomous generated-tool boundary is deliberately asymmetric. The LLM is
+a source-code synthesizer only. PALADYN extracts the owner fixtures, derives the
+tool identity and strict schemas, constructs the tests and manifest, validates
+and activates the immutable bundle, binds the post-activation invocation, and
+renders the evidence-backed result. During source synthesis the model receives
+no callable tool definitions, so a malformed function-call envelope cannot
+become lifecycle authority. Explicit owner instructions such as `offline` or
+`do not browse` are enforced again after semantic routing and remove web tools
+from the task contract.
+
 Autonomous runtime exceptions are captured as failure evidence. Completion is
 captured as success evidence only when a verifier explicitly marks it verified.
 Learning capture failure is journaled but never allowed to crash or falsely
@@ -343,6 +353,16 @@ defaults to `off`, and migrates legacy `--reasoning` extra arguments.
 Anti-repetition is a validated `off`, `balanced`, or `strong` profile field.
 Balanced and strong profiles map to controlled llama.cpp repeat-penalty and DRY
 sampler arguments; profile extras cannot override them.
+
+An automatic routing pool may contain at most three local models. Each candidate
+requires a current qualification card bound to both the sampled GGUF identity
+and its behaviour-affecting profile. The runtime classifies the owner task into
+a fixed capability class, applies code-owned weights, and unloads the active
+model before starting the selected specialist. Agent and memory components share
+one reconfigurable LLM client, so a switch cannot leave an old component talking
+to a terminated server. Background reflection is cancelled at the turn boundary
+before unloading. Startup failure follows the ranked qualified fallback order,
+and routing journals store a prompt digest rather than owner text.
 
 Short chat, explicit tool-result, and research generation use guarded token
 streaming; routine conversation also uses a compact persona prompt. Multi-step

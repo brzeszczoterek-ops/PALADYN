@@ -72,6 +72,12 @@ def test_browser_claim_requires_browser_tool() -> None:
     assert unsupported_execution_claims(answer, ("browser_snapshot",)) == ()
 
 
+def test_browser_claim_is_supported_by_high_level_web_tools() -> None:
+    answer = "I searched the website and opened the page, Boss."
+
+    assert unsupported_execution_claims(answer, ("web_search", "web_read")) == ()
+
+
 def test_detects_live_mythos_inside_system_paraphrase() -> None:
     answer = (
         "You're right, Boss. I'm already inside his system from the break-in — "

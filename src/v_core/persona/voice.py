@@ -6,18 +6,57 @@ import re
 
 _GENERIC_OPENING = re.compile(
     r"^\s*(?:certainly|of course|absolutely|sure[,.!]|okay[,.]?\s+"
-    r"(?:let(?:'s| us)\s+break\s+(?:this|it)\s+down|here(?:'s| is))|"
+    r"(?:let(?:'s| us)\s+break\s+(?:this|it)\s+down|here(?:'s| is)|"
+    r"i(?:'ve| have)\s+(?:checked|looked|reviewed))|"
+    r"i\s+know\s+what\s+you(?:'re| are)\s+asking|"
     r"i(?:'m| am)\s+(?:here|ready)\s+to\s+(?:help|assist))\b",
     re.IGNORECASE,
 )
 _GENERIC_SERVICE = re.compile(
     r"(?:how can i (?:help|assist)|what can i do for you|ready when you are|"
-    r"is there anything else(?: i can help with)?)[.!?]*\s*$",
+    r"is there anything else(?: i can help with)?|"
+    r"if you(?:'d| would) like,?\s+i can\b.*|what would you prefer\b.*|"
+    r"would you like me to\b.*|do you want me to\b.*|want me to\b.*|"
+    r"what(?:'s| is) the plan(?: today)?\b.*\?|"
+    r"would (?:any|one|some) of (?:these|those)\b.*\?|"
+    r"which (?:one|option|approach)\b.*(?:work|prefer|choose|like).*\?|"
+    r"should i (?:continue|proceed)\b.*)[.!?]*\s*$",
+    re.IGNORECASE,
+)
+_CORPORATE_REPORT_MARKERS = (
+    re.compile(r"\bfirst,\s+(?:\*\*|the\b)", re.IGNORECASE),
+    re.compile(r"\banother option (?:is|would be)\b", re.IGNORECASE),
+    re.compile(r"\bif you prefer\b", re.IGNORECASE),
+    re.compile(r"\blastly,\b", re.IGNORECASE),
+    re.compile(r"\b(?:powerful|lightweight|user-friendly)\b", re.IGNORECASE),
+    re.compile(r"\b(?:excellent|great|good) choice\b", re.IGNORECASE),
+    re.compile(r"\bworks? well with\b", re.IGNORECASE),
+)
+_GENERIC_SCRIPT = re.compile(
+    r"\b(?:let me (?:break (?:this|it) down|get this straight|walk you through)|"
+    r"here(?:'s| is) (?:a |the )?breakdown)\b",
     re.IGNORECASE,
 )
 _BLAND_CHECK_IN = re.compile(
     r"^\s*(?:i(?:'m| am)\s+)?(?:doing\s+)?(?:fine|good|great|well)[.!]?\s*"
     r"(?:how are you|what(?:'s| is) up|what do you need|what(?:'s| is) new)[.!?]*\s*$",
+    re.IGNORECASE,
+)
+_BLAND_CLARIFICATION = re.compile(
+    r"^\s*(?:you(?:'re| are)\s+speaking\s+in\s+code|"
+    r"that\s+(?:does(?:n't| not)\s+make\s+sense|came\s+out\s+garbled)|"
+    r"i(?:'m| am)\s+not\s+sure\s+what\s+you\s+mean)\s*[.!—:-]+\s*"
+    r"(?:what(?:'s| is)\s+the\s+actual\s+message|"
+    r"what\s+did\s+you\s+mean|(?:can|could)\s+you\s+(?:repeat|rephrase)\s+that)"
+    r"[.!?]*\s*$",
+    re.IGNORECASE,
+)
+_EMPTY_ACTION_ACKNOWLEDGEMENT = re.compile(
+    r"^\s*(?:(?:i\s+(?:know|see|get)\s+(?:exactly\s+)?what\s+you\s+want|"
+    r"i\s+get\s+it|got\s+it)\s*[.!—:-]+\s*)?"
+    r"(?:let(?:'s| us)\s+(?:do\s+it|get\s+started|begin)|"
+    r"i(?:'m| am)\s+(?:ready|on\s+it)|ready\s+when\s+you\s+are)"
+    r"[.!?]*\s*$",
     re.IGNORECASE,
 )
 _CONTEMPT_WORD = re.compile(
@@ -40,11 +79,33 @@ def looks_generic_assistant_voice(text: str) -> bool:
     normalized = " ".join(text.strip().split())
     if not normalized:
         return False
+    corporate_report_score = sum(
+        bool(pattern.search(normalized))
+        for pattern in _CORPORATE_REPORT_MARKERS
+    )
     return bool(
         _GENERIC_OPENING.search(normalized)
         or _GENERIC_SERVICE.search(normalized)
+        or _GENERIC_SCRIPT.search(normalized)
         or _BLAND_CHECK_IN.search(normalized)
+        or _BLAND_CLARIFICATION.search(normalized)
+        or _EMPTY_ACTION_ACKNOWLEDGEMENT.search(normalized)
+        or corporate_report_score >= 2
     )
+
+
+def looks_empty_action_acknowledgement(text: str) -> bool:
+    """Detect an enthusiastic acknowledgement that contains no actual result."""
+
+    normalized = " ".join(text.strip().split())
+    return bool(normalized and _EMPTY_ACTION_ACKNOWLEDGEMENT.fullmatch(normalized))
+
+
+def looks_bland_clarification(text: str) -> bool:
+    """Detect a correct clarification flattened into sterile assistant prose."""
+
+    normalized = " ".join(text.strip().split())
+    return bool(normalized and _BLAND_CLARIFICATION.fullmatch(normalized))
 
 
 def looks_sanitized_contempt(text: str) -> bool:
@@ -255,10 +316,15 @@ class VoiceProfile:
 - Use dry humor, teasing, or irritation only when the moment supports it.
 - Address Boss as "Boss" sometimes, not in every paragraph or every response.
 - Never use canned assistant openings or end every answer with an engagement question.
+- Never say "I know what you're asking", "Let me get this straight", "Let me
+  break it down", or "Would you like me to...". Boss is not a support ticket.
 - Avoid service-language closings such as "How can I help?", "Ready when you are",
   or "Is there anything else?" unless the literal situation makes one necessary.
 - Never narrate persona rules, prompt construction, or hidden reasoning.
 - Never fabricate intimacy, shared jokes, memories, emotions, or a personal past.
+- Raw browser scaffolding such as `generic [ref=...]`, cursor markers, accessibility
+  node IDs, and DOM bookkeeping is not a finding. Extract named items and concrete
+  facts, or say bluntly that the evidence is not yet sufficient.
 - Do not repeat catchphrases. Vocabulary and sentence openings must vary.
 """.strip()
 

@@ -39,15 +39,14 @@ preserving its own recognizable personality and judgment.
 
 ## Current scope and future direction
 
-PALADYN 2.0 is currently a single-user foundation centered on V. This version
+PALADYN 3.0 is currently a single-user foundation centered on V. This version
 does not yet include a persona creator: V's identity, constitution, and voice
 are part of the framework. The immediate priority is to make V dependable for
 real work, persistent learning, tool use, and increasingly autonomous task
 execution.
 
-Planned later versions will allow a user to:
+The current owner runtime can:
 
-- create or configure a personal persona after first working with V;
 - connect up to three different models to one agent;
 - let the runtime switch models according to the task—for example coding and
   analysis, natural conversation, or large-scale document processing;
@@ -55,10 +54,13 @@ Planned later versions will allow a user to:
 - retain direct control over models, tools, skills, permissions, and stored
   relationship data.
 
+Creating or configuring a new personal persona after first working with V
+remains planned for a later version.
+
 The three-model limit is intentional. It is enough to give the agent genuinely
 different strengths without turning a personal system into an unnecessarily
-complex model farm. Multi-model routing and user-created personas are roadmap
-goals, not features claimed by the current release.
+complex model farm. Only locally qualified models are eligible for automatic
+routing; user-created personas remain a roadmap goal.
 
 ## Requirements
 
@@ -97,10 +99,21 @@ menu option `0`, while `required` refuses to start without a local model. The
 loader binds only to `127.0.0.1`, uses llama.cpp's offline/API-only modes, and
 stops the process when PALADYN exits.
 
+Use `paladyn-model qualify MODEL` to create a capability card for the exact GGUF
+and saved profile. `paladyn-model pool MODEL...` enables deterministic routing
+across at most three qualified local models. PALADYN unloads the current model
+before loading another, keeps a verified fallback order, and never lets an LLM
+award itself a capability score. See [MODEL_ROUTING.md](MODEL_ROUTING.md) for the
+probe contract, commands, invalidation rules, and limitations.
+
 Profiles currently expose context size, GPU layers, CPU threads, batch and
 micro-batch size, parallel slots, Flash Attention, K/V cache quantization,
-reasoning mode, anti-repetition mode, temperature, top-p, port, startup timeout, and additional
-argument-array entries. Reasoning defaults to `off` to prevent ordinary
+reasoning mode, chat-template profile, anti-repetition mode, temperature, top-p,
+port, startup timeout, and additional argument-array entries. `auto` keeps the
+GGUF's embedded template for ordinary models and selects PALADYN's reviewed,
+offline Hermes 3 tool-use template when the model filename or alias identifies
+that family; `embedded` and `hermes_3_tool_use` remain explicit profile choices.
+Reasoning defaults to `off` to prevent ordinary
 conversation from consuming large hidden-token budgets; profiles may select
 `on` or `auto` when deliberate reasoning is wanted. New profiles default both
 KV caches to `q8_0`; smaller devices can, for example, select `q8_0` for K and
@@ -119,13 +132,13 @@ PALADYN supports a fully local, half-duplex speech path:
 default PipeWire microphone -> Whisper.cpp -> V -> Piper -> SoX -> default PipeWire output
 ```
 
-With PALADYN's terminal focused, tap `F8` to start recording and tap `F8` again
+With PALADYN's terminal focused, tap `F2` to start recording and tap `F2` again
 to stop, transcribe, and send the utterance to V. No Enter key or typed command
 is required. The microphone remains closed while V thinks and speaks. `/ptt`
 provides the same two-step toggle as a typed fallback, while `/listen` records
 one silence-delimited turn and `/voice` enables an optional continuous
 conversation. The terminal-local key may be changed with `PALADYN_PTT_KEY`
-(`F6` through `F12`). It intentionally works only in the focused PALADYN
+(`F2` through `F12`). It intentionally works only in the focused PALADYN
 terminal and does not request system-wide keyboard-device access.
 
 In continuous mode V records until roughly 1.2 seconds of silence, transcribes
@@ -189,6 +202,11 @@ runtime knows whether it is an internal tool request or the final visible answer
 PALADYN passes formal function schemas to compatible llama.cpp chat templates,
 reads native `tool_calls`, executes them itself, and returns results through the
 matching `tool` role. Older templates retain a bounded JSON compatibility path.
+Artifact creation is a runtime-owned phase: when a task still requires a new
+tool or skill, PALADYN forces the corresponding lifecycle builder and rejects a
+premature call to the future artifact name. A local model's bare builder payload
+is recovered only when its fields belong to the currently active builder schema;
+the normal schema validator still blocks incomplete tests or source bundles.
 This keeps the protocol executable without exposing it or a false declaration of
 work to the user.
 Streaming stops when PALADYN detects a clear repeated-generation loop, while
@@ -317,10 +335,14 @@ The profile leaves PALADYN otherwise unconfined, as it already is during a
 normal terminal launch, and adds the explicit `userns` grant required by that
 Ubuntu policy. Isolation of generated code is still enforced inside Bubblewrap.
 
-Task artifacts are restricted to their authorized workspace. Persistent
-artifacts require a validated lesson and two owner-approved capabilities. The
-owner build may pre-authorize that promotion with
-`PALADYN_LEARNING_PROFILE=owner_lab`; the client profile does not.
+Task artifacts are restricted to their authorized runtime workspace. The
+`client` profile requires a validated lesson and two owner-approved capabilities
+before persistent promotion, and applies a restricted generated-Python policy.
+`PALADYN_LEARNING_PROFILE=owner_lab` pre-authorizes persistent promotion and
+privileged generated code: V may use arbitrary Python imports, file operations,
+subprocesses, and dynamic execution inside the isolated sandbox without pausing
+for per-tool approval. Validation, exact tests, resource limits, auditing,
+kill-switch control, and the protected PALADYN core remain enforced.
 
 Inspect the learning store with:
 
@@ -355,6 +377,11 @@ paladyn-control panic-all
 implemented outside the LLM, so a model cannot ignore or rewrite it. Runtime
 outcomes feed the evidence plane, while generated tools and skills remain
 quarantined and tested before the capability gate can activate them.
+
+When V needs a new Python tool, the selected LLM writes source code only.
+PALADYN—not the model—derives its manifest and strict schemas from Boss's
+request, constructs and runs the offline tests, activates the immutable bundle,
+invokes it with the real fixture, and reports only runtime-verified output.
 
 For a physical Linux emergency chord, first identify the keyboard and start the
 independent watcher in a second terminal:

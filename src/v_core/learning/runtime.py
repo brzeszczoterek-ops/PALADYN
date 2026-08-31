@@ -22,11 +22,13 @@ from .models import (
     LessonStatus,
     SkillManifest,
     ToolManifest,
+    ToolTestCase,
     clean_text,
     utc_now,
 )
 from .policy import ArtifactPolicy, ArtifactPolicyError
 from .schema import SchemaError, validate_instance
+from .source_builder import build_source_blueprint, schema_from_example
 from .storage import LearningStore
 
 
@@ -47,7 +49,12 @@ class LearningRuntime:
     def __post_init__(self) -> None:
         self.root = Path(self.root).resolve()
         self.store = LearningStore(self.root)
-        self.policy = ArtifactPolicy(self.authorization)
+        self.policy = ArtifactPolicy(
+            self.authorization,
+            privileged_generated_code=self.authorization.envelope.allows(
+                "owner:privileged_generated_code"
+            ),
+        )
         self.runtime_root = self.root / "runtime"
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         self.runtime_root.chmod(0o700)
@@ -260,6 +267,127 @@ class LearningRuntime:
         await self.validate_artifact(record.artifact_id)
         return self.activate_artifact(record.artifact_id)
 
+    async def create_tool_from_source(
+        self,
+        source: str,
+        *,
+        objective: str,
+        observed_snapshot: str = "",
+        name_hint: str = "",
+        description_hint: str = "",
+        version: str = "1.0.0",
+        scope: ArtifactScope = ArtifactScope.TASK,
+        timeout_seconds: float = 10.0,
+    ) -> ArtifactRecord:
+        """Build and run a complete lifecycle while the model supplies code only.
+
+        Identity and fixtures are derived from the immutable interaction objective,
+        runtime-observed data, and literal source defaults. If Boss supplied an
+        ``expected = {...}`` oracle, normal validation checks it. Otherwise PALADYN
+        runs the candidate twice offline and accepts only a byte-equivalent JSON
+        result as a deterministic contract smoke test. The latter proves execution
+        and determinism, not domain correctness, and is named accordingly in the
+        immutable manifest.
+        """
+
+        self.policy.may_validate()
+        self.policy.validate_tool_source(source)
+        blueprint = build_source_blueprint(
+            objective=objective,
+            source=source,
+            observed_snapshot=observed_snapshot,
+            name_hint=name_hint,
+            description_hint=description_hint,
+        )
+        expected = blueprint.expected
+        if expected is None:
+            first = await self._preview_generated_source(
+                name=blueprint.name,
+                description=blueprint.description,
+                source=source,
+                arguments=blueprint.arguments,
+                timeout_seconds=timeout_seconds,
+            )
+            second = await self._preview_generated_source(
+                name=blueprint.name,
+                description=blueprint.description,
+                source=source,
+                arguments=blueprint.arguments,
+                timeout_seconds=timeout_seconds,
+            )
+            if first != second:
+                raise ArtifactValidationError(
+                    "generated tool is nondeterministic on its runtime-derived "
+                    "contract fixture"
+                )
+            expected = first
+
+        test = ToolTestCase(
+            name=(
+                "owner-specified semantic oracle"
+                if blueprint.oracle == "owner_expected"
+                else "runtime-derived deterministic contract smoke test"
+            ),
+            arguments=blueprint.arguments,
+            expected=expected,
+        )
+        manifest = ToolManifest(
+            name=blueprint.name,
+            version=version,
+            description=blueprint.description,
+            input_schema=schema_from_example(test.arguments),
+            output_schema=schema_from_example(test.expected),
+            tests=(test,),
+            scope=scope,
+            lesson_ids=(),
+            timeout_seconds=timeout_seconds,
+        )
+        return await self.create_tool(manifest, source)
+
+    async def _preview_generated_source(
+        self,
+        *,
+        name: str,
+        description: str,
+        source: str,
+        arguments: dict[str, Any],
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        """Execute unstaged source once in the same offline sandbox as validation."""
+
+        permissive_output = {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": True,
+        }
+        preview_manifest = ToolManifest(
+            name=name,
+            version="0.0.0",
+            description=description,
+            input_schema=schema_from_example(arguments),
+            output_schema=permissive_output,
+            tests=(
+                ToolTestCase(
+                    name="internal source preview",
+                    arguments=arguments,
+                    expected={},
+                ),
+            ),
+            scope=ArtifactScope.TASK,
+            lesson_ids=(),
+            timeout_seconds=timeout_seconds,
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="source-preview-",
+            dir=self.runtime_root,
+        ) as preview_root:
+            # _execute mounts its second read-only input at /inputs/1-tool.py.
+            # Keep the preview filename identical to immutable stored bundles.
+            source_path = Path(preview_root) / "tool.py"
+            source_path.write_text(source, encoding="utf-8")
+            source_path.chmod(0o600)
+            return await self._execute(preview_manifest, source_path, arguments)
+
     def _tool_version_record(
         self,
         manifest: ToolManifest,
@@ -470,7 +598,11 @@ class LearningRuntime:
         return {
             "passed": True,
             "checked_at": utc_now(),
-            "static_policy": "passed",
+            "static_policy": (
+                "owner_privileged"
+                if self.policy.privileged_generated_code
+                else "restricted"
+            ),
             "sandbox": self.backend.name,
             "network": "offline",
             "tests": cases,
@@ -570,7 +702,11 @@ class LearningRuntime:
         scope: ArtifactScope,
     ) -> None:
         lesson_ids = tuple(lesson_ids)
-        if scope is ArtifactScope.PERSISTENT and not lesson_ids:
+        if (
+            scope is ArtifactScope.PERSISTENT
+            and not lesson_ids
+            and not self.policy.privileged_generated_code
+        ):
             raise ArtifactPolicyError(
                 "persistent generated artifacts require a validated lesson"
             )

@@ -23,6 +23,7 @@ from .models import (
 from .policy import AuthorizationDenied, AuthorizationGuard
 from .runner import AutonomousRunner, StepDriver
 from .runtime import RuntimeRegistry
+from .run_review import load_task_checkpoint, review_task, review_task_checkpoint
 
 __all__ = [
     "AgentTaskTrace",
@@ -43,6 +44,9 @@ __all__ = [
     "MultilingualIntentRouter",
     "PanicRequested",
     "RuntimeRegistry",
+    "load_task_checkpoint",
+    "review_task",
+    "review_task_checkpoint",
     "SemanticIntent",
     "StepOutcome",
     "StepDriver",

@@ -1,8 +1,9 @@
 # PALADYN Learning, Skills, and Generated Tools
 
 PALADYN learning is an evidence-driven runtime mechanism. It is not model
-fine-tuning, an unrestricted self-modifying loop, or an LLM writing claims into
-its own system prompt.
+fine-tuning or an LLM writing claims into its own system prompt. The owner build
+may run privileged generated code, but that code remains a separately audited
+artifact below PALADYN's protected core and emergency controls.
 
 ## Lifecycle
 
@@ -83,11 +84,17 @@ def run(arguments):
     return {"result": arguments["value"] * 2}
 ```
 
-Its manifest defines immutable versioning, JSON input/output schemas, scope,
-linked lessons, limits, and exact test cases. PALADYN then:
+For the ordinary autonomous creation path, the model supplies **only that Python
+source**. It does not author the manifest, schemas, tests, activation request,
+execution request, or success report. PALADYN derives those control-plane
+objects from the immutable owner request and the source AST, then owns every
+remaining lifecycle transition. The complete manifest still defines immutable
+versioning, JSON input/output schemas, scope, linked lessons, limits, and exact
+test cases. PALADYN then:
 
 1. validates the schema and reserved name boundary;
-2. parses the Python AST and rejects dangerous imports/calls;
+2. parses the Python AST and applies either the client restricted-code policy or
+   the owner-approved privileged-code policy;
 3. mounts the trusted host and generated source read-only into Bubblewrap;
 4. runs every case with no network, no host home, no inherited environment,
    process/memory/CPU limits, output limits, a wall-clock timeout, and per-file
@@ -95,10 +102,52 @@ linked lessons, limits, and exact test cases. PALADYN then:
 5. validates the returned JSON against the declared output schema;
 6. checks the bundle digest again immediately before activation.
 
+After activation, PALADYN binds the final owner fixture to the validated input
+schema and invokes the new tool itself. A successful creation call is therefore
+not enough to satisfy a request that also asked to use the tool. The final
+completion message is built from the artifact record and verified execution
+result, not from a model claim.
+
+If Boss supplied an exact `expected = {...}` value, it becomes the semantic
+oracle for the corresponding quarantine fixture. Without an expected result,
+PALADYN may run the candidate twice and accept only byte-equivalent JSON as a
+determinism smoke test. That smoke test proves repeatability and schema
+compatibility, not that the program implements an unstated domain rule.
+
 Generated tools cannot replace built-in PALADYN, filesystem, browser, learning,
-or EVM tool names. The initial backend intentionally supports only an allowlist
-of non-I/O standard-library modules. Networked tools and third-party dependency
-installation require a future enforcing backend and are rejected today.
+or EVM tool names. In `client`, generated source uses an allowlist of non-I/O
+standard-library modules and rejects dynamic execution, subprocesses, and direct
+file operations. In `owner_lab`, the pre-authorized
+`owner:privileged_generated_code` capability permits arbitrary Python imports,
+`open`, subprocesses, dynamic imports, and `eval`/`exec`/`compile` inside the
+isolated sandbox. The owner policy controls containment and evidence, not the
+subject matter or purpose of the tool.
+
+Both profiles currently execute generated Python without network access and
+without the host home, credentials, sockets, or PALADYN's protected state.
+Network acquisition is composed through registered browser/web tools and skills;
+the generated tool receives the resulting data for local processing. This keeps
+autonomous creation non-interactive without silently turning generated code into
+an unrestricted host process.
+
+For deterministic tool creation, an owner request may provide repeated JSON
+assignments such as `records = [...]`, `keywords = [...]`, and
+`expected = {...}`. PALADYN reads those literals directly from the immutable task
+request instead of asking a local model to copy them. The first occurrence of an
+input is used by the quarantine test; after activation, the last occurrence is
+bound to the real execution call. This is schema-driven and independent of the
+tool name, subject, and language surrounding the JSON. It prevents long URLs,
+nested records, and expected values from drifting during model generation.
+Candidate source must consume the concrete fixture fields exposed by its
+`run(arguments)` interface. A program that ignores them and merely hard-codes
+the demonstrated expected result is rejected before staging.
+
+When a generated candidate fails, a context rollover preserves its source,
+expected output, and validator error while omitting the duplicate fixture body
+already present in the objective. The next iteration therefore repairs a concrete
+candidate instead of reconstructing one from a shortened summary. Passing the
+lifecycle still depends on the selected model's coding ability; repeated invalid
+source is rejected and checkpointed, never activated as a successful tool.
 
 An active tool is automatically retired after three execution failures. If it
 replaced an earlier active version, PALADYN rolls back to that directly
@@ -136,17 +185,21 @@ non-matching test.
 workspace. They remain available after a restart of that same workspace but are
 invisible to other workspaces.
 
-`persistent` artifacts can be reused across tasks. They require:
+`persistent` artifacts can be reused across tasks. In `client` they require:
 
 - a validated linked lesson;
 - `owner:create_persistent_artifacts` to stage;
 - `owner:activate_persistent_artifacts` to activate;
 - both capabilities in the normal and owner-approved capability sets.
 
-`PALADYN_LEARNING_PROFILE=owner_lab` pre-authorizes those two owner capabilities
-for the owner's build. This allows Full Autonomous to promote a fully validated
-artifact without interrupting Boss for every individual creation. The `client`
-profile does not pre-authorize persistent promotion.
+`PALADYN_LEARNING_PROFILE=owner_lab` pre-authorizes those two promotion
+capabilities plus `owner:privileged_generated_code`. This allows Full Autonomous
+to create privileged task or persistent artifacts without interrupting Boss for
+every individual operation. A persistent owner artifact may be promoted without
+a previously validated lesson, but still requires quarantine tests, exact schema
+validation, digest verification, auditing, sandbox execution, and automatic
+retirement after repeated failures. The `client` profile retains the lesson and
+restricted-source requirements.
 
 ## Operator audit
 

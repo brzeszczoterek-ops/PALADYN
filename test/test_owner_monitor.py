@@ -2,13 +2,18 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from datetime import datetime, timezone
 import json
+import os
 
 from v_core.owner_monitor import (
+    browser_activity_lines,
     build_monitor_command,
+    compact_url,
     compact_tegrastats,
     counter_rate,
     launch_owner_monitor,
+    latest_browser_activity,
     monitor_session_identity,
     parse_prometheus,
     parse_response_timing,
@@ -104,30 +109,36 @@ def test_monitor_command_contains_only_explicit_session_values(tmp_path: Path) -
         session,
         terminal=Path("/usr/bin/gnome-terminal"),
         python=Path("/venv/bin/python"),
+        owner_pid=9876,
     )
 
     assert command[0] == "/usr/bin/gnome-terminal"
     assert command[command.index("--pid") + 1] == "4321"
+    assert command[command.index("--owner-pid") + 1] == "9876"
     assert command[command.index("--model") + 1] == "mythos"
     assert command[command.index("--cache-v") + 1] == "q4_0"
     assert command[command.index("--log") + 1] == str(session.log_path)
-    assert command[command.index("--session") + 1] == "20260824-012340-pid4321"
+    assert command[command.index("--session") + 1].endswith("-vpid9876")
     assert command[command.index("--telemetry") + 1].endswith(
-        "monitor_sessions/20260824-012340-pid4321.jsonl"
+        "-vpid9876.jsonl"
     )
 
 
 def test_monitor_session_identity_is_unique_and_bound_to_current_log(
     tmp_path: Path,
 ) -> None:
-    session_id, telemetry = monitor_session_identity(_session(tmp_path))
+    session_id, telemetry = monitor_session_identity(
+        _session(tmp_path),
+        owner_pid=9876,
+        started_at=datetime(2026, 8, 26, 1, 23, 40, tzinfo=timezone.utc),
+    )
 
-    assert session_id == "20260824-012340-pid4321"
+    assert session_id == "20260826-012340-000000-vpid9876"
     assert telemetry == (
         tmp_path
         / "runtime"
         / "monitor_sessions"
-        / "20260824-012340-pid4321.jsonl"
+        / "20260826-012340-000000-vpid9876.jsonl"
     )
 
 
@@ -143,6 +154,104 @@ def test_telemetry_journal_is_private_append_only_jsonl(tmp_path: Path) -> None:
     assert all(event["session_id"] == "session-1" for event in events)
     assert path.stat().st_mode & 0o777 == 0o600
     assert path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_latest_browser_activity_reads_only_newest_task(tmp_path: Path) -> None:
+    checkpoints = tmp_path / "interactive" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    old = checkpoints / "interactive-old.json"
+    old.write_text(
+        json.dumps(
+            {
+                "task_id": "interactive-old",
+                "status": "completed",
+                "tool_calls": [
+                    {
+                        "sequence": 1,
+                        "tool": "browser_navigate",
+                        "arguments": {"url": "https://old.example/"},
+                        "status": "succeeded",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    current = checkpoints / "interactive-current.json"
+    current.write_text(
+        json.dumps(
+            {
+                "task_id": "interactive-current",
+                "status": "running",
+                "tool_calls": [
+                    {
+                        "sequence": 2,
+                        "tool": "browser_navigate",
+                        "arguments": {
+                            "url": "https://www.google.com/search?q=example"
+                        },
+                        "status": "succeeded",
+                        "started_at": "2026-08-26T03:35:34+00:00",
+                        "result_excerpt": (
+                            "### Page\n"
+                            "- Page URL: https://www.google.com/sorry/index\n"
+                            "- HTTP status: 429\n"
+                        ),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.utime(old, ns=(1, 1))
+    os.utime(current, ns=(2, 2))
+
+    activity = latest_browser_activity(tmp_path)
+
+    assert activity is not None
+    assert activity.task_id == "interactive-current"
+    assert activity.task_status == "running"
+    assert len(activity.visits) == 1
+    assert activity.visits[0].http_status == 429
+    assert activity.visits[0].final_url == "https://www.google.com/sorry/index"
+
+
+def test_browser_activity_lines_distinguish_tool_and_http_status(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "interactive" / "checkpoints" / "task.json"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text(
+        json.dumps(
+            {
+                "task_id": "task",
+                "status": "running",
+                "tool_calls": [
+                    {
+                        "sequence": 1,
+                        "tool": "browser_navigate",
+                        "arguments": {"url": "https://example.com/search?q=test"},
+                        "status": "succeeded",
+                        "started_at": "2026-08-26T03:35:34+00:00",
+                        "result_excerpt": (
+                            "- Page URL: https://example.com/blocked\n"
+                            "- HTTP status: 429"
+                        ),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rendered = "\n".join(
+        browser_activity_lines(latest_browser_activity(tmp_path))
+    )
+
+    assert "tool succeeded · HTTP 429" in rendered
+    assert "example.com/search?q=test" in rendered
+    assert "example.com/blocked" in rendered
+    assert compact_url("https://example.com/path") == "example.com/path"
 
 
 def test_owner_monitor_is_disabled_by_default(tmp_path: Path) -> None:

@@ -7,6 +7,9 @@ import stat
 import pytest
 
 from v_core.memory.memory_engine import MemoryEngine
+from v_core.memory.experience import Experience
+from v_core.memory.knowledge import Knowledge
+from v_core.memory.manager import recent_records_json
 from v_core.memory.models import (
     ExperienceEntry,
     KnowledgeEntry,
@@ -15,6 +18,8 @@ from v_core.memory.models import (
     ReflectionEntry,
     SummaryEntry,
 )
+from v_core.memory.reflection import Reflection
+from v_core.memory.summary import Summary
 from v_core.persona.kernel import IdentityKernel
 from v_core.persona.runtime import PersonaRuntime
 from v_core.persona.voice import VoiceProfile
@@ -33,6 +38,70 @@ class LLMStub:
     async def ask(self, prompt: str, **kwargs) -> str:
         self.prompts.append(prompt)
         return self.response
+
+
+def test_memory_prompt_context_is_bounded_and_keeps_newest_records() -> None:
+    records = [
+        {
+            "timestamp": f"2026-08-27T03:{minute:02d}:00+00:00",
+            "summary": f"record-{minute}-" + ("x" * 1_000),
+        }
+        for minute in range(60)
+    ]
+
+    rendered = recent_records_json(records, max_records=12, max_chars=3_000)
+    data = __import__("json").loads(rendered)
+
+    assert len(rendered) <= 3_000
+    assert data["omitted_older_records"] > 0
+    assert "record-59" in rendered
+    assert "record-0-" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_every_memory_stage_bounds_accumulated_history() -> None:
+    old_experiences = [
+        {
+            "timestamp": f"2026-08-{day:02d}T03:00:00+00:00",
+            "summary": f"experience-{day}-" + ("x" * 1_500),
+            "lesson": "Keep runtime evidence.",
+        }
+        for day in range(1, 80)
+    ]
+    old_knowledge = [
+        {
+            "timestamp": f"2026-07-{day:02d}T03:00:00+00:00",
+            "title": f"knowledge-{day}",
+            "content": "y" * 1_500,
+        }
+        for day in range(1, 31)
+    ]
+    reflection = ReflectionEntry(
+        summary="Current result",
+        lesson="Use bounded context.",
+        remember=True,
+    )
+    summary = SummaryEntry(summary="Current summary")
+
+    llm = LLMStub("{}")
+    await Experience(llm).learn(reflection, old_experiences, old_knowledge)
+    await Summary(llm).summarize(old_experiences, old_knowledge)
+    await Knowledge(llm).update(summary, old_knowledge)
+    await Reflection(llm).reflect(
+        "task " + ("t" * 50_000),
+        "result " + ("r" * 50_000),
+        execution={
+            "status": "completed",
+            "tool_calls": [{"status": "succeeded", "result": "z" * 50_000}],
+            "successful_tool_count": 1,
+        },
+    )
+
+    assert len(llm.prompts) == 4
+    assert all(len(prompt) < 12_000 for prompt in llm.prompts)
+    assert "experience-79" in llm.prompts[0]
+    assert "experience-1-" not in llm.prompts[0]
+    assert "[memory evidence clipped]" in llm.prompts[3]
 
 
 def test_relationship_state_normalises_untrusted_values() -> None:

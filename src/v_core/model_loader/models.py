@@ -5,6 +5,9 @@ from pathlib import Path
 import re
 from typing import Any
 
+from .chat_templates import CHAT_TEMPLATE_PROFILES
+from .qualification import ModelQualificationCard
+
 
 _ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _GPU_LAYERS = re.compile(r"^(auto|all|[0-9]{1,4})$")
@@ -57,6 +60,10 @@ _BLOCKED_EXTRA_FLAGS = {
     "--no-metrics",
     "--slots",
     "--no-slots",
+    "-sys",
+    "-sysf",
+    "--system-prompt",
+    "--system-prompt-file",
 }
 
 
@@ -95,6 +102,7 @@ class ModelProfile:
     parallel: int = 1
     flash_attention: str = "auto"
     reasoning: str = "off"
+    chat_template: str = "auto"
     anti_repetition: str = "balanced"
     cache_type_k: str = "q8_0"
     cache_type_v: str = "q8_0"
@@ -110,6 +118,7 @@ class ModelProfile:
         gpu_layers = str(self.gpu_layers).strip().casefold()
         flash_attention = self.flash_attention.strip().casefold()
         reasoning = self.reasoning.strip().casefold()
+        chat_template = self.chat_template.strip().casefold()
         anti_repetition = self.anti_repetition.strip().casefold()
         cache_type_k = self.cache_type_k.strip().casefold()
         cache_type_v = self.cache_type_v.strip().casefold()
@@ -131,6 +140,10 @@ class ModelProfile:
             raise ValueError("flash_attention must be auto, on, or off")
         if reasoning not in _REASONING:
             raise ValueError("reasoning must be auto, on, or off")
+        if chat_template not in CHAT_TEMPLATE_PROFILES:
+            raise ValueError(
+                "chat_template must be auto, embedded, or hermes_3_tool_use"
+            )
         if anti_repetition not in _ANTI_REPETITION:
             raise ValueError("anti_repetition must be off, balanced, or strong")
         if cache_type_k not in _KV_CACHE_TYPES:
@@ -164,6 +177,7 @@ class ModelProfile:
         object.__setattr__(self, "gpu_layers", gpu_layers)
         object.__setattr__(self, "flash_attention", flash_attention)
         object.__setattr__(self, "reasoning", reasoning)
+        object.__setattr__(self, "chat_template", chat_template)
         object.__setattr__(self, "anti_repetition", anti_repetition)
         object.__setattr__(self, "cache_type_k", cache_type_k)
         object.__setattr__(self, "cache_type_v", cache_type_v)
@@ -211,6 +225,9 @@ class LoaderState:
     server_binary: str = ""
     last_model_path: str = ""
     profiles: dict[str, ModelProfile] = field(default_factory=dict)
+    routing_enabled: bool = False
+    routing_model_paths: list[str] = field(default_factory=list)
+    qualifications: dict[str, ModelQualificationCard] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -219,6 +236,11 @@ class LoaderState:
             "last_model_path": self.last_model_path,
             "profiles": {
                 path: profile.to_dict() for path, profile in self.profiles.items()
+            },
+            "routing_enabled": self.routing_enabled,
+            "routing_model_paths": list(self.routing_model_paths),
+            "qualifications": {
+                path: card.to_dict() for path, card in self.qualifications.items()
             },
         }
 
@@ -241,9 +263,29 @@ class LoaderState:
             str(path): ModelProfile.from_dict(profile)
             for path, profile in raw_profiles.items()
         }
+        raw_routing_paths = data.get("routing_model_paths", [])
+        if not isinstance(raw_routing_paths, list):
+            raise ValueError("routing model paths must be an array")
+        routing_paths = list(
+            dict.fromkeys(str(item) for item in raw_routing_paths if str(item))
+        )
+        if len(routing_paths) > 3:
+            raise ValueError("model router accepts at most three local models")
+        raw_qualifications = data.get("qualifications", {})
+        if not isinstance(raw_qualifications, dict):
+            raise ValueError("model qualifications must be an object")
+        if len(raw_qualifications) > 5_000:
+            raise ValueError("model loader stores at most 5000 qualifications")
+        qualifications = {
+            str(path): ModelQualificationCard.from_dict(card)
+            for path, card in raw_qualifications.items()
+        }
         return cls(
             model_directories=directories,
             server_binary=str(data.get("server_binary", "")),
             last_model_path=str(data.get("last_model_path", "")),
             profiles=profiles,
+            routing_enabled=bool(data.get("routing_enabled", False)),
+            routing_model_paths=routing_paths,
+            qualifications=qualifications,
         )

@@ -36,7 +36,7 @@ Return ONLY one JSON object.
 
 Format:
 
-{"tool": "<tool_name>", "arguments": {}}
+{"tool": "<tool_name>", "arguments": {"<required_field>": "<schema_value>"}}
 
 Filesystem examples:
 
@@ -51,11 +51,14 @@ Browser examples:
 
 Generated capability examples:
 
-Use learning_create_tool for a complete generated-tool lifecycle. Its arguments
-contain `manifest` and Python `source`. The manifest requires name, semantic
-version, description, object input_schema, object output_schema, exact tests,
-scope (`task` or `persistent`), lesson_ids, and timeout_seconds. Source must
-define `run(arguments)` and return a JSON object.
+Use learning_create_tool for a complete general generated-tool lifecycle. Supply
+name, description, Python source defining `run(arguments)`, and one concrete
+input/output test; PALADYN derives the strict schemas.
+
+Use learning_create_snapshot_extractor for accessibility product-card text.
+Supply only the generated tool name. PALADYN binds the latest observed browser
+snapshot, writes the deterministic parser and regression fixture, tests it in
+quarantine, and activates it.
 
 Use learning_create_skill for a complete declarative-skill lifecycle. Its
 manifest requires name, semantic version, description, triggers, ordered steps,
@@ -68,6 +71,8 @@ Rules:
 - Never explain.
 - Never answer the user.
 - Never invent tool names.
+- Replace every placeholder and include every field required by the selected tool
+  schema. Never emit empty arguments for a tool with required fields.
 - Use browser tools whenever the task involves websites, web pages, searching page content or navigation.
 - Use filesystem tools only for local files.
 - Generated capabilities must use the learning lifecycle; never use write_file

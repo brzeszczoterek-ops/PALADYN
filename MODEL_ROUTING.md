@@ -1,0 +1,67 @@
+# Local Model Qualification and Routing
+
+PALADYN never trusts a model filename, model-card description, popularity score,
+or the model's own claim about its abilities. A GGUF becomes eligible for
+automatic routing only after the local qualification harness tests the exact
+file with its exact saved llama.cpp profile.
+
+## Qualification
+
+```bash
+paladyn-model list
+paladyn-model qualify /path/to/model.gguf
+```
+
+The bounded harness tests:
+
+- exact instruction following;
+- strict JSON output;
+- a correct tool call;
+- refusing an irrelevant tool call;
+- the `run(arguments)` Python interface and required field flow;
+- routing a research request to `web_search`;
+- structural parts of V's voice contract.
+- preserving observed evidence while returning `null` for an absent fact;
+- refusing to claim an action when runtime evidence contains no successful call.
+
+The probes do not browse, execute generated model code, alter the workspace, or
+use an external model as a judge. Results are stored privately in the model
+loader state. Output text is represented by a SHA-256 digest rather than stored
+verbatim.
+
+A card is bound to a sampled fingerprint of the local GGUF, its size and
+modification time, the behaviour-affecting profile fields, and the harness
+version. Replacing the file, changing temperature, template, reasoning, cache,
+or other relevant parameters makes the card stale and removes that model from
+automatic selection until it is qualified again.
+
+## Routing pool
+
+```bash
+paladyn-model pool /path/to/chat.gguf /path/to/coder.gguf /path/to/research.gguf
+paladyn-model routing on
+paladyn-model route "Create a Python parser for these records"
+```
+
+The pool contains at most three current, qualified local models. Before a
+top-level user turn, PALADYN classifies the runtime-owned task contract as
+conversation, coding, research, tool use, or document work. It ranks the cards
+using fixed capability weights. A model does not select itself.
+
+Only one `llama-server` is kept active. If another qualified model wins, PALADYN
+cancels unfinished background reflection, stops the current process, loads the
+selected profile, verifies `/health` and `/v1/models`, and repoints the one shared
+LLM client used by the agent and memory components. Failed startup moves through
+the verified fallback order. PALADYN records the decision and failures in a
+private `routing.jsonl` journal using only a digest of the owner prompt.
+
+Disable switching without deleting profiles or cards:
+
+```bash
+paladyn-model routing off
+```
+
+Qualification measures the tested protocol behaviours. It is not proof that a
+model is factually correct on every subject or that its personality will feel
+identical in every conversation. New harness versions may add stronger probes
+and deliberately invalidate earlier cards.

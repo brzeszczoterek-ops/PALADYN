@@ -139,7 +139,7 @@ def tool_supports_claim(category: str, tool: str) -> bool:
     if category == COMMAND_EXECUTION:
         return name in _COMMAND_TOOLS
     if category == BROWSER_ACTION:
-        return name.startswith("browser_")
+        return name.startswith("browser_") or name in {"web_search", "web_read"}
     return False
 
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "v-core"
-version = "2.0.0"
+version = "3.0.0"
 description = "PALADYN Framework powered by V"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -39,6 +39,7 @@ paladyn-control = "v_core.autonomy.cli:main"
 paladyn-live = "v_core.evm.live_cli:main"
 paladyn-learning = "v_core.learning.cli:main"
 paladyn-monitor = "v_core.owner_monitor:main"
+paladyn-model = "v_core.model_loader.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

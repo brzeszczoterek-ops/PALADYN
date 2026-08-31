@@ -21,6 +21,13 @@ from .runtime import (
     LearningRuntime,
 )
 from .schema import SchemaError, validate_instance, validate_schema
+from .source_builder import (
+    SourceBlueprint,
+    SourceBlueprintError,
+    build_source_blueprint,
+    json_assignments,
+    schema_from_example,
+)
 from .storage import (
     HashChainJournal,
     JournalIntegrityError,
@@ -49,11 +56,16 @@ __all__ = [
     "LearningStore",
     "LessonStatus",
     "SchemaError",
+    "SourceBlueprint",
+    "SourceBlueprintError",
     "SkillManifest",
     "SkillTestCase",
     "ToolManifest",
     "ToolTestCase",
     "validate_instance",
     "validate_schema",
+    "build_source_blueprint",
+    "json_assignments",
+    "schema_from_example",
     "audit_learning_store",
 ]

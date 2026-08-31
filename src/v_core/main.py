@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import sys
 from collections.abc import Callable
@@ -20,6 +21,7 @@ from .model_loader import (
     LlamaServerUnavailable,
     ModelLoaderInteractionError,
     ModelLoaderStorageError,
+    RoutedModelRuntime,
     bootstrap_interactive_model,
 )
 from .owner_monitor import launch_owner_monitor
@@ -50,11 +52,19 @@ from .llm import LLM
 
 class VCore:
 
-    def __init__(self, config: Config | None = None):
+    def __init__(
+        self,
+        config: Config | None = None,
+        *,
+        llm: LLM | None = None,
+        model_runtime: RoutedModelRuntime | None = None,
+    ):
 
         self.config = config or load_config()
+        self.model_runtime = model_runtime
 
-        llm = LLM()
+        llm = llm or LLM()
+        self.llm = llm
 
         storage = MemoryStorage(
             self.config.memory_root
@@ -104,6 +114,7 @@ class VCore:
         self.agent = Agent(
             config=self.config,
             memory=memory,
+            llm=llm,
         )
 
         self.autonomy = AutonomousRunner(
@@ -126,6 +137,12 @@ class VCore:
         on_token: Callable[[str], None] | None = None,
     ) -> str:
 
+        if self.model_runtime is not None:
+            # Background reflection must release the shared client before the
+            # one-model-at-a-time runtime unloads a GGUF and selects another.
+            await self.agent.cancel_background_memory()
+            await self.model_runtime.ensure_for(prompt)
+
         return await self.agent.run(
             prompt,
             on_token=on_token,
@@ -135,7 +152,18 @@ class VCore:
         try:
             await self.agent.close()
         finally:
-            self.runtime_registry.unregister()
+            try:
+                if self.model_runtime is not None:
+                    await self.model_runtime.stop()
+            finally:
+                try:
+                    close = getattr(self.llm.client, "close", None)
+                    if callable(close):
+                        result = close()
+                        if inspect.isawaitable(result):
+                            await result
+                finally:
+                    self.runtime_registry.unregister()
 
     async def run_autonomous(
         self,
@@ -174,10 +202,26 @@ async def chat():
         mode=config.model_loader_mode,
     )
     owner_monitor_started = launch_owner_monitor(model_session)
+    model_runtime: RoutedModelRuntime | None = None
     try:
-        core = VCore(config)
+        if model_session is None:
+            core = VCore(config)
+        else:
+            shared_llm = LLM()
+            model_runtime = RoutedModelRuntime(
+                model_session,
+                config.model_runtime_root,
+                shared_llm,
+            )
+            core = VCore(
+                config,
+                llm=shared_llm,
+                model_runtime=model_runtime,
+            )
     except BaseException:
-        if model_session is not None:
+        if model_runtime is not None:
+            await model_runtime.stop()
+        elif model_session is not None:
             await model_session.stop()
         raise
 
@@ -268,7 +312,7 @@ async def chat():
                 await speech.close()
             await core.close()
         finally:
-            if model_session is not None:
+            if model_session is not None and model_runtime is None:
                 await model_session.stop()
 
 
@@ -372,15 +416,19 @@ def _configure_push_to_talk_hotkey(
     stdin_is_tty: bool | None = None,
 ) -> str | None:
     environment = os.environ if environ is None else environ
-    key = environment.get("PALADYN_PTT_KEY", "F8").strip().upper()
+    key = environment.get("PALADYN_PTT_KEY", "F2").strip().upper()
     sequences = {
-        "F6": 17,
-        "F7": 18,
-        "F8": 19,
-        "F9": 20,
-        "F10": 21,
-        "F11": 23,
-        "F12": 24,
+        "F2": (r"\eOQ", r"\e[12~"),
+        "F3": (r"\eOR", r"\e[13~"),
+        "F4": (r"\eOS", r"\e[14~"),
+        "F5": (r"\e[15~",),
+        "F6": (r"\e[17~",),
+        "F7": (r"\e[18~",),
+        "F8": (r"\e[19~",),
+        "F9": (r"\e[20~",),
+        "F10": (r"\e[21~",),
+        "F11": (r"\e[23~",),
+        "F12": (r"\e[24~",),
     }
     if key not in sequences:
         return None
@@ -395,7 +443,8 @@ def _configure_push_to_talk_hotkey(
         bind = readline.parse_and_bind
     # Clear any partially typed line without ringing the terminal bell, insert
     # /ptt, and accept it immediately.
-    bind(f'"\\e[{sequences[key]}~": "\\C-A\\C-K/ptt\\C-M"')
+    for sequence in sequences[key]:
+        bind(f'"{sequence}": "\\C-A\\C-K/ptt\\C-M"')
     return key
 
 

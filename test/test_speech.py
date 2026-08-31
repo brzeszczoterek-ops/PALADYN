@@ -270,23 +270,39 @@ def test_normal_prompt_does_not_end_voice_mode() -> None:
     assert _ends_voice_mode("Powiedz mi, jak działa ten kod") is False
 
 
-def test_f8_binds_to_immediate_push_to_talk_command() -> None:
+def test_f2_binds_to_immediate_push_to_talk_command() -> None:
     bindings: list[str] = []
 
     key = _configure_push_to_talk_hotkey(
-        environ={"PALADYN_PTT_KEY": "f8"},
+        environ={"PALADYN_PTT_KEY": "f2"},
         bind=bindings.append,
         stdin_is_tty=True,
     )
 
-    assert key == "F8"
-    assert bindings == ['"\\e[19~": "\\C-A\\C-K/ptt\\C-M"']
+    assert key == "F2"
+    assert bindings == [
+        '"\\eOQ": "\\C-A\\C-K/ptt\\C-M"',
+        '"\\e[12~": "\\C-A\\C-K/ptt\\C-M"',
+    ]
+
+
+def test_f2_is_the_default_push_to_talk_key() -> None:
+    bindings: list[str] = []
+
+    key = _configure_push_to_talk_hotkey(
+        environ={},
+        bind=bindings.append,
+        stdin_is_tty=True,
+    )
+
+    assert key == "F2"
+    assert bindings[0].startswith('"\\eOQ"')
 
 
 def test_push_to_talk_hotkey_is_disabled_for_noninteractive_input() -> None:
     assert (
         _configure_push_to_talk_hotkey(
-            environ={"PALADYN_PTT_KEY": "F8"},
+            environ={"PALADYN_PTT_KEY": "F2"},
             bind=lambda _: None,
             stdin_is_tty=False,
         )

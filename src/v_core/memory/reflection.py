@@ -7,6 +7,7 @@ from ..llm import LLM
 from ..execution_claims import unsupported_execution_claims
 from ..utils import parse_llm_json
 from .models import MemoryKind, MemorySource, ReflectionEntry
+from .manager import clip_text
 
 
 class Reflection:
@@ -48,7 +49,7 @@ class Reflection:
                 source=MemorySource.SELF_GENERATED,
             )
 
-        execution_evidence = json.dumps(
+        execution_evidence = clip_text(json.dumps(
             execution or {
                 "status": "no_runtime_evidence",
                 "tool_calls": [],
@@ -58,7 +59,9 @@ class Reflection:
             ensure_ascii=False,
             indent=2,
             default=str,
-        )
+        ), 2_500)
+        task_evidence = clip_text(task, 1_500)
+        result_evidence = clip_text(result, 3_000)
 
         prompt = f"""
 You are V.
@@ -67,11 +70,11 @@ You have just completed a task.
 
 Task:
 
-{task}
+{task_evidence}
 
 Result:
 
-{result}
+{result_evidence}
 
 Runtime execution evidence:
 

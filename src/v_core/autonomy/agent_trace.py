@@ -40,6 +40,7 @@ class AgentTaskTrace:
     started_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     finished_at: str | None = None
+    runtime_pid: int = field(default_factory=os.getpid)
     requirements: dict[str, bool] = field(default_factory=dict)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     context_rollovers: list[dict[str, Any]] = field(default_factory=list)
@@ -97,12 +98,15 @@ class AgentTaskTrace:
         result: str,
         *,
         error: str | None = None,
+        evidence_excerpt: str | None = None,
     ) -> None:
         call = self.tool_calls[sequence - 1]
         call["status"] = "failed" if error else "succeeded"
         call["finished_at"] = utc_now()
         call["result_sha256"] = _digest(result)
-        call["result_excerpt"] = result[:2_000]
+        call["result_excerpt"] = (
+            result if evidence_excerpt is None else evidence_excerpt
+        )[:2_000]
         if error:
             call["error"] = error
         self.updated_at = utc_now()
@@ -280,6 +284,7 @@ class AgentTaskTrace:
         trace.started_at = str(payload.get("started_at", utc_now()))
         trace.updated_at = str(payload.get("updated_at", utc_now()))
         trace.finished_at = payload.get("finished_at")
+        trace.runtime_pid = int(payload.get("runtime_pid") or 0)
         trace.requirements = dict(payload.get("requirements", {}))
         trace.tool_calls = list(payload.get("tool_calls", []))
         trace.context_rollovers = list(payload.get("context_rollovers", []))
@@ -288,6 +293,58 @@ class AgentTaskTrace:
         trace._journal = TaskJournal(root / "journal")
         trace._checkpoint_root = root / "checkpoints"
         return trace
+
+    @staticmethod
+    def recover_stale_running(root: Path) -> list[str]:
+        """Mark checkpoints abandoned by a dead PALADYN process as interrupted.
+
+        A live PID is left untouched so two explicitly separate runtimes do not
+        rewrite each other's active task. Older checkpoints had no PID; a new
+        runtime can safely recover those because no old process identity exists.
+        """
+
+        recovered: list[str] = []
+        checkpoints = Path(root) / "checkpoints"
+        try:
+            candidates = list(checkpoints.glob("interactive-*.json"))
+        except OSError:
+            return recovered
+        for path in candidates:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict) or payload.get("status") != "running":
+                continue
+            runtime_pid = int(payload.get("runtime_pid") or 0)
+            if runtime_pid > 0:
+                try:
+                    os.kill(runtime_pid, 0)
+                except (OSError, ProcessLookupError):
+                    pass
+                else:
+                    continue
+            task_id = str(payload.get("task_id", path.stem))
+            trace = AgentTaskTrace.load(root, task_id)
+            if trace is None:
+                continue
+            now = utc_now()
+            for call in trace.tool_calls:
+                if call.get("status") != "running":
+                    continue
+                call["status"] = "failed"
+                call["finished_at"] = now
+                call["error"] = "PALADYN runtime exited before the tool completed."
+            trace.status = "interrupted"
+            trace.updated_at = now
+            trace.finished_at = now
+            data = {
+                "reason": "previous PALADYN runtime exited without closing the task"
+            }
+            trace._journal.append(task_id, "task_recovered_as_interrupted", data)
+            trace._save(result=data)
+            recovered.append(task_id)
+        return recovered
 
     def complete(self, answer: str) -> None:
         self.status = "completed"
@@ -334,6 +391,7 @@ class AgentTaskTrace:
             "status": self.status,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "runtime_pid": self.runtime_pid,
             "tool_calls": calls,
             "context_rollovers": self.context_rollovers,
             "owner_checkpoint": self.owner_checkpoint,
@@ -481,7 +539,7 @@ class AgentTaskTrace:
         path = self._checkpoint_root / f"{self.task_id}.json"
         temporary = self._checkpoint_root / f".{self.task_id}.tmp"
         payload = {
-            "schema_version": 3,
+            "schema_version": 4,
             "task_id": self.task_id,
             "objective": self.objective,
             "status": self.status,

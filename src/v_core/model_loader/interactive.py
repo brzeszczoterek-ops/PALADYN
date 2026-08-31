@@ -8,6 +8,7 @@ import sys
 from typing import Callable
 
 from .discovery import discover_models, human_size
+from .chat_templates import CHAT_TEMPLATE_PROFILES, infer_chat_template
 from .models import LoaderState, LocalModel, ModelProfile
 from .runtime import LlamaServerSession, find_llama_server, start_llama_server
 from .storage import ModelLoaderStore
@@ -161,6 +162,7 @@ def default_profile(model: LocalModel) -> ModelProfile:
     return ModelProfile(
         model_path=str(model.path),
         alias=alias,
+        chat_template=infer_chat_template(str(model.path), alias),
         context_size=_environment_int("V_CORE_CONTEXT", 32_768),
         temperature=_environment_float("V_CORE_TEMPERATURE", 0.2),
         top_p=_environment_float("V_CORE_TOP_P", 0.95),
@@ -205,6 +207,12 @@ def edit_profile(
         "Reasoning mode",
         profile.reasoning,
         {"auto", "on", "off"},
+    )
+    values["chat_template"] = _prompt_choice(
+        input_fn,
+        "Chat template",
+        profile.chat_template,
+        CHAT_TEMPLATE_PROFILES,
     )
     values["anti_repetition"] = _prompt_choice(
         input_fn,
@@ -273,6 +281,7 @@ def render_profile(profile: ModelProfile) -> str:
         f"  batch={profile.batch_size}, ubatch={profile.ubatch_size}, "
         f"parallel={profile.parallel}, flash_attn={profile.flash_attention}\n"
         f"  reasoning={profile.reasoning}, "
+        f"chat_template={profile.chat_template}, "
         f"anti_repetition={profile.anti_repetition}\n"
         f"  kv_cache_k={profile.cache_type_k}, "
         f"kv_cache_v={profile.cache_type_v}\n"

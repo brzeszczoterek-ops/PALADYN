@@ -14,6 +14,7 @@ import sys
 import time
 from typing import Callable
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, build_opener
 
@@ -45,8 +46,27 @@ class ResponseTiming:
 
 
 @dataclass(frozen=True, slots=True)
+class BrowserVisit:
+    sequence: int
+    started_at: str
+    requested_url: str
+    tool_status: str
+    http_status: int | None = None
+    final_url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserActivity:
+    task_id: str
+    task_status: str
+    checkpoint_path: Path
+    visits: tuple[BrowserVisit, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class MonitorTarget:
     pid: int
+    owner_pid: int
     port: int
     model: str
     context_size: int
@@ -97,9 +117,18 @@ class TelemetryJournal:
             self._handle = None
 
 
-def monitor_session_identity(session: LlamaServerSession) -> tuple[str, Path]:
-    stamp = session.log_path.stem.removeprefix("llama-server-")
-    session_id = f"{stamp}-pid{session.process.pid}"
+def monitor_session_identity(
+    session: LlamaServerSession,
+    *,
+    owner_pid: int | None = None,
+    started_at: datetime | None = None,
+) -> tuple[str, Path]:
+    """Return a unique identity for one V session, not the reused model server."""
+
+    owner = os.getpid() if owner_pid is None else owner_pid
+    started = started_at or datetime.now(timezone.utc)
+    stamp = started.strftime("%Y%m%d-%H%M%S-%f")
+    session_id = f"{stamp}-vpid{owner}"
     telemetry = (
         session.log_path.parent.parent
         / "monitor_sessions"
@@ -202,13 +231,18 @@ def build_monitor_command(
     *,
     terminal: Path,
     python: Path,
+    owner_pid: int | None = None,
 ) -> tuple[str, ...]:
     profile = session.profile
-    session_id, telemetry_path = monitor_session_identity(session)
+    owner = os.getpid() if owner_pid is None else owner_pid
+    session_id, telemetry_path = monitor_session_identity(
+        session,
+        owner_pid=owner,
+    )
     return (
         str(terminal),
         "--window",
-        "--geometry=92x31",
+        "--geometry=100x42",
         "--title=V Owner Monitor",
         "--",
         str(python),
@@ -216,6 +250,8 @@ def build_monitor_command(
         "v_core.owner_monitor",
         "--pid",
         str(session.process.pid),
+        "--owner-pid",
+        str(owner),
         "--port",
         str(profile.port),
         "--model",
@@ -255,6 +291,7 @@ def launch_owner_monitor(
         session,
         terminal=Path(discovered),
         python=Path(sys.executable),
+        owner_pid=os.getpid(),
     )
     try:
         popen(
@@ -288,6 +325,127 @@ def _tail(path: Path, maximum: int = 128 * 1024) -> str:
             return handle.read(maximum).decode("utf-8", errors="replace")
     except OSError:
         return ""
+
+
+def latest_browser_activity(
+    autonomy_root: Path,
+    *,
+    limit: int = 6,
+) -> BrowserActivity | None:
+    """Return browser navigation evidence for only the newest interactive task."""
+    checkpoint_root = Path(autonomy_root) / "interactive" / "checkpoints"
+    try:
+        candidates = sorted(
+            checkpoint_root.glob("*.json"),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for checkpoint in candidates:
+        try:
+            payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        calls = payload.get("tool_calls", [])
+        if not isinstance(calls, list):
+            calls = []
+        visits: list[BrowserVisit] = []
+        for raw_call in calls:
+            if not isinstance(raw_call, dict):
+                continue
+            tool = str(raw_call.get("tool", ""))
+            if tool not in {"browser_navigate", "web_search", "web_read"}:
+                continue
+            arguments = raw_call.get("arguments", {})
+            excerpt = str(raw_call.get("result_excerpt", ""))
+            tool_payload = None
+            try:
+                candidate = json.loads(excerpt)
+            except (TypeError, json.JSONDecodeError):
+                candidate = None
+            if isinstance(candidate, dict):
+                tool_payload = candidate
+            if tool == "web_search":
+                requested_url = str((tool_payload or {}).get("search_url", ""))
+            else:
+                requested_url = (
+                    str(arguments.get("url", ""))
+                    if isinstance(arguments, dict)
+                    else ""
+                )
+            if not requested_url:
+                continue
+            page_url = re.search(r"^- Page URL:\s*(\S+)", excerpt, re.MULTILINE)
+            http_status = re.search(
+                r"^- HTTP status:\s*(\d{3})\b", excerpt, re.MULTILINE
+            )
+            visits.append(
+                BrowserVisit(
+                    sequence=int(raw_call.get("sequence", len(visits) + 1)),
+                    started_at=str(raw_call.get("started_at", "")),
+                    requested_url=requested_url,
+                    tool_status=str(raw_call.get("status", "unknown")),
+                    http_status=(
+                        int(http_status.group(1)) if http_status else None
+                    ),
+                    final_url=(
+                        str(
+                            (tool_payload or {}).get("url")
+                            or (tool_payload or {}).get("search_url")
+                        )
+                        if tool_payload
+                        else (page_url.group(1) if page_url else None)
+                    ),
+                )
+            )
+        return BrowserActivity(
+            task_id=str(payload.get("task_id", checkpoint.stem)),
+            task_status=str(payload.get("status", "unknown")),
+            checkpoint_path=checkpoint,
+            visits=tuple(visits[-max(1, limit) :]),
+        )
+    return None
+
+
+def compact_url(url: str, maximum: int = 82) -> str:
+    try:
+        parsed = urlsplit(url)
+        compact = f"{parsed.netloc}{parsed.path}"
+        if parsed.query:
+            compact += f"?{parsed.query}"
+    except ValueError:
+        compact = url
+    if len(compact) <= maximum:
+        return compact
+    return compact[: max(1, maximum - 1)] + "…"
+
+
+def browser_activity_lines(activity: BrowserActivity | None) -> list[str]:
+    if activity is None:
+        return ["Browser audit  no interactive task found"]
+    lines = [
+        f"Browser audit  {activity.task_id}  ·  {activity.task_status}",
+    ]
+    if not activity.visits:
+        lines.append("  No browser navigation in this task yet.")
+        return lines
+    for visit in activity.visits:
+        try:
+            local_time = datetime.fromisoformat(visit.started_at).astimezone()
+            clock = local_time.strftime("%H:%M:%S")
+        except ValueError:
+            clock = "—"
+        status = f"tool {visit.tool_status}"
+        if visit.http_status is not None:
+            status += f" · HTTP {visit.http_status}"
+        lines.append(f"  {clock}  #{visit.sequence}  {status}")
+        lines.append(f"    → {compact_url(visit.requested_url)}")
+        if visit.final_url and visit.final_url != visit.requested_url:
+            lines.append(f"    ↳ {compact_url(visit.final_url)}")
+    return lines
 
 
 def _metric(metrics: dict[str, float], suffix: str) -> float | None:
@@ -346,6 +504,9 @@ def run_monitor(target: MonitorTarget, *, interval: float = 1.0) -> None:
         5.0,
     )
     last_recorded = 0.0
+    autonomy_root = Path(
+        os.getenv("PALADYN_AUTONOMY_ROOT", "autonomy")
+    ).expanduser()
     journal = TelemetryJournal(target.telemetry_path, target.session_id)
     journal.append(
         "session_start",
@@ -375,7 +536,7 @@ def run_monitor(target: MonitorTarget, *, interval: float = 1.0) -> None:
             tegra = None
 
     try:
-        while _alive(target.pid):
+        while _alive(target.pid) and _alive(target.owner_pid):
             if tegra is not None and tegra.stdout is not None:
                 while select.select([tegra.stdout], [], [], 0)[0]:
                     line = tegra.stdout.readline().strip()
@@ -408,6 +569,7 @@ def run_monitor(target: MonitorTarget, *, interval: float = 1.0) -> None:
             kv_usage = _metric(metrics, "kv_cache_usage_ratio")
             context_percent = (100.0 * used / context) if context else 0.0
             hardware = compact_tegrastats(tegra_line)
+            browser_activity = latest_browser_activity(autonomy_root)
             now = time.monotonic()
 
             if now - last_recorded >= record_interval:
@@ -450,6 +612,7 @@ def run_monitor(target: MonitorTarget, *, interval: float = 1.0) -> None:
                 f"Reasoning   {target.reasoning}",
                 f"KV cache    K={target.cache_type_k}  V={target.cache_type_v}",
                 f"Server      pid={target.pid}  port={target.port}",
+                f"V session   pid={target.owner_pid}",
                 f"Session     {target.session_id}",
                 f"Saved       {target.telemetry_path.name}",
                 "",
@@ -476,13 +639,21 @@ def run_monitor(target: MonitorTarget, *, interval: float = 1.0) -> None:
                 f"  {hardware[1]}",
                 f"  {hardware[2]}",
                 "",
-                "This window closes when the local model stops.",
+                *browser_activity_lines(browser_activity),
+                "",
+                "This window closes when this V session ends.",
             ]
             print("\n".join(lines), end="", flush=True)
             previous_metrics = metrics
             time.sleep(max(0.2, interval))
     finally:
-        journal.append("session_end", {"model_pid_alive": _alive(target.pid)})
+        journal.append(
+            "session_end",
+            {
+                "model_pid_alive": _alive(target.pid),
+                "owner_pid_alive": _alive(target.owner_pid),
+            },
+        )
         journal.close()
         if tegra is not None and tegra.poll() is None:
             try:
@@ -498,6 +669,7 @@ def run_monitor(target: MonitorTarget, *, interval: float = 1.0) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="PALADYN owner model monitor")
     parser.add_argument("--pid", type=int, required=True)
+    parser.add_argument("--owner-pid", type=int, required=True)
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--context", type=int, required=True)
@@ -522,6 +694,7 @@ def main() -> None:
     run_monitor(
         MonitorTarget(
             pid=args.pid,
+            owner_pid=args.owner_pid,
             port=args.port,
             model=args.model,
             context_size=args.context,

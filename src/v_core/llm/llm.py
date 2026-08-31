@@ -9,10 +9,14 @@ from typing import Any
 
 from openai import APIStatusError, AsyncOpenAI
 
-from .llm_config import load_llm_config
+from .llm_config import LLMConfig, load_llm_config
 
 
 _WORD = re.compile(r"[\w']+", re.UNICODE)
+_TEXTUAL_TOOL_CALL = re.compile(
+    r"<tool_call>\s*(\{.*\})\s*</tool_call>",
+    re.DOTALL,
+)
 
 
 def repetition_start(text: str) -> int | None:
@@ -77,27 +81,43 @@ class LLMResponse:
 class LLM:
 
     def __init__(self, api_key: str | None = None):
-
+        self._api_key = api_key
         self.config = load_llm_config()
-
-        self.client = AsyncOpenAI(
-            base_url=self.config.base_url,
-            api_key=api_key or os.getenv("V_CORE_API_KEY", "local"),
-            timeout=float(os.getenv("V_CORE_TIMEOUT", "120")),
-        )
+        self.client = self._new_client()
         # None means untested. A strict/older GGUF template may reject the
         # OpenAI tool schema; after one explicit provider rejection PALADYN
         # uses its documented textual compatibility protocol for that run.
         self._native_tools_supported: bool | None = None
+
+    def _new_client(self) -> AsyncOpenAI:
+        return AsyncOpenAI(
+            base_url=self.config.base_url,
+            api_key=self._api_key or os.getenv("V_CORE_API_KEY", "local"),
+            timeout=float(os.getenv("V_CORE_TIMEOUT", "120")),
+        )
+
+    async def reconfigure(self, config: LLMConfig | None = None) -> None:
+        """Point all shared PALADYN components at a newly selected local model."""
+
+        previous = self.client
+        self.config = config or load_llm_config()
+        self.client = self._new_client()
+        self._native_tools_supported = None
+        close = getattr(previous, "close", None)
+        if callable(close):
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
 
     async def respond(
         self,
         *,
         messages: list,
         tools: list[dict[str, Any]] | None = None,
-        tool_choice: str = "auto",
+        tool_choice: str | dict[str, Any] = "auto",
         max_tokens: int | None = None,
         temperature: float | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """Return prose and native tool calls without discarding either.
 
@@ -115,10 +135,28 @@ class LLM:
             "messages": normalized,
             "max_tokens": max_tokens or int(os.getenv("V_CORE_MAX_TOKENS", "512")),
         }
+        tool_names = {
+            str(item.get("function", {}).get("name", ""))
+            for item in tools or []
+            if isinstance(item, dict) and isinstance(item.get("function"), dict)
+        }
+        if tool_names & {"learning_create_tool", "learning_create_skill"}:
+            # A generated artifact contains schemas, source, and deterministic
+            # tests. On a local 2-4 token/s model that can legitimately take
+            # several minutes even though an ordinary chat turn should still
+            # fail quickly. Apply a per-request override so the artifact path
+            # does not inherit the short conversational HTTP timeout.
+            request["timeout"] = max(
+                float(os.getenv("V_CORE_TIMEOUT", "120")),
+                float(os.getenv("V_CORE_ARTIFACT_TIMEOUT", "1200")),
+            )
         native_requested = bool(tools) and self._native_tools_supported is not False
+        if response_format is not None:
+            request["response_format"] = response_format
         if native_requested:
             request["tools"] = tools
             request["tool_choice"] = tool_choice
+            request["parallel_tool_calls"] = False
 
         try:
             response = await self.client.chat.completions.create(**request)
@@ -177,8 +215,10 @@ class LLM:
                                 "its arguments were malformed or truncated JSON. Retry "
                                 "the same next action now using exactly one compact "
                                 "compatibility object: "
-                                '{"tool":"<available_tool>","arguments":{}}. '
-                                "Output JSON only, include only required fields, and "
+                                '{"tool":"<available_tool>","arguments":'
+                                '{"<required_field>":"<schema_value>"}}. '
+                                "Replace every placeholder. Output JSON only, include "
+                                "every required field from the supplied schema, and "
                                 "close every string and brace. Do not narrate the call."
                             ),
                         },
@@ -222,6 +262,15 @@ class LLM:
                 )
             )
 
+        if not decoded_calls and tool_names and content:
+            compatibility_call = _decode_textual_tool_call(content, tool_names)
+            if compatibility_call is not None:
+                decoded_calls.append(compatibility_call)
+                content = ""
+                # The request still carried schemas, but llama.cpp surfaced the
+                # model-family envelope as text instead of a provider tool_call.
+                native_requested = False
+
         return LLMResponse(
             content=content,
             tool_calls=decoded_calls,
@@ -235,6 +284,7 @@ class LLM:
         messages: list | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> str:
 
         if messages is None:
@@ -254,6 +304,7 @@ class LLM:
             messages=messages,
             max_tokens=max_tokens or int(os.getenv("V_CORE_MAX_TOKENS", "512")),
             temperature=temperature,
+            response_format=response_format,
         )
         return response.content
 
@@ -325,3 +376,45 @@ class LLM:
             },
             *conversation,
         ]
+
+
+def _decode_textual_tool_call(
+    text: str,
+    allowed_names: set[str],
+) -> LLMToolCall | None:
+    """Promote one exact, allowed compatibility envelope to a runtime call."""
+
+    stripped = text.strip()
+    match = _TEXTUAL_TOOL_CALL.fullmatch(stripped)
+    if match is not None:
+        candidate = match.group(1)
+    elif "<tool_call>" in stripped or "</tool_call>" in stripped:
+        return None
+    else:
+        candidate = stripped
+    try:
+        payload = json.loads(candidate)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if set(payload) == {"name", "arguments"}:
+        name = payload.get("name")
+    elif set(payload) == {"tool", "arguments"}:
+        name = payload.get("tool")
+    else:
+        return None
+    arguments = payload.get("arguments")
+    if (
+        not isinstance(name, str)
+        or name not in allowed_names
+        or not isinstance(arguments, dict)
+    ):
+        return None
+    raw = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+    return LLMToolCall(
+        call_id="compatibility_call_1",
+        name=name,
+        arguments=arguments,
+        raw_arguments=raw,
+    )

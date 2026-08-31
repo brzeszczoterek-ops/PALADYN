@@ -166,7 +166,20 @@ Every item should pass before creating a new release.
 - [x] Active generated tools expose their validated input schema; an empty call to
   a single-string tool can recover explicit quoted text without guessing complex
   or multi-field arguments.
-- [x] Offline generated tools cannot claim browser, network, or internet retrieval.
+- [x] Repeated structured JSON assignments are bound without model retyping: the
+  first fixture validates a new tool and the last fixture drives its later call.
+- [x] Explicit fixture URLs in an offline creation request do not create a browser
+  contract, while “execute the new tool” requires a distinct successful run.
+- [x] Tight-context repair rollover preserves failed generated source, exact
+  expected output, and validator error while omitting the redundant large fixture.
+- [x] Invalid optional blueprint versions such as `1.0` are normalized to the
+  default semantic version before lifecycle validation.
+- [x] Client generated tools cannot claim browser, network, or internet retrieval.
+- [x] `owner_lab` accepts generated tools using arbitrary imports, `open`,
+  subprocesses, and dynamic `compile`/`exec`, while executing them inside the
+  offline resource-limited sandbox.
+- [x] `owner_lab` may promote a fully tested persistent tool without a prior
+  validated lesson; the client profile still requires one.
 - [x] Failed tool tests prevent activation.
 - [x] Active generated tools survive a runtime restart.
 - [x] Three runtime failures automatically retire an active generated tool.
@@ -220,6 +233,13 @@ Every item should pass before creating a new release.
 - [x] Early server failure reports the private log tail.
 - [x] A managed server is terminated during shutdown and failed startup.
 - [x] Noninteractive runs never hang waiting for input.
+- [x] Qualification cards persist exact probe scores and become stale when the
+  GGUF identity or behaviour-affecting profile changes.
+- [x] The deterministic router selects conversation, coding, and research
+  specialists from at most three current local cards.
+- [x] Runtime switching terminates the current server, verifies the selected
+  profile, reconfigures the shared LLM client, and records only a prompt digest.
+- [x] Failed specialist startup follows the verified fallback order.
 
 ---
 
@@ -245,7 +265,7 @@ Every item should pass before creating a new release.
   as fallback.
 - [x] Piper output passes through the selected argument-array SoX effects.
 - [x] Playback completes before continuous mode opens the microphone again.
-- [x] The terminal-local F8 binding submits `/ptt` without Enter or global
+- [x] The terminal-local F2 binding submits `/ptt` without Enter or global
   keyboard-device access.
 - [x] Toggle push-to-talk starts one recorder, stops it on the second action,
   transcribes the bounded WAV, and cleans temporary state.

@@ -28,8 +28,11 @@ from v_core.autonomy import (
     TaskJournal,
     TaskStatus,
     parse_chord,
+    review_task,
+    review_task_checkpoint,
 )
 from v_core.autonomy.policy import AuthorizationDenied, AuthorizationGuard
+from v_core.capabilities.web_target import extract_web_target
 from v_core.config import load_config
 
 
@@ -60,10 +63,87 @@ def test_task_contract_detects_polish_local_tool_and_required_use() -> None:
     assert contract.unmet(calls) == []
 
 
-def test_task_contract_round_trip_preserves_dynamic_required_tools() -> None:
-    contract = TaskContract(requires_evidence_report=True).with_required_tools(
-        ["count_words", "count_words"]
+def test_task_contract_accepts_deterministic_snapshot_tool_builder() -> None:
+    contract = TaskContract(
+        requires_created_tool=True,
+        requires_created_tool_execution=True,
     )
+    calls = [
+        {
+            "tool": "learning_create_snapshot_extractor",
+            "status": "succeeded",
+            "result_excerpt": json.dumps({"name": "extract_book_cards"}),
+        },
+        {
+            "tool": "extract_book_cards",
+            "status": "succeeded",
+            "result_excerpt": json.dumps({"records": []}),
+        },
+    ]
+
+    assert contract.unmet(calls) == []
+
+
+def test_task_contract_renders_generated_records_without_model_rewrite() -> None:
+    contract = TaskContract(
+        requires_created_tool=True,
+        requires_created_tool_execution=True,
+        requires_evidence_report=True,
+    )
+    records = [
+        {
+            "title": "A Light in the Attic",
+            "price": "£51.77",
+            "availability": "In stock",
+            "relative_product_url": (
+                "catalogue/a-light-in-the-attic_1000/index.html"
+            ),
+        },
+        {
+            "title": "Tipping the Velvet",
+            "price": "£53.74",
+            "availability": "In stock",
+            "relative_product_url": "catalogue/tipping-the-velvet_999/index.html",
+        },
+        {
+            "title": "Soumission",
+            "price": "£50.10",
+            "availability": "In stock",
+            "relative_product_url": "catalogue/soumission_998/index.html",
+        },
+    ]
+    calls = [
+        {
+            "tool": "learning_create_snapshot_extractor",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "name": "extract_book_cards",
+                    "status": "active",
+                    "validation": {"passed": True},
+                }
+            ),
+        },
+        {
+            "tool": "extract_book_cards",
+            "status": "succeeded",
+            "result_excerpt": json.dumps({"records": records}),
+        },
+    ]
+
+    answer = contract.deterministic_answer(calls)
+
+    assert answer is not None
+    assert "validated and activated" in answer
+    assert "catalogue/a-light-in-the-attic_1000/index.html" in answer
+    assert "attica-1000" not in answer
+
+
+def test_task_contract_round_trip_preserves_dynamic_required_tools() -> None:
+    contract = TaskContract(
+        requires_evidence_report=True,
+        required_public_subject="Cud Malina",
+    ).with_required_tools(["count_words", "count_words"])
 
     restored = TaskContract.from_dict(contract.to_dict())
     merged = restored.merged(
@@ -71,7 +151,9 @@ def test_task_contract_round_trip_preserves_dynamic_required_tools() -> None:
     )
 
     assert restored.required_tools == ("count_words",)
+    assert restored.required_public_subject == "Cud Malina"
     assert merged.required_tools == ("count_words", "extract_domains")
+    assert merged.required_public_subject == "Cud Malina"
 
 
 def test_checkpoint_round_trip(tmp_path: Path) -> None:
@@ -137,6 +219,29 @@ def test_interactive_agent_trace_records_runtime_evidence(tmp_path: Path) -> Non
     assert checkpoint.stat().st_mode & 0o777 == 0o600
 
 
+def test_interactive_trace_persists_prioritized_evidence_excerpt(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "interactive"
+    trace = AgentTaskTrace(root, "Inspect search results")
+    sequence = trace.tool_started("browser_snapshot", {})
+    trace.tool_finished(
+        sequence,
+        "raw navigation chrome " * 500,
+        evidence_excerpt=(
+            "Observed result: Crawl4AI — https://docs.crawl4ai.com/"
+        ),
+    )
+
+    restored = AgentTaskTrace.load(root, trace.task_id)
+
+    assert restored is not None
+    assert restored.tool_calls[0]["result_excerpt"] == (
+        "Observed result: Crawl4AI — https://docs.crawl4ai.com/"
+    )
+    assert restored.tool_calls[0]["result_sha256"]
+
+
 def test_interactive_trace_recovers_latest_runtime_context(tmp_path: Path) -> None:
     root = tmp_path / "interactive"
     trace = AgentTaskTrace(root, "Inspect the first result")
@@ -158,6 +263,158 @@ def test_interactive_trace_recovers_latest_runtime_context(tmp_path: Path) -> No
     assert context["tool_calls"][0]["error"].endswith("DNS resolution failed")
 
 
+def test_runtime_review_is_grounded_in_checkpoint_events(tmp_path: Path) -> None:
+    payload = {
+        "task_id": "interactive-review-1",
+        "objective": "Find a Firecrawler alternative and report it.",
+        "status": "running",
+        "finished_at": None,
+        "requirements": TaskContract(
+            requires_browser_navigation=True,
+            requires_browser_snapshot=True,
+            requires_web_discovery=True,
+            requires_distinct_detail_page=True,
+            requires_evidence_report=True,
+        ).to_dict(),
+        "tool_calls": [
+            {
+                "sequence": 1,
+                "tool": "browser_navigate",
+                "status": "succeeded",
+                "arguments": {"url": "https://duckduckgo.com/?q=firecrawler"},
+                "result_sha256": "nav-search",
+            },
+            {
+                "sequence": 2,
+                "tool": "browser_snapshot",
+                "status": "succeeded",
+                "arguments": {},
+                "result_sha256": "search-results",
+                "result_excerpt": "Scrapy https://scrapy.org",
+            },
+            {
+                "sequence": 3,
+                "tool": "browser_navigate",
+                "status": "failed",
+                "arguments": {"url": "https://bad.example/docs"},
+                "error": "BrowserHTTPError: HTTP status 404",
+                "result_sha256": "http-404",
+            },
+            {
+                "sequence": 4,
+                "tool": "browser_snapshot",
+                "status": "failed",
+                "arguments": {},
+                "error": "BrowserHTTPError: HTTP status 404",
+                "result_sha256": "error-page",
+            },
+            {
+                "sequence": 5,
+                "tool": "browser_navigate",
+                "status": "succeeded",
+                "arguments": {"url": "https://scrapy.org"},
+                "result_sha256": "nav-detail",
+            },
+            {
+                "sequence": 6,
+                "tool": "browser_snapshot",
+                "status": "succeeded",
+                "arguments": {},
+                "result_sha256": "detail-page",
+                "result_excerpt": "Scrapy is an open source web crawling framework.",
+            },
+            {
+                "sequence": 7,
+                "tool": "browser_find",
+                "status": "succeeded",
+                "arguments": {"text": "Firecrawler"},
+                "result_sha256": "no-match",
+            },
+            {
+                "sequence": 8,
+                "tool": "browser_find",
+                "status": "succeeded",
+                "arguments": {"text": "Firecrawler"},
+                "result_sha256": "no-match",
+            },
+        ],
+        "context_rollovers": [
+            {
+                "sequence": 1,
+                "context_size": 12_000,
+                "estimated_tokens_after": 12_100,
+                "evidence_count": 0,
+            }
+        ],
+    }
+
+    report = review_task_checkpoint(payload)
+    findings = {item["code"]: item for item in report["findings"]}
+
+    assert report["metrics"] == {
+        "tool_calls": 8,
+        "successful_tool_calls": 6,
+        "failed_tool_calls": 2,
+        "context_rollovers": 1,
+        "finding_count": len(findings),
+    }
+    assert findings["snapshot_after_failed_navigation"]["tool_calls"] == [4]
+    assert findings["repeated_identical_result"]["tool_calls"] == [7, 8]
+    assert findings["rollover_without_evidence"]["rollovers"] == [1]
+    assert findings["rollover_still_over_context"]["rollovers"] == [1]
+    assert findings["tooling_after_contract_satisfied"]["tool_calls"] == [7, 8]
+    assert "Only describe faults listed" in report["grounding_rule"]
+
+
+def test_runtime_review_uses_previous_task_and_rejects_path_traversal(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "interactive"
+    prior = AgentTaskTrace(root, "Prior task")
+    prior.complete("done")
+    current = AgentTaskTrace(root, "Review the prior task")
+
+    report = review_task(root, exclude_task_id=current.task_id)
+
+    assert report["task_id"] == prior.task_id
+    with pytest.raises(ValueError, match="invalid PALADYN"):
+        review_task(root, task_id="../../secrets")
+
+
+def test_trace_recovery_marks_dead_runtime_as_interrupted(tmp_path: Path) -> None:
+    root = tmp_path / "interactive"
+    trace = AgentTaskTrace(root, "Interrupted work")
+    checkpoint = root / "checkpoints" / f"{trace.task_id}.json"
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    payload["runtime_pid"] = 999_999_999
+    checkpoint.write_text(json.dumps(payload), encoding="utf-8")
+
+    recovered = AgentTaskTrace.recover_stale_running(root)
+    restored = AgentTaskTrace.load(root, trace.task_id)
+
+    assert recovered == [trace.task_id]
+    assert restored is not None
+    assert restored.status == "interrupted"
+    assert restored.finished_at is not None
+    assert restored._journal.read(trace.task_id)[-1]["event"] == (
+        "task_recovered_as_interrupted"
+    )
+    report = review_task(root, task_id=trace.task_id)
+    assert report["findings"][0]["code"] == "interrupted_checkpoint"
+
+
+def test_task_contract_detects_runtime_self_review() -> None:
+    contract = TaskContract.from_prompt(
+        "Przeanalizuj swoje logi z ostatniej sesji i pokaż, gdzie były błędy."
+    )
+
+    assert contract.requires_runtime_review is True
+    assert contract.unmet([]) == ["runtime_review_task"]
+    assert contract.unmet(
+        [{"tool": "runtime_review_task", "status": "succeeded"}]
+    ) == []
+
+
 def test_task_contract_detects_generic_online_work_without_explicit_url() -> None:
     contract = TaskContract.from_prompt(
         "Znajdź w sieci narzędzia do monitorowania darknetu i podaj wyniki."
@@ -165,8 +422,426 @@ def test_task_contract_detects_generic_online_work_without_explicit_url() -> Non
 
     assert contract.requires_browser_navigation is True
     assert contract.requires_browser_snapshot is True
+    assert contract.requires_web_discovery is True
+    assert contract.requires_distinct_detail_page is True
     assert contract.requires_evidence_report is True
-    assert contract.unmet([]) == ["browser_navigate", "browser_snapshot"]
+    assert contract.unmet([]) == [
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_navigate:distinct_detail_page",
+    ]
+
+
+def test_public_business_facts_recover_when_semantic_router_calls_it_chat() -> None:
+    prompt = (
+        "Cześć mi. Słuchaj, sprawdź mi ile w Warszawie jest cukierni "
+        "Cud Malina i sprawdź mi również godziny otwarcia. "
+        "I sprawdź mi również gdzie. Podaj mi tylko sprawdzone informacje."
+    )
+    false_chat_intent = SemanticIntent(
+        action_requested=False,
+        capabilities=(),
+    )
+
+    assert TaskContract.from_prompt(prompt).requires_browser_navigation is False
+    assert TaskContract.implies_public_web_lookup(prompt) is True
+    assert MultilingualIntentRouter._usable(false_chat_intent, prompt) is False
+
+
+def test_public_fact_lookup_recovery_does_not_capture_creative_request() -> None:
+    prompt = "Napisz opowiadanie o cukierni Cud Malina w Warszawie."
+
+    assert TaskContract.implies_public_web_lookup(prompt) is False
+
+
+def test_public_business_contract_stays_open_on_namesake_product_page() -> None:
+    prompt = (
+        "Sprawdź ile znajduje się w Warszawie cukierni, które nazywają się "
+        "Cud Malina, i znajdź wszystkie adresy i numery telefonów."
+    )
+    intent = SemanticIntent(
+        action_requested=True,
+        capabilities=("browser",),
+        requires_report=True,
+    )
+    contract = intent.to_contract(prompt)
+    product_page = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": (
+                "Cud malina - cena | Cukiernia Sweet Home; "
+                "url: https://www.sweet-home.pl/994,Cud-malina.html"
+            ),
+        },
+        {
+            "tool": "web_read",
+            "status": "succeeded",
+            "arguments": {
+                "url": "https://www.sweet-home.pl/994,Cud-malina.html"
+            },
+            "result_excerpt": (
+                "Cud malina. Torty kompozycje smaków. 120 zł za kg. "
+                "Zadzwoń pod nr 698 314 125."
+            ),
+        },
+    ]
+
+    missing = contract.unmet(product_page)
+
+    assert contract.required_public_fields == ("count", "address", "contact")
+    assert "public_fact:address" in missing
+    assert "public_fact:contact" not in missing
+
+
+def test_search_query_metadata_cannot_satisfy_public_address_or_hours() -> None:
+    contract = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+        requires_evidence_report=True,
+        required_public_fields=("address", "opening_hours"),
+    )
+    search_only = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "arguments": {
+                "query": "address and opening hours Cud Malina Warsaw"
+            },
+            "result_excerpt": json.dumps(
+                {
+                    "query": "address and opening hours Cud Malina Warsaw",
+                    "result_count": 10,
+                    "results": [
+                        {
+                            "rank": 1,
+                            "title": "Cud malina cake, price per kg",
+                            "url": "https://example.test/product-994",
+                        }
+                    ],
+                }
+            ),
+        }
+    ]
+
+    missing = contract.unmet(search_only)
+
+    assert "public_fact:address" in missing
+    assert "public_fact:opening_hours" in missing
+
+
+def test_public_facts_from_wrong_subject_do_not_complete_contract() -> None:
+    contract = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+        requires_evidence_report=True,
+        required_public_fields=("address", "opening_hours"),
+        required_public_subject="Cud Malina",
+    )
+    wrong_business = [
+        {
+            "tool": "web_read",
+            "status": "succeeded",
+            "arguments": {"url": "https://example.test/cud-miod"},
+            "result_excerpt": (
+                "Cud Miód Warszawa. Adres: ul. Senatorska 13/15. "
+                "Poniedziałek: 09:00 - 00:00."
+            ),
+        }
+    ]
+
+    missing = contract.unmet(wrong_business)
+
+    assert "public_fact:subject" in missing
+    assert "public_fact:address" not in missing
+    assert "public_fact:opening_hours" not in missing
+
+
+def test_public_business_contract_accepts_observed_address_and_contact() -> None:
+    prompt = "Znajdź adres i numer telefonu cukierni Cud Malina."
+    intent = SemanticIntent(
+        action_requested=True,
+        capabilities=("browser",),
+        requires_report=True,
+    )
+    contract = intent.to_contract(prompt)
+    observed_business_page = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": (
+                "Cukiernia Cud Malina; "
+                "url: https://example.test/cud-malina-kontakt"
+            ),
+        },
+        {
+            "tool": "web_read",
+            "status": "succeeded",
+            "arguments": {"url": "https://example.test/cud-malina-kontakt"},
+            "result_excerpt": (
+                "Cukiernia Cud Malina. Adres: ul. Domaniewska 31, "
+                "02-672 Warszawa. Telefon: +48 22 123 45 67."
+            ),
+        },
+    ]
+
+    missing = contract.unmet(observed_business_page)
+
+    assert "public_fact:address" not in missing
+    assert "public_fact:contact" not in missing
+
+
+def test_task_contract_skips_discovery_when_owner_supplies_url() -> None:
+    contract = TaskContract.from_prompt(
+        "Inspect https://example.com/docs and report what is there."
+    )
+
+    assert contract.requires_browser_navigation is True
+    assert contract.requires_web_discovery is False
+
+
+def test_spoken_url_is_reconstructed_without_search_discovery() -> None:
+    prompt = (
+        "Otwórz HTTPS, dwukropek, łamane, łamane, this, minus, domain, "
+        "minus, definitely, minus, those, minus, not, minus, exist, "
+        "kropka, invalid. I powiedz co znalazłaś."
+    )
+
+    assert extract_web_target(prompt) == (
+        "https://this-domain-definitely-those-not-exist.invalid"
+    )
+    contract = TaskContract.from_prompt(prompt)
+    assert contract.requires_browser_navigation is True
+    assert contract.requires_web_discovery is False
+
+
+def test_semantic_browser_contract_enables_discovery_without_url() -> None:
+    intent = SemanticIntent(
+        action_requested=True,
+        capabilities=("browser",),
+        requires_report=True,
+    )
+
+    discovery = intent.to_contract("Znajdź alternatywę dla Firecrawlera.")
+    direct = intent.to_contract("Inspect https://example.com/docs")
+
+    assert discovery.requires_web_discovery is True
+    assert discovery.requires_distinct_detail_page is True
+    assert direct.requires_web_discovery is False
+
+
+def test_discovery_report_rejects_second_search_as_detail_page() -> None:
+    contract = TaskContract.from_prompt(
+        "Znajdź w internecie alternatywę dla Firecrawlera i podaj wyniki."
+    )
+    listing_only = [
+        {
+            "tool": "browser_navigate",
+            "arguments": {"url": "https://duckduckgo.com/?q=firecrawl"},
+            "status": "succeeded",
+        },
+        {"tool": "browser_snapshot", "arguments": {}, "status": "succeeded"},
+        {
+            "tool": "browser_navigate",
+            "arguments": {"url": "https://duckduckgo.com/?q=firecrawl+alternative"},
+            "status": "succeeded",
+        },
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": "Result: https://docs.crawl4ai.com/ - Crawl4AI docs",
+        },
+    ]
+
+    assert contract.unmet(listing_only) == [
+        "browser_navigate:distinct_detail_page"
+    ]
+
+
+def test_discovery_report_accepts_observed_external_source() -> None:
+    contract = TaskContract.from_prompt(
+        "Find a Firecrawl alternative online and report the result."
+    )
+    calls = [
+        {
+            "tool": "browser_navigate",
+            "arguments": {"url": "https://duckduckgo.com/?q=firecrawl"},
+            "status": "succeeded",
+        },
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": "Result: https://docs.crawl4ai.com/ - Crawl4AI docs",
+        },
+        {
+            "tool": "browser_navigate",
+            "arguments": {"url": "https://docs.crawl4ai.com/"},
+            "status": "succeeded",
+        },
+        {"tool": "browser_snapshot", "arguments": {}, "status": "succeeded"},
+    ]
+
+    assert contract.unmet(calls) == []
+
+
+def test_discovery_report_accepts_high_level_search_and_read_tools() -> None:
+    contract = TaskContract.from_prompt(
+        "Find the Cud Malina bakery online and report public information."
+    )
+    calls = [
+        {
+            "tool": "web_search",
+            "arguments": {"query": "Cud Malina bakery"},
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "query": "Cud Malina bakery",
+                    "engine": "duckduckgo",
+                    "results": [
+                        {
+                            "title": "Cud Malina",
+                            "url": "https://example.com/cud-malina",
+                        }
+                    ],
+                }
+            ),
+        },
+        {
+            "tool": "web_read",
+            "arguments": {"url": "https://example.com/cud-malina"},
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "url": "https://example.com/cud-malina",
+                    "title": "Cud Malina",
+                    "content": "Public business page for Cud Malina.",
+                }
+            ),
+        },
+    ]
+
+    assert contract.requires_web_discovery is True
+    assert contract.unmet(calls) == []
+    assert contract.answer_issues(
+        "Cud Malina has a public page at https://example.com/cud-malina.",
+        calls,
+        request="Find the Cud Malina bakery online.",
+    ) == []
+
+
+def test_discovery_report_rejects_high_level_read_of_unobserved_url() -> None:
+    contract = TaskContract.from_prompt(
+        "Find the Cud Malina bakery online and report public information."
+    )
+    calls = [
+        {
+            "tool": "web_search",
+            "arguments": {"query": "Cud Malina bakery"},
+            "status": "succeeded",
+            "result_excerpt": "Result: https://example.com/verified",
+        },
+        {
+            "tool": "web_read",
+            "arguments": {"url": "https://invented.invalid/result"},
+            "status": "succeeded",
+            "result_excerpt": "Invented page",
+        },
+    ]
+
+    assert contract.unmet(calls) == [
+        "browser_navigate:distinct_detail_page"
+    ]
+
+
+def test_discovery_report_rejects_detail_url_guessed_from_model_memory() -> None:
+    contract = TaskContract.from_prompt(
+        "Find a Firecrawl alternative online and report the result."
+    )
+    calls = [
+        {
+            "tool": "browser_navigate",
+            "arguments": {"url": "https://duckduckgo.com/?q=fire+chlorella"},
+            "status": "succeeded",
+        },
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": "Results about algae supplements and grilling.",
+        },
+        {
+            "tool": "browser_navigate",
+            "arguments": {"url": "https://www.scrapy.org/"},
+            "status": "succeeded",
+        },
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": "Scrapy web scraping framework.",
+        },
+    ]
+
+    assert contract.unmet(calls) == [
+        "browser_navigate:detail_not_discovered"
+    ]
+
+
+def test_discovery_report_does_not_learn_links_from_a_guessed_page() -> None:
+    contract = TaskContract.from_prompt(
+        "Find a Firecrawl alternative online and report the result."
+    )
+    calls = [
+        {
+            "tool": "browser_navigate",
+            "arguments": {"url": "https://duckduckgo.com/?q=firecrawl+alternative"},
+            "status": "succeeded",
+        },
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": (
+                "Result: https://thunderbit.com/pl/blog/"
+                "open-source-firecrawl-alternatives"
+            ),
+        },
+        {
+            "tool": "browser_navigate",
+            "arguments": {
+                "url": (
+                    "https://thunderbit.com/pl/blog/"
+                    "open-source_firecrawl_alternatives"
+                )
+            },
+            "status": "succeeded",
+        },
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": (
+                "Generic blog page with a link to https://thunderbit.com/blog"
+            ),
+        },
+        {
+            "tool": "browser_navigate",
+            "arguments": {"url": "https://thunderbit.com/blog"},
+            "status": "succeeded",
+        },
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": "Thunderbit blog index",
+        },
+    ]
+
+    assert contract.unmet(calls) == [
+        "browser_navigate:detail_not_discovered"
+    ]
 
 
 def test_task_contract_detects_polish_infinitive_przeszukac_internet() -> None:
@@ -180,6 +855,153 @@ def test_task_contract_detects_polish_infinitive_przeszukac_internet() -> None:
     assert contract.requires_evidence_report is True
 
 
+def test_conditional_artifact_fallback_is_allowed_but_not_required() -> None:
+    contract = TaskContract.from_prompt(
+        "Przeszukaj sieć i znajdź alternatywę dla Firecrawlera. Jeżeli nic "
+        "nie znajdziesz, wtedy stwórz własne narzędzie albo skill."
+    )
+
+    assert contract.requires_created_tool is False
+    assert contract.requires_created_skill is False
+    assert contract.allows_artifact_fallback is True
+    assert "learning_create_tool" not in contract.unmet([])
+
+
+def test_conditional_artifact_fallback_can_finish_after_unsuccessful_search() -> None:
+    contract = TaskContract.from_prompt(
+        "Find a Firecrawl alternative online. If none exists, create a tool."
+    )
+    calls = [
+        {
+            "tool": "browser_navigate",
+            "arguments": {"url": "https://duckduckgo.com/?q=firecrawl+alternative"},
+            "status": "succeeded",
+        },
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": "No matching results were found.",
+        },
+        {
+            "tool": "learning_create_tool",
+            "arguments": {"name": "local_crawler"},
+            "status": "succeeded",
+            "result_excerpt": '{"name": "local_crawler", "status": "active"}',
+        },
+    ]
+
+    assert contract.allows_artifact_fallback is True
+    assert contract.unmet(calls) == []
+
+
+def test_late_success_guard_does_not_make_tool_creation_conditional() -> None:
+    contract = TaskContract.from_prompt(
+        "Visit https://books.toscrape.com/. Then create and activate a "
+        "task-scoped offline tool named extract_book_cards. Then use the newly "
+        "created tool. Do not claim success unless the generated tool really ran."
+    )
+
+    assert contract.requires_created_tool is True
+    assert contract.requires_created_tool_execution is True
+    assert contract.allows_artifact_fallback is False
+
+
+def test_offline_tool_fixture_urls_do_not_create_browser_contract() -> None:
+    contract = TaskContract.from_prompt(
+        "Create and activate an offline tool. Do not browse or contact any "
+        "service. observations = "
+        '[{"url":"http://exampleexample.onion/item"}]. '
+        "After it is active, really execute it on the supplied fixture."
+    )
+
+    assert contract.requires_browser_navigation is False
+    assert contract.requires_browser_snapshot is False
+    assert contract.requires_created_tool is True
+    assert contract.requires_created_tool_execution is True
+
+
+def test_adjective_heavy_offline_tool_request_stays_on_local_lifecycle() -> None:
+    contract = TaskContract.from_prompt(
+        "Create and activate a task-scoped deterministic offline Python tool "
+        "named index_onion_observations. Do not browse or contact any network."
+    )
+
+    assert contract.requires_created_tool is True
+    assert contract.requires_browser_navigation is False
+    assert contract.requires_browser_snapshot is False
+
+    polish = TaskContract.from_prompt(
+        "Utwórz własne deterministyczne narzędzie Pythona o nazwie "
+        "index_onion_observations. Nie korzystaj z sieci."
+    )
+    assert polish.requires_created_tool is True
+    assert polish.requires_browser_navigation is False
+
+
+def test_task_contract_ignores_creation_words_inside_quoted_tool_input() -> None:
+    contract = TaskContract.from_prompt(
+        'Użyj narzędzia count_words na tekście "V can build her own tools".'
+    )
+
+    assert contract.requires_created_tool is False
+    assert contract.requires_created_tool_execution is False
+
+
+def test_explicit_no_web_clause_removes_semantic_browser_requirements() -> None:
+    semantic = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+        requires_web_discovery=True,
+        requires_distinct_detail_page=True,
+        requires_created_tool=True,
+        required_public_fields=("address",),
+        required_public_subject="irrelevant semantic guess",
+    )
+
+    constrained = semantic.without_web()
+
+    assert constrained.requires_created_tool is True
+    assert constrained.requires_browser_navigation is False
+    assert constrained.requires_browser_snapshot is False
+    assert constrained.requires_web_discovery is False
+    assert constrained.requires_distinct_detail_page is False
+    assert constrained.required_public_fields == ()
+    assert constrained.required_public_subject == ""
+
+
+def test_created_tool_contract_recognizes_execute_the_new_tool() -> None:
+    contract = TaskContract.from_prompt(
+        "Create an offline tool. After validation and activation, really "
+        "execute the new tool on Fixture B."
+    )
+
+    assert contract.requires_created_tool is True
+    assert contract.requires_created_tool_execution is True
+
+
+def test_semantic_conditional_artifact_fallback_is_not_mandatory() -> None:
+    intent = SemanticIntent.parse(
+        json.dumps(
+            {
+                "action_requested": True,
+                "continue_previous": False,
+                "capabilities": ["browser", "learning_tool"],
+                "requires_report": True,
+                "distinct_detail_page": False,
+                "artifact_fallback": True,
+                "web_query": "alternatywa dla Firecrawlera",
+            }
+        )
+    )
+
+    assert intent is not None
+    assert intent.web_query == "alternatywa dla Firecrawlera"
+    contract = intent.to_contract("Find an alternative online")
+    assert contract.allows_artifact_fallback is True
+    assert contract.requires_created_tool is False
+
+
 def test_task_contract_detects_polish_locative_w_internecie() -> None:
     contract = TaskContract.from_prompt(
         "Znajdź mi w internecie informacje o tej osobie i podaj wyniki."
@@ -188,6 +1010,17 @@ def test_task_contract_detects_polish_locative_w_internecie() -> None:
     assert contract.requires_browser_navigation is True
     assert contract.requires_browser_snapshot is True
     assert contract.requires_evidence_report is True
+
+
+def test_task_contract_detects_polish_accusative_siec() -> None:
+    contract = TaskContract.from_prompt(
+        "Cześć V, przeszukaj sieć w poszukiwaniu alternatywy dla "
+        "firecrawlera, którą mogłabyś skądś przyswoić."
+    )
+
+    assert contract.requires_browser_navigation is True
+    assert contract.requires_browser_snapshot is True
+    assert contract.requires_evidence_report is False
 
 
 @pytest.mark.asyncio
@@ -259,6 +1092,241 @@ async def test_rollover_caps_complete_request_to_local_context_budget() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rollover_drops_duplicated_dynamic_context_before_raw_evidence() -> None:
+    system_prompt = "\n\n".join(
+        (
+            "base rules",
+            "=== V PERSONA ===\n" + "persona " * 1_200,
+            "=== V MEMORY CONTEXT ===\n" + "old memory " * 1_500,
+            "=== PREVIOUS RUNTIME CHECKPOINT ===\n" + "old trace " * 1_500,
+            "=== AGENT MODE ===\nexecute with evidence",
+            "=== OUTPUT LANGUAGE GATE ===\nEnglish output",
+        )
+    )
+    evidence = [
+        {
+            "sequence": 9,
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": "Newest verified page evidence",
+            "error": "",
+        }
+    ]
+
+    rollover = await ContextWindowManager().rollover(
+        llm=object(),
+        system_prompt=system_prompt,
+        objective="Inspect the verified result",
+        contract=TaskContract(requires_browser_snapshot=True),
+        messages=[{"role": "user", "content": "history " * 4_000}],
+        tools=[],
+        evidence=evidence,
+        previous_summary={
+            "completed": ["old step " * 30] * 8,
+            "findings": ["old finding " * 30] * 8,
+            "open_questions": [],
+            "next_steps": [],
+        },
+        evidence_since_previous=evidence,
+        context_tokens=12_000,
+        step=9,
+        use_model_summary=False,
+    )
+
+    assert rollover.evidence[0]["sequence"] == 9
+    assert "Newest verified page evidence" in rollover.evidence[0]["result_excerpt"]
+    assert "=== V MEMORY CONTEXT ===" not in rollover.messages[0]["content"]
+    assert "=== PREVIOUS RUNTIME CHECKPOINT ===" not in rollover.messages[0]["content"]
+    assert rollover.estimated_tokens_after <= 12_000 - 768 - 512
+
+
+def test_rollover_preserves_generated_source_and_error_instead_of_fixture_copy() -> None:
+    source = (
+        "def run(arguments):\n"
+        "    values = arguments.get('values', [])\n"
+        "    return {'total': sum(values)}\n"
+        + "# candidate repair context\n" * 60
+    )
+    evidence = [
+        {
+            "sequence": 4,
+            "tool": "learning_create_tool",
+            "arguments": {
+                "name": "sum_values",
+                "description": "Sum supplied values.",
+                "source": source,
+                "test": {
+                    "name": "fixture",
+                    "arguments": {"values": list(range(2_000))},
+                    "expected": {"total": 6},
+                },
+            },
+            "status": "failed",
+            "result_excerpt": "Tool execution failed: got 5 instead of 6",
+            "error": "ArtifactValidationError: got 5 instead of 6",
+        }
+    ]
+
+    bounded = ContextWindowManager._bounded_evidence(
+        evidence,
+        context_tokens=12_000,
+        maximum_characters=4_000,
+    )
+
+    assert len(bounded) == 1
+    assert bounded[0]["arguments"]["source"] == source
+    assert "grounded fixture omitted" in bounded[0]["arguments"]["test"][
+        "arguments"
+    ]
+    assert bounded[0]["arguments"]["test"]["expected"] == {"total": 6}
+    assert "got 5 instead of 6" in bounded[0]["error"]
+
+    fresh = ContextWindowManager._fresh_messages(
+        system_prompt="system",
+        objective="Create and run the tool",
+        step=4,
+        contract=TaskContract(
+            requires_created_tool=True,
+            requires_created_tool_execution=True,
+        ),
+        summary={field: [] for field in ("completed", "findings", "open_questions", "next_steps")},
+        evidence=bounded,
+        still_missing=["learning_create_tool", "generated_tool_execution"],
+    )
+    assert "Correct that source against the same contract" in fresh[1]["content"]
+
+
+def test_repair_capsule_compacts_only_runtime_bound_json_values() -> None:
+    objective = (
+        "Stwórz narzędzie. records = "
+        + json.dumps([{"url": "http://example.onion/"}] * 50)
+        + '; keywords = ["escrow"]; expected = {"count":50}. Keep order.'
+    )
+
+    compacted = ContextWindowManager._compact_runtime_bound_literals(objective)
+
+    assert compacted.startswith("Stwórz narzędzie. records = ")
+    assert compacted.count("exact runtime-bound JSON omitted") == 3
+    assert "http://example.onion/" not in compacted
+    assert compacted.endswith(". Keep order.")
+
+
+@pytest.mark.asyncio
+async def test_tight_rollover_reserves_full_safe_space_for_tool_repair() -> None:
+    source = (
+        "def run(arguments):\n"
+        "    return {'count': len(arguments.get('items', []))}\n"
+        + "# keep exact candidate source\n" * 65
+    )
+    failure = {
+        "sequence": 1,
+        "tool": "learning_create_tool",
+        "arguments": {
+            "name": "count_items",
+            "description": "Count supplied items.",
+            "source": source,
+            "test": {
+                "name": "fixture",
+                "arguments": {"items": ["x" * 500] * 20},
+                "expected": {"count": 3},
+            },
+        },
+        "status": "failed",
+        "result_excerpt": "ArtifactValidationError: expected 3, got 2",
+        "error": "ArtifactValidationError: expected 3, got 2",
+    }
+    objective = (
+        "Create and execute an offline tool. items = "
+        + json.dumps(["fixture " * 30] * 60)
+        + '; expected = {"count":3}. '
+    )
+    system_prompt = "system rules " * 1_150
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "learning_create_tool",
+                "description": "builder " * 200,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    rollover = await ContextWindowManager().rollover(
+        llm=object(),
+        system_prompt=system_prompt,
+        objective=objective,
+        contract=TaskContract(
+            requires_created_tool=True,
+            requires_created_tool_execution=True,
+        ),
+        messages=[{"role": "user", "content": "history " * 2_000}],
+        tools=tools,
+        evidence=[failure],
+        evidence_since_previous=[failure],
+        previous_summary=None,
+        context_tokens=12_000,
+        step=1,
+        use_model_summary=False,
+    )
+
+    assert rollover.evidence
+    assert rollover.evidence[0]["arguments"]["source"] == source
+    assert rollover.estimated_tokens_after <= 12_000 - 768 - 512
+    assert "exact runtime-bound JSON omitted" in rollover.messages[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_rollover_summarizes_only_evidence_since_previous_capsule() -> None:
+    calls = [
+        {
+            "sequence": 1,
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "result_excerpt": "Opened source one",
+        },
+        {
+            "sequence": 2,
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "result_excerpt": "Observed source two",
+        },
+    ]
+    previous = {
+        "completed": ["browser_navigate: succeeded"],
+        "findings": ["browser_navigate: Opened source one"],
+        "open_questions": [],
+        "next_steps": [],
+    }
+
+    rollover = await ContextWindowManager().rollover(
+        llm=object(),
+        system_prompt="system",
+        objective="Research alternatives",
+        contract=TaskContract(requires_browser_navigation=True),
+        messages=[{"role": "user", "content": "research"}],
+        tools=[],
+        evidence=calls,
+        previous_summary=previous,
+        evidence_since_previous=[calls[1]],
+        context_tokens=8_192,
+        step=2,
+        use_model_summary=False,
+    )
+
+    assert rollover.summary["completed"] == [
+        "browser_navigate: succeeded",
+        "browser_snapshot: succeeded",
+    ]
+    assert rollover.summary["findings"] == [
+        "browser_navigate: Opened source one",
+        "browser_snapshot: Observed source two",
+    ]
+    assert [item["sequence"] for item in rollover.evidence] == [2]
+
+
+@pytest.mark.asyncio
 async def test_rollover_cannot_relabel_failed_runtime_call_as_success() -> None:
     class LLMStub:
         async def ask(self, **kwargs) -> str:
@@ -303,6 +1371,90 @@ async def test_rollover_cannot_relabel_failed_runtime_call_as_success() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_rollover_replaces_dns_domain_guessing_with_search_discovery() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "completed": [],
+                    "findings": [],
+                    "open_questions": ["Is another nearby domain valid?"],
+                    "next_steps": ["Try marketplace.example instead"],
+                }
+            )
+
+    evidence = [
+        {
+            "sequence": 1,
+            "tool": "browser_navigate",
+            "arguments": {"url": "https://missing.invalid"},
+            "status": "failed",
+            "result_excerpt": "NS_ERROR_UNKNOWN_HOST",
+            "error": "MCPToolExecutionError: NS_ERROR_UNKNOWN_HOST",
+        }
+    ]
+
+    rollover = await ContextWindowManager().rollover(
+        llm=LLMStub(),
+        system_prompt="system",
+        objective="Search for an alternative",
+        contract=TaskContract(requires_web_discovery=True),
+        messages=[{"role": "user", "content": "search"}],
+        tools=[],
+        evidence=evidence,
+        previous_summary=None,
+        context_tokens=8_192,
+        step=1,
+    )
+
+    assert "DuckDuckGo search results" in rollover.summary["next_steps"][0]
+    assert "do not guess" in rollover.summary["next_steps"][0]
+    assert "marketplace.example" not in json.dumps(rollover.summary)
+
+
+@pytest.mark.asyncio
+async def test_rollover_replaces_http_429_captcha_advice_with_duckduckgo() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "completed": [],
+                    "findings": [],
+                    "open_questions": ["How can I bypass the reCAPTCHA?"],
+                    "next_steps": ["Try to bypass the challenge"],
+                }
+            )
+
+    evidence = [
+        {
+            "sequence": 1,
+            "tool": "browser_navigate",
+            "arguments": {"url": "https://google.com/search?q=test"},
+            "status": "failed",
+            "result_excerpt": "HTTP status: 429; reCAPTCHA",
+            "error": "BrowserHTTPError: page returned HTTP status 429",
+        }
+    ]
+
+    rollover = await ContextWindowManager().rollover(
+        llm=LLMStub(),
+        system_prompt="system",
+        objective="Search for an alternative",
+        contract=TaskContract(requires_web_discovery=True),
+        messages=[{"role": "user", "content": "search"}],
+        tools=[],
+        evidence=evidence,
+        previous_summary=None,
+        context_tokens=8_192,
+        step=1,
+    )
+
+    encoded = json.dumps(rollover.summary)
+    assert "DuckDuckGo search results" in encoded
+    assert "bypass" not in encoded
+
+
 def test_semantic_intent_accepts_only_closed_capability_vocabulary() -> None:
     intent = SemanticIntent.parse(
         json.dumps(
@@ -325,6 +1477,52 @@ def test_semantic_intent_accepts_only_closed_capability_vocabulary() -> None:
     assert contract.requires_evidence_report is True
 
 
+def test_semantic_intent_preserves_unclear_message_signal() -> None:
+    intent = SemanticIntent.parse(
+        json.dumps(
+            {
+                "message_clear": False,
+                "action_requested": False,
+                "continue_previous": False,
+                "capabilities": [],
+                "requires_report": False,
+                "distinct_detail_page": False,
+                "artifact_fallback": False,
+                "required_public_fields": [],
+                "public_subject": "",
+                "web_query": "",
+            }
+        )
+    )
+
+    assert intent is not None
+    assert intent.message_clear is False
+
+
+def test_semantic_intent_preserves_odd_banter_signal() -> None:
+    intent = SemanticIntent.parse(
+        json.dumps(
+            {
+                "message_clear": True,
+                "message_odd": True,
+                "action_requested": False,
+                "continue_previous": False,
+                "capabilities": [],
+                "requires_report": False,
+                "distinct_detail_page": False,
+                "artifact_fallback": False,
+                "required_public_fields": [],
+                "public_subject": "",
+                "web_query": "",
+            }
+        )
+    )
+
+    assert intent is not None
+    assert intent.message_clear is True
+    assert intent.message_odd is True
+
+
 @pytest.mark.asyncio
 async def test_multilingual_intent_router_classifies_hungarian_action() -> None:
     class LLMStub:
@@ -340,6 +1538,7 @@ async def test_multilingual_intent_router_classifies_hungarian_action() -> None:
                     "capabilities": ["browser"],
                     "requires_report": True,
                     "distinct_detail_page": False,
+                    "web_query": "internetes kutatási eredmények",
                 }
             )
 
@@ -354,8 +1553,104 @@ async def test_multilingual_intent_router_classifies_hungarian_action() -> None:
     assert intent.action_requested is True
     assert intent.capabilities == ("browser",)
     assert intent.requires_report is True
+    assert intent.web_query == "internetes kutatási eredmények"
     assert llm.kwargs["temperature"] == 0.0
     assert llm.kwargs["max_tokens"] == 128
+    assert llm.kwargs["response_format"]["type"] == "json_schema"
+
+
+@pytest.mark.asyncio
+async def test_router_normalizes_language_independent_action_contradiction() -> None:
+    class LLMStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ask(self, **kwargs) -> str:
+            self.calls += 1
+            return json.dumps(
+                {
+                    "action_requested": False,
+                    "continue_previous": False,
+                    "capabilities": ["browser"],
+                    "requires_report": True,
+                    "distinct_detail_page": True,
+                    "artifact_fallback": False,
+                    "required_public_fields": [
+                        "address",
+                        "contact",
+                        "opening_hours",
+                    ],
+                    "public_subject": "Csodamalina",
+                    "web_query": "Csodamalina cukrászda Varsó",
+                }
+            )
+
+    llm = LLMStub()
+    router = MultilingualIntentRouter(llm)
+    intent = await router.classify(
+        "Keresd meg a varsói Csodamalina cukrászdák címét, telefonszámát "
+        "és nyitvatartását."
+    )
+
+    assert intent is not None
+    assert intent.action_requested is True
+    assert intent.required_public_fields == (
+        "address",
+        "contact",
+        "opening_hours",
+    )
+    assert intent.public_subject == "Csodamalina"
+    contract = intent.to_contract()
+    assert contract.requires_browser_navigation is True
+    assert contract.required_public_fields == (
+        "address",
+        "contact",
+        "opening_hours",
+    )
+    assert contract.required_public_subject == "Csodamalina"
+    assert llm.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_router_rejects_prior_subject_leaking_into_unrelated_message() -> None:
+    class LLMStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ask(self, **kwargs) -> str:
+            self.calls += 1
+            return json.dumps(
+                {
+                    "action_requested": True,
+                    "continue_previous": False,
+                    "capabilities": ["browser"],
+                    "requires_report": True,
+                    "distinct_detail_page": True,
+                    "artifact_fallback": False,
+                    "required_public_fields": ["address", "opening_hours"],
+                    "public_subject": "Cukiernia Cud Malina",
+                    "web_query": "cukiernia cud malina warszawa",
+                }
+            )
+
+    llm = LLMStub()
+    router = MultilingualIntentRouter(llm)
+    intent = await router.classify(
+        "pirat",
+        previous_context={
+            "objective": "Znajdź cukiernie Cud Malina.",
+            "status": "completed",
+        },
+    )
+
+    assert intent is None
+    assert llm.calls == 1
+    assert router.last_failure_reason == "current_message_grounding"
+
+
+def test_context_rollover_requires_material_token_saving() -> None:
+    assert ContextWindowManager.materially_reduces(8_784, 8_778) is False
+    assert ContextWindowManager.materially_reduces(8_784, 8_600) is True
 
 
 @pytest.mark.asyncio
@@ -369,6 +1664,88 @@ async def test_multilingual_intent_router_fails_closed_on_invalid_output() -> No
     )
 
     assert intent is None
+
+
+@pytest.mark.asyncio
+async def test_multilingual_intent_router_retries_malformed_json_once() -> None:
+    class LLMStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ask(self, **kwargs) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                return '{"action_requested": true'
+            return json.dumps(
+                {
+                    "action_requested": True,
+                    "continue_previous": False,
+                    "capabilities": ["browser"],
+                    "requires_report": True,
+                    "distinct_detail_page": False,
+                    "artifact_fallback": True,
+                    "web_query": "alternative to Firecrawler",
+                }
+            )
+
+    llm = LLMStub()
+    intent = await MultilingualIntentRouter(llm).classify(
+        "Hello V, find an alternative to Firecrawler."
+    )
+
+    assert intent is not None
+    assert intent.web_query == "alternative to Firecrawler"
+    assert llm.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_multilingual_intent_router_rejects_empty_artifact_fallback() -> None:
+    class LLMStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ask(self, **kwargs) -> str:
+            self.calls += 1
+            return json.dumps(
+                {
+                    "action_requested": False,
+                    "continue_previous": False,
+                    "capabilities": [],
+                    "requires_report": False,
+                    "distinct_detail_page": False,
+                    "artifact_fallback": True,
+                    "web_query": "",
+                }
+            )
+
+    llm = LLMStub()
+    intent = await MultilingualIntentRouter(llm).classify(
+        "Znajdź alternatywę dla Firecrawlera, a jeśli jej nie ma, stwórz tool."
+    )
+
+    assert intent is None
+    assert llm.calls == 2
+
+
+def test_conditional_artifact_search_has_runtime_discovery_fallback() -> None:
+    prompt = (
+        "Cześć V, znajdź darmową alternatywę dla Firecrawlera. Jeżeli jej "
+        "nie znajdziesz, zbierz informacje potrzebne do stworzenia toola."
+    )
+    contract = TaskContract.from_prompt(prompt)
+
+    assert contract.allows_artifact_fallback is True
+    assert TaskContract.implies_artifact_discovery(prompt) is True
+
+
+def test_conditional_artifact_recognizes_pronoun_phrase_before_tool() -> None:
+    contract = TaskContract.from_prompt(
+        "Znajdź w internecie alternatywę dla Firecrawlera. Ewentualnie, "
+        "jeżeli nic nie znajdziesz, stwórz to po swojemu, jako tool albo skill."
+    )
+
+    assert contract.allows_artifact_fallback is True
+    assert contract.requires_created_tool is False
 
 
 def test_task_contract_requires_real_detail_page_after_search_listing() -> None:
@@ -386,6 +1763,210 @@ def test_task_contract_requires_real_detail_page_after_search_listing() -> None:
 
     assert contract.requires_distinct_detail_page is True
     assert contract.unmet(listing_only) == ["browser_navigate:distinct_detail_page"]
+
+
+def test_first_product_listing_page_is_not_misread_as_search_result() -> None:
+    contract = TaskContract.from_prompt(
+        "Visit https://books.toscrape.com/ and inspect the first product "
+        "listing page."
+    )
+
+    assert contract.requires_browser_navigation is True
+    assert contract.requires_browser_snapshot is True
+    assert contract.requires_distinct_detail_page is False
+
+
+def test_task_contract_rejects_browser_scaffolding_as_report_findings() -> None:
+    contract = TaskContract.from_prompt(
+        "Inspect https://marketplace.example and list useful tools."
+    )
+    calls = [
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": (
+                "Tool E2B by Example · Tool for integration.\n"
+                "Tool PaddleOCR by Example · Document parsing."
+            ),
+        }
+    ]
+
+    issues = contract.answer_issues(
+        "Potential tool: generic [ref=f1e118] [cursor=pointer].",
+        calls,
+    )
+
+    assert issues == ["answer:browser_scaffolding_is_not_a_finding"]
+
+
+def test_task_contract_rejects_online_recommendations_absent_from_sources() -> None:
+    contract = TaskContract.from_prompt(
+        "Find an alternative to FireCrawler online and report the result."
+    )
+    calls = [
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": (
+                "Page URL: https://github.com/\n"
+                "Page Title: GitHub · Change is constant."
+            ),
+        }
+    ]
+
+    issues = contract.answer_issues(
+        "Try **Scrapy**, **BeautifulSoup**, or **Puppeteer**, Boss.",
+        calls,
+        request="Find an alternative to FireCrawler online.",
+    )
+
+    assert issues == [
+        "answer:ungrounded_online_claims=BeautifulSoup|Puppeteer|Scrapy"
+    ]
+
+
+def test_task_contract_accepts_named_online_result_present_in_source() -> None:
+    contract = TaskContract.from_prompt(
+        "Find an alternative to FireCrawler online and report the result."
+    )
+    calls = [
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": (
+                "Page URL: https://github.com/scrapy/scrapy\n"
+                "Scrapy is an open source web crawling framework."
+            ),
+        }
+    ]
+
+    assert contract.answer_issues(
+        "**Scrapy** is the source-backed candidate, Boss.",
+        calls,
+        request="Find an alternative to FireCrawler online.",
+    ) == []
+
+
+def test_task_contract_accepts_source_backed_based_adjective() -> None:
+    contract = TaskContract.from_prompt(
+        "Find an alternative to FireCrawler online and report the result."
+    )
+    calls = [
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": (
+                "Page URL: https://scrapy.org/\n"
+                "Scrapy is built in Python for large crawling projects."
+            ),
+        }
+    ]
+
+    assert contract.answer_issues(
+        "**Scrapy** is a source-backed Python-based crawling framework.",
+        calls,
+        request="Find an alternative to FireCrawler online.",
+    ) == []
+
+
+def test_task_contract_rejects_mistyped_online_source_url() -> None:
+    contract = TaskContract.from_prompt(
+        "Find an alternative to FireCrawler online and report the result."
+    )
+    calls = [
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": (
+                "Page URL: "
+                "https://thunderbit.com/pl/blog/open-source-firecrawl-alternatives\n"
+                "Scrapy is built in Python."
+            ),
+        }
+    ]
+
+    issues = contract.answer_issues(
+        "The source is "
+        "https://thunderbit.com/pl/blog/open-source-firercrawl-alternatives. "
+        "It recommends **Scrapy**.",
+        calls,
+        request="Find an alternative to FireCrawler online.",
+    )
+
+    assert issues == [
+        "answer:ungrounded_online_urls="
+        "https://thunderbit.com/pl/blog/open-source-firercrawl-alternatives"
+    ]
+
+
+def test_task_contract_routes_public_social_profile_lookup_to_web() -> None:
+    contract = TaskContract.from_prompt(
+        "Znajdź publiczny profil tej osoby na Facebooku i podaj źródło."
+    )
+
+    assert contract.requires_browser_navigation is True
+    assert contract.requires_browser_snapshot is True
+    assert contract.requires_web_discovery is True
+
+
+def test_task_contract_routes_person_lookup_with_inflected_facebook_to_web() -> None:
+    contract = TaskContract.from_prompt(
+        "Znajdźmy pewną osobę. Chcę wiedzieć, gdzie jest. Na pewno ma Facebooka."
+    )
+
+    assert contract.requires_browser_navigation is True
+    assert contract.requires_browser_snapshot is True
+    assert contract.requires_web_discovery is True
+    assert contract.requires_evidence_report is True
+
+
+def test_task_contract_does_not_treat_language_name_as_online_product() -> None:
+    contract = TaskContract.from_prompt(
+        "Find an alternative to FireCrawler online and report the result."
+    )
+    calls = [
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": "Crawl4AI is a free open-source alternative.",
+        }
+    ]
+
+    issues = contract.answer_issues(
+        "The English response identifies Crawl4AI as the verified alternative.",
+        calls,
+        request="Find an alternative to FireCrawler online.",
+    )
+
+    assert not any("ungrounded_online_claims=English" in issue for issue in issues)
+
+
+def test_task_contract_does_not_treat_owner_vocative_as_online_product() -> None:
+    contract = TaskContract.from_prompt(
+        "Find an alternative to FireCrawler online and report the result."
+    )
+    calls = [
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": "TinyFish published a Firecrawl alternatives review.",
+        }
+    ]
+
+    issues = contract.answer_issues(
+        "Okay, Brzeszczot. TinyFish published the verified review.",
+        calls,
+        request="Find an alternative to FireCrawler online.",
+    )
+
+    assert not any("Brzeszczot" in issue for issue in issues)
 
 
 def test_task_contract_requires_real_file_and_command_actions() -> None:

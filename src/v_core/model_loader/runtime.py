@@ -9,11 +9,14 @@ import shutil
 import signal
 import subprocess
 import time
-from typing import Callable
+from typing import Callable, Protocol
 
 import httpx
 
+from .chat_templates import resolve_chat_template
+
 from .models import ModelProfile
+from ..persona.primer import V_IDENTITY_PRIMER
 
 
 class LlamaServerUnavailable(RuntimeError):
@@ -22,6 +25,42 @@ class LlamaServerUnavailable(RuntimeError):
 
 class LlamaServerStartError(RuntimeError):
     pass
+
+
+class ProcessHandle(Protocol):
+    pid: int
+
+    def poll(self) -> int | None: ...
+
+    def wait(self, timeout: float | None = None) -> int: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AttachedProcess:
+    """Controllable handle for an exact verified local llama-server."""
+
+    pid: int
+
+    def poll(self) -> int | None:
+        try:
+            stat_fields = Path(f"/proc/{self.pid}/stat").read_text().split()
+            if len(stat_fields) >= 3 and stat_fields[2] == "Z":
+                return 0
+        except OSError:
+            return 0
+        try:
+            os.kill(self.pid, 0)
+        except OSError:
+            return 0
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(str(self.pid), timeout)
+            time.sleep(0.05)
+        return 0
 
 
 def find_llama_server(
@@ -61,7 +100,12 @@ def find_llama_server(
     return None
 
 
-def build_server_command(binary: Path, profile: ModelProfile) -> tuple[str, ...]:
+def build_server_command(
+    binary: Path,
+    profile: ModelProfile,
+    *,
+    system_prompt_file: Path | None = None,
+) -> tuple[str, ...]:
     model = Path(profile.model_path).resolve(strict=True)
     executable = Path(binary).resolve(strict=True)
     if not executable.is_file() or not os.access(executable, os.X_OK):
@@ -136,11 +180,23 @@ def build_server_command(binary: Path, profile: ModelProfile) -> tuple[str, ...]
     if profile.threads:
         command.extend(("--threads", str(profile.threads)))
     command.extend(profile.extra_args)
+    if system_prompt_file is not None:
+        prompt_file = Path(system_prompt_file).resolve(strict=True)
+        if not prompt_file.is_file():
+            raise LlamaServerUnavailable("system prompt file does not exist")
+        command.extend(("--system-prompt-file", str(prompt_file)))
     # Enforced arguments are deliberately last so a profile cannot enable
     # downloads, llama.cpp's own filesystem tools, or a public listener.
+    command.append("--jinja")
+    chat_template = resolve_chat_template(
+        profile.chat_template,
+        profile.model_path,
+        profile.alias,
+    )
+    if chat_template:
+        command.extend(("--chat-template", chat_template))
     command.extend(
         (
-            "--jinja",
             "--metrics",
             "--slots",
             "--offline",
@@ -155,9 +211,10 @@ def build_server_command(binary: Path, profile: ModelProfile) -> tuple[str, ...]
 @dataclass(slots=True)
 class LlamaServerSession:
     profile: ModelProfile
-    process: subprocess.Popen[bytes]
+    process: ProcessHandle
     log_path: Path
     _log_handle: object
+    owns_process: bool = True
 
     @property
     def base_url(self) -> str:
@@ -172,18 +229,24 @@ class LlamaServerSession:
         os.environ["V_CORE_TOP_P"] = str(self.profile.top_p)
 
     async def stop(self, *, timeout: float = 10.0) -> None:
-        if self.process.poll() is None:
+        if self.owns_process and self.process.poll() is None:
             try:
                 os.killpg(self.process.pid, signal.SIGTERM)
             except ProcessLookupError:
-                pass
+                try:
+                    os.kill(self.process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
             try:
                 await asyncio.to_thread(self.process.wait, timeout=timeout)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(self.process.pid, signal.SIGKILL)
                 except ProcessLookupError:
-                    pass
+                    try:
+                        os.kill(self.process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                 await asyncio.to_thread(self.process.wait)
         close = getattr(self._log_handle, "close", None)
         if callable(close):
@@ -202,15 +265,33 @@ async def start_llama_server(
     logs = root / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     logs.chmod(0o700)
+    system_prompt_file = _write_identity_primer(root)
 
     if await _endpoint_responds(profile.port):
-        raise LlamaServerStartError(
-            f"port {profile.port} already has an HTTP service; refusing to replace it"
+        attached = await _attach_existing_llama_server(
+            binary,
+            profile,
+            root,
+            system_prompt_file,
         )
+        if attached is None:
+            raise LlamaServerStartError(
+                f"port {profile.port} already has an HTTP service; refusing to replace it"
+            )
+        attached.apply_to_environment()
+        output(
+            f"Reusing already-loaded model {profile.alias} "
+            f"(llama-server PID {attached.process.pid})."
+        )
+        return attached
 
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     log_path = logs / f"llama-server-{timestamp}.log"
-    command = build_server_command(binary, profile)
+    command = build_server_command(
+        binary,
+        profile,
+        system_prompt_file=system_prompt_file,
+    )
     log_handle = log_path.open("ab", buffering=0)
     log_path.chmod(0o600)
     try:
@@ -281,6 +362,155 @@ async def _endpoint_responds(port: int) -> bool:
             return response.status_code in {200, 401, 403, 404, 503}
     except httpx.HTTPError:
         return False
+
+
+async def _attach_existing_llama_server(
+    binary: Path,
+    profile: ModelProfile,
+    runtime_root: Path,
+    system_prompt_file: Path,
+) -> LlamaServerSession | None:
+    """Attach only to the exact local, private server selected by the owner."""
+
+    try:
+        async with httpx.AsyncClient(timeout=1.0, trust_env=False) as client:
+            health = await client.get(f"http://127.0.0.1:{profile.port}/health")
+            if health.status_code != 200:
+                return None
+            payload = health.json()
+            if not isinstance(payload, dict) or payload.get("status") != "ok":
+                return None
+            await _verify_model_alias(client, profile)
+    except (httpx.HTTPError, ValueError, LlamaServerStartError):
+        return None
+
+    pid = _matching_local_llama_pid(
+        binary,
+        profile,
+        system_prompt_file=system_prompt_file,
+    )
+    if pid is None:
+        return None
+    logs = Path(runtime_root) / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    logs.chmod(0o700)
+    try:
+        candidates = sorted(
+            logs.glob("llama-server-*.log"),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+    except OSError:
+        candidates = []
+    if candidates:
+        log_path = candidates[0]
+    else:
+        log_path = logs / f"llama-server-attached-pid{pid}.log"
+        log_path.touch(mode=0o600, exist_ok=True)
+        log_path.chmod(0o600)
+    return LlamaServerSession(
+        profile=profile,
+        process=AttachedProcess(pid),
+        log_path=log_path,
+        _log_handle=None,
+        # A matching orphan from an interrupted prior run is adopted by this V
+        # session. Session shutdown must release its VRAM and process tree too.
+        owns_process=True,
+    )
+
+
+def _matching_local_llama_pid(
+    binary: Path,
+    profile: ModelProfile,
+    *,
+    system_prompt_file: Path,
+) -> int | None:
+    expected_binary = Path(binary).resolve()
+    expected_model = Path(profile.model_path).resolve()
+    expected_system_prompt = Path(system_prompt_file).resolve()
+    expected_chat_template = resolve_chat_template(
+        profile.chat_template,
+        profile.model_path,
+        profile.alias,
+    )
+    try:
+        processes = list(Path("/proc").glob("[0-9]*"))
+    except OSError:
+        return None
+    for process_root in processes:
+        try:
+            if process_root.stat().st_uid != os.getuid():
+                continue
+            raw = (process_root / "cmdline").read_bytes()
+            arguments = [
+                item.decode("utf-8", errors="replace")
+                for item in raw.split(b"\0")
+                if item
+            ]
+        except OSError:
+            continue
+        if not arguments:
+            continue
+        executable_match = False
+        for candidate in arguments[:2]:
+            try:
+                if Path(candidate).resolve() == expected_binary:
+                    executable_match = True
+                    break
+            except OSError:
+                continue
+        if not executable_match:
+            continue
+
+        def value(flag: str) -> str:
+            positions = [
+                index for index, item in enumerate(arguments[:-1]) if item == flag
+            ]
+            return arguments[positions[-1] + 1] if positions else ""
+
+        try:
+            model_match = Path(value("--model")).resolve() == expected_model
+            prompt_match = (
+                Path(value("--system-prompt-file")).resolve()
+                == expected_system_prompt
+            )
+            template_match = value("--chat-template") == expected_chat_template
+        except OSError:
+            model_match = False
+            prompt_match = False
+        if not all(
+            (
+                model_match,
+                prompt_match,
+                template_match,
+                value("--alias") == profile.alias,
+                value("--port") == str(profile.port),
+                value("--host") == "127.0.0.1",
+                "--offline" in arguments,
+                "--no-webui" in arguments,
+            )
+        ):
+            continue
+        try:
+            return int(process_root.name)
+        except ValueError:
+            continue
+    return None
+
+
+def _write_identity_primer(runtime_root: Path) -> Path:
+    """Persist the immutable V primer privately for llama-server startup."""
+
+    directory = Path(runtime_root) / "system-prompts"
+    directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(0o700)
+    destination = directory / "v-identity.txt"
+    temporary = directory / ".v-identity.tmp"
+    temporary.write_text(V_IDENTITY_PRIMER + "\n", encoding="utf-8")
+    temporary.chmod(0o600)
+    temporary.replace(destination)
+    destination.chmod(0o600)
+    return destination.resolve()
 
 
 async def _verify_model_alias(

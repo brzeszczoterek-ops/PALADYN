@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from v_core.autonomy import (
+    AgentTaskTrace,
     AuthorizationEnvelope,
     AuthorizationGuard,
     AutonomousRunner,
@@ -42,6 +43,10 @@ from v_core.learning import (
     validate_schema,
     audit_learning_store,
 )
+from v_core.learning.snapshot_extractor import (
+    extract_accessibility_product_cards,
+    product_card_fixture,
+)
 from v_core.sandbox import BubblewrapBackend, SandboxResult
 from v_core.mcp_tools import MCPTools
 from v_core.agent import Agent
@@ -67,6 +72,32 @@ OUTPUT_SCHEMA = {
 DOUBLE_SOURCE = """
 def run(arguments):
     return {"result": arguments["value"] * 2}
+""".strip()
+PRODUCT_SNAPSHOT = """
+- article:
+  - link:
+    - /url: catalogue/a-light-in-the-attic_1000/index.html
+    - img "A Light in the Attic"
+  - paragraph: £51.77
+  - text: In stock
+- article:
+  - link:
+    - /url: catalogue/tipping-the-velvet_999/index.html
+    - img "Tipping the Velvet"
+  - paragraph: £53.74
+  - text: In stock
+- article:
+  - link:
+    - /url: catalogue/soumission_998/index.html
+    - img "Soumission"
+  - paragraph: £50.10
+  - text: In stock
+- article:
+  - link:
+    - /url: catalogue/sharp-objects_997/index.html
+    - img "Sharp Objects"
+  - paragraph: £47.82
+  - text: In stock
 """.strip()
 
 
@@ -463,9 +494,110 @@ def test_learning_profiles_keep_persistent_promotion_owner_only(tmp_path: Path) 
     for capability in (
         "owner:create_persistent_artifacts",
         "owner:activate_persistent_artifacts",
+        "owner:privileged_generated_code",
     ):
         assert not client.authorization.envelope.allows(capability)
         assert owner.authorization.envelope.allows(capability)
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.asyncio
+async def test_owner_profile_allows_privileged_code_inside_sandbox(
+    tmp_path: Path,
+) -> None:
+    def configured(profile: str, suffix: str) -> MCPTools:
+        return MCPTools(
+            SimpleNamespace(
+                filesystem_server=["/usr/bin/false"],
+                browser_server=["/usr/bin/false"],
+                workspace=tmp_path / f"workspace-{suffix}",
+                learning_root=tmp_path / f"learning-{suffix}",
+                learning_profile=profile,
+                evm_profile="client",
+            )
+        )
+
+    source = """
+import subprocess
+
+def run(arguments):
+    namespace = {"arguments": arguments}
+    exec(compile("value = arguments['text']", "<owner-tool>", "exec"), namespace)
+    with open("owner-tool.txt", "w", encoding="utf-8") as handle:
+        handle.write(namespace["value"])
+    completed = subprocess.run(
+        ["/usr/bin/printf", namespace["value"]],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return {"stdout": completed.stdout}
+""".strip()
+    blueprint = {
+        "name": "run_local_process",
+        "description": "Execute a bounded local subprocess and return stdout.",
+        "source": source,
+        "test": {
+            "name": "prints exact text",
+            "arguments": {"text": "owner-lab"},
+            "expected": {"stdout": "owner-lab"},
+        },
+    }
+    client = configured("client", "client-privileged")
+    owner = configured("owner_lab", "owner-privileged")
+
+    with pytest.raises(ArtifactValidationError, match="import is not allowed"):
+        await client.call("learning_create_tool", blueprint)
+
+    created = json.loads(await owner.call("learning_create_tool", blueprint))
+    executed = json.loads(
+        await owner.call("run_local_process", {"text": "still-contained"})
+    )
+
+    assert created["status"] == "active"
+    assert created["validation"]["static_policy"] == "owner_privileged"
+    assert created["validation"]["network"] == "offline"
+    assert executed == {"stdout": "still-contained"}
+
+    persistent_blueprint = dict(blueprint)
+    persistent_blueprint.update(
+        {"name": "persistent_owner_process", "scope": "persistent"}
+    )
+    persistent = json.loads(
+        await owner.call("learning_create_tool", persistent_blueprint)
+    )
+    assert persistent["status"] == "active"
+    assert persistent["scope"] == "persistent"
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.asyncio
+async def test_blueprint_normalizes_invalid_optional_version(tmp_path: Path) -> None:
+    tools = MCPTools(
+        SimpleNamespace(
+            filesystem_server=["/usr/bin/false"],
+            browser_server=["/usr/bin/false"],
+            workspace=tmp_path / "workspace",
+            learning_root=tmp_path / "learning",
+            learning_profile="owner_lab",
+            evm_profile="client",
+        )
+    )
+    blueprint = {
+        "name": "echo_value",
+        "version": "1.0",
+        "description": "Return a supplied value.",
+        "source": "def run(arguments):\n    return {'value': arguments['value']}",
+        "test": {
+            "name": "exact value",
+            "arguments": {"value": 7},
+            "expected": {"value": 7},
+        },
+    }
+
+    created = json.loads(await tools.call("learning_create_tool", blueprint))
+
+    assert created["version"] == "1.0.0"
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
@@ -1002,7 +1134,7 @@ async def test_composite_creation_reuses_identical_active_bundle(
     assert len(learning.store.list_records()) == 1
 
 
-def test_learning_tool_definition_requires_complete_manifest(tmp_path: Path) -> None:
+def test_learning_tool_definition_uses_concrete_test_blueprint(tmp_path: Path) -> None:
     tools = MCPTools(
         SimpleNamespace(
             filesystem_server=["/usr/bin/false"],
@@ -1017,15 +1149,269 @@ def test_learning_tool_definition_requires_complete_manifest(tmp_path: Path) -> 
         item["function"]["name"]: item["function"]["parameters"]
         for item in tools._local_tool_definitions()
     }
-    manifest = definitions["learning_create_tool"]["properties"]["manifest"]
-
-    assert "description" in manifest["required"]
-    assert "tests" in manifest["required"]
-    assert manifest["properties"]["tests"]["items"]["required"] == [
+    creation = definitions["learning_create_tool"]
+    assert creation["required"] == ["source"]
+    assert creation["properties"]["test"]["required"] == [
         "name",
         "arguments",
         "expected",
     ]
+    assert definitions["learning_create_snapshot_extractor"]["required"] == [
+        "name"
+    ]
+    stage_manifest = definitions["learning_stage_tool"]["properties"]["manifest"]
+    assert "description" in stage_manifest["required"]
+    assert "tests" in stage_manifest["required"]
+    assert definitions["learning_record_evidence"]["required"] == [
+        "source",
+        "outcome",
+        "summary",
+    ]
+    assert definitions["learning_propose_lesson"]["required"] == [
+        "title",
+        "hypothesis",
+        "trigger",
+        "action",
+        "evidence_ids",
+    ]
+    assert definitions["learning_stage_tool"]["required"] == [
+        "manifest",
+        "source",
+    ]
+    assert definitions["learning_stage_skill"]["required"] == ["manifest"]
+    assert definitions["runtime_review_task"]["properties"]["task_id"][
+        "pattern"
+    ].startswith("^interactive-")
+    assert definitions["learning_list_artifacts"] == {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+    for name, schema in definitions.items():
+        if name.startswith("learning_"):
+            validate_schema(schema)
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.asyncio
+async def test_mcp_runtime_creates_tool_from_concrete_test_blueprint(
+    tmp_path: Path,
+) -> None:
+    tools = MCPTools(
+        SimpleNamespace(
+            filesystem_server=["/usr/bin/false"],
+            browser_server=["/usr/bin/false"],
+            workspace=tmp_path / "workspace",
+            learning_root=tmp_path / "learning",
+            learning_profile="client",
+            evm_profile="client",
+        )
+    )
+
+    created = json.loads(
+        await tools.call(
+            "learning_create_tool",
+            {
+                "name": "double_from_blueprint",
+                "description": "Double an integer from one concrete test.",
+                "source": DOUBLE_SOURCE,
+                "test": {
+                    "name": "double two",
+                    "arguments": {"value": 2},
+                    "expected": {"result": 4},
+                },
+            },
+        )
+    )
+
+    assert created["status"] == "active"
+    assert json.loads(await tools.call("double_from_blueprint", {"value": 7})) == {
+        "result": 14
+    }
+    generated = next(
+        item
+        for item in tools._local_tool_definitions()
+        if item["function"]["name"] == "double_from_blueprint"
+    )
+    assert generated["function"]["parameters"] == INPUT_SCHEMA
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.asyncio
+async def test_mcp_runtime_builds_full_tool_contract_from_source_only(
+    tmp_path: Path,
+) -> None:
+    tools = MCPTools(
+        SimpleNamespace(
+            filesystem_server=["/usr/bin/false"],
+            browser_server=["/usr/bin/false"],
+            workspace=tmp_path / "workspace",
+            learning_root=tmp_path / "learning",
+            learning_profile="client",
+            evm_profile="client",
+        )
+    )
+    tools.begin_interaction(
+        "source-only-test",
+        (
+            "Create a tool named double_from_source. "
+            'value = 2\nexpected = {"result": 4}'
+        ),
+    )
+
+    created = json.loads(
+        await tools.call("learning_create_tool", {"source": DOUBLE_SOURCE})
+    )
+
+    assert created["name"] == "double_from_source"
+    assert created["status"] == "active"
+    assert created["validation"]["passed"] is True
+    assert created["validation"]["tests"] == [
+        {"name": "owner-specified semantic oracle", "passed": True}
+    ]
+    assert json.loads(await tools.call("double_from_source", {"value": 9})) == {
+        "result": 18
+    }
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.asyncio
+async def test_source_only_builder_marks_runtime_derived_smoke_contract(
+    tmp_path: Path,
+) -> None:
+    learning = runtime(tmp_path)
+
+    created = await learning.create_tool_from_source(
+        DOUBLE_SOURCE,
+        objective="Create a tool named smoke_double. value = 3",
+    )
+    manifest, _ = learning.store.load_tool(created)
+
+    assert created.status is ArtifactStatus.ACTIVE
+    assert manifest.tests[0].name == (
+        "runtime-derived deterministic contract smoke test"
+    )
+    assert manifest.tests[0].expected == {"result": 6}
+    assert await learning.execute_tool("smoke_double", {"value": 5}) == {
+        "result": 10
+    }
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.asyncio
+async def test_source_only_builder_refuses_to_invent_missing_fixture(
+    tmp_path: Path,
+) -> None:
+    learning = runtime(tmp_path)
+
+    with pytest.raises(ValueError, match="input fields: value"):
+        await learning.create_tool_from_source(
+            DOUBLE_SOURCE,
+            objective="Create a tool named missing_fixture.",
+        )
+
+    with pytest.raises(ValueError, match="ignores concrete objective fixture fields"):
+        await learning.create_tool_from_source(
+            "def run(arguments):\n    return {'result': 4}",
+            objective=(
+                "Create a tool named hardcoded_result. "
+                'value = 2 expected = {"result": 4}'
+            ),
+        )
+
+    assert learning.list_artifacts() == []
+
+
+def test_accessibility_product_card_template_uses_literal_observed_values() -> None:
+    fixture = product_card_fixture(PRODUCT_SNAPSHOT, maximum_records=3)
+
+    assert "Sharp Objects" not in fixture
+    assert extract_accessibility_product_cards(fixture) == [
+        {
+            "title": "A Light in the Attic",
+            "price": "£51.77",
+            "availability": "In stock",
+            "relative_product_url": (
+                "catalogue/a-light-in-the-attic_1000/index.html"
+            ),
+        },
+        {
+            "title": "Tipping the Velvet",
+            "price": "£53.74",
+            "availability": "In stock",
+            "relative_product_url": "catalogue/tipping-the-velvet_999/index.html",
+        },
+        {
+            "title": "Soumission",
+            "price": "£50.10",
+            "availability": "In stock",
+            "relative_product_url": "catalogue/soumission_998/index.html",
+        },
+    ]
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.asyncio
+async def test_mcp_runtime_builds_snapshot_extractor_from_observed_evidence(
+    tmp_path: Path,
+) -> None:
+    tools = MCPTools(
+        SimpleNamespace(
+            filesystem_server=["/usr/bin/false"],
+            browser_server=["/usr/bin/false"],
+            workspace=tmp_path / "workspace",
+            learning_root=tmp_path / "learning",
+            learning_profile="client",
+            evm_profile="client",
+        )
+    )
+    tools.begin_interaction("interactive-template", "build an extractor")
+    tools.observe_browser_snapshot(PRODUCT_SNAPSHOT)
+
+    created = json.loads(
+        await tools.call(
+            "learning_create_snapshot_extractor",
+            {"name": "extract_book_cards"},
+        )
+    )
+    result = json.loads(
+        await tools.call(
+            "extract_book_cards",
+            {"snapshot_text": PRODUCT_SNAPSHOT},
+        )
+    )
+
+    assert created["status"] == "active"
+    assert created["validation"]["passed"] is True
+    assert len(result["records"]) == 4
+    assert result["records"][2]["relative_product_url"] == (
+        "catalogue/soumission_998/index.html"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_review_tool_excludes_current_interaction(tmp_path: Path) -> None:
+    autonomy_root = tmp_path / "autonomy"
+    trace_root = autonomy_root / "interactive"
+    prior = AgentTaskTrace(trace_root, "Previous run")
+    prior.complete("done")
+    current = AgentTaskTrace(trace_root, "Review previous run")
+    tools = MCPTools(
+        SimpleNamespace(
+            filesystem_server=["/usr/bin/false"],
+            browser_server=["/usr/bin/false"],
+            workspace=tmp_path / "workspace",
+            learning_root=tmp_path / "learning",
+            autonomy_root=autonomy_root,
+            learning_profile="client",
+            evm_profile="client",
+        )
+    )
+    tools.begin_interaction(current.task_id, current.objective)
+
+    report = json.loads(await tools.call("runtime_review_task", {}))
+
+    assert report["task_id"] == prior.task_id
 
 
 @pytest.mark.asyncio
@@ -1040,6 +1426,84 @@ async def test_generated_offline_tool_cannot_claim_web_retrieval(tmp_path: Path)
 
     with pytest.raises(ArtifactPolicyError, match="run offline"):
         await learning.create_tool(manifest, DOUBLE_SOURCE)
+
+
+def test_generated_tool_rejects_placeholder_test_fixtures(tmp_path: Path) -> None:
+    learning = runtime(tmp_path)
+    manifest = ToolManifest(
+        name="extract_records",
+        version="1.0.0",
+        description="Extract records from observed text.",
+        input_schema={
+            "type": "object",
+            "properties": {"snapshot": {"type": "string"}},
+            "required": ["snapshot"],
+            "additionalProperties": False,
+        },
+        output_schema={
+            "type": "object",
+            "properties": {
+                "records": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["records"],
+            "additionalProperties": False,
+        },
+        tests=(
+            ToolTestCase(
+                name="placeholder snapshot",
+                arguments={"snapshot": "[Snapshot] ... (rest of page)"},
+                expected={"records": []},
+            ),
+        ),
+    )
+
+    with pytest.raises(ArtifactPolicyError, match="placeholder data"):
+        learning.stage_tool(manifest, "def run(arguments):\n    return {'records': []}")
+
+
+def test_generated_extractor_rejects_expected_values_absent_from_fixture(
+    tmp_path: Path,
+) -> None:
+    learning = runtime(tmp_path)
+    manifest = ToolManifest(
+        name="extract_records",
+        version="1.0.0",
+        description="Extract records from observed text.",
+        input_schema={
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+        output_schema={
+            "type": "object",
+            "properties": {"records": {"type": "array", "items": {"type": "string"}}},
+            "required": ["records"],
+            "additionalProperties": False,
+        },
+        tests=(
+            ToolTestCase(
+                name="grounded extraction",
+                arguments={"text": "alpha"},
+                expected={"records": ["invented"]},
+            ),
+        ),
+    )
+
+    with pytest.raises(ArtifactPolicyError, match="absent from its extraction fixture"):
+        learning.stage_tool(manifest, "def run(arguments):\n    return {'records': []}")
+
+
+def test_blueprint_schema_merges_heterogeneous_object_list_items() -> None:
+    schema = MCPTools._schema_from_example(
+        {"parts": [{"url": "one"}, {"title": "Two"}]}
+    )
+
+    item = schema["properties"]["parts"]["items"]
+    assert item["type"] == "object"
+    assert set(item["properties"]) == {"title", "url"}
+    assert item["required"] == []
+    validate_instance({"parts": [{"url": "one"}, {"title": "Two"}]}, schema)
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")

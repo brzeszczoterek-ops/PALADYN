@@ -17,7 +17,7 @@ W obecnej wersji pod WSL2:
 | Akceleracja NVIDIA/CUDA | obsługiwana po konfiguracji CUDA dla WSL |
 | Narzędzia MCP i przeglądarka | obsługiwane; pierwsza instalacja wymaga sieci |
 | Sandbox Bubblewrap | należy zweryfikować testem na konkretnym WSL |
-| Mowa, Whisper, Kokoro/Piper i F8 | eksperymentalne, nieobjęte tą instrukcją |
+| Mowa, Whisper, Kokoro/Piper i F2 | eksperymentalne, nieobjęte tą instrukcją |
 | Fizyczny kill switch `Q+P+0` z `/dev/input` | nieobsługiwany przez WSL |
 | Awaryjne `paladyn-control panic-all` | obsługiwane z drugiego terminala WSL |
 
@@ -256,7 +256,7 @@ Windows używaj drugiego terminala z `panic-all`.
 - Ustaw `PALADYN_OWNER_MONITOR=0`. Automatyczne okno monitora zakłada obecnie
   terminal linuksowy z `gnome-terminal`.
 - Warstwa głosowa korzysta z PipeWire, `pw-record`, `pw-play` i linuksowej
-  obsługi F8. WSLg może udostępniać część audio, ale pełny tor mikrofon–STT–TTS
+  obsługi F2. WSLg może udostępniać część audio, ale pełny tor mikrofon–STT–TTS
   nie jest jeszcze testowanym profilem Windows.
 - Nie przekazuj PALADYNOWI ścieżek `C:\...`. W WSL ten sam dysk ma postać
   `/mnt/c/...`.
