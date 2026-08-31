@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import time
 
 import typer
 from rich.console import Console
@@ -12,8 +11,6 @@ from .hotkey import LinuxHotkeyWatcher, input_devices, parse_chord
 from .journal import CheckpointStore
 from .models import ControlSignal
 from .runtime import RuntimeRegistry
-from v_core.evm.grants import LiveGrantStore
-from v_core.evm.live import LiveAction, LiveActionGrant, MAX_LIVE_GRANT_SECONDS
 
 
 app = typer.Typer(add_completion=False)
@@ -128,98 +125,6 @@ def hotkey(
     except FileNotFoundError as exc:
         console.print(f"Input device does not exist: {device}")
         raise typer.Exit(code=1) from exc
-
-
-@app.command("grant-live")
-def grant_live(
-    chain_id: int = typer.Option(..., help="Exact EVM chain ID."),
-    actions: str = typer.Option(
-        "observe,simulate",
-        help="Comma-separated: observe, simulate, sign, broadcast.",
-    ),
-    duration: int = typer.Option(600, help="Grant lifetime in seconds (max 900)."),
-    targets: str = typer.Option("", help="Comma-separated target addresses."),
-    selectors: str = typer.Option("", help="Comma-separated 4-byte selectors."),
-    max_value_wei: int = typer.Option(0, help="Maximum simulated/sent value."),
-    allow_state_change: bool = typer.Option(
-        False,
-        help="Required when sign or broadcast is requested.",
-    ),
-    root: Path = typer.Option(default_root(), help="Autonomy state directory."),
-) -> None:
-    if duration <= 0 or duration > MAX_LIVE_GRANT_SECONDS:
-        console.print(f"Duration must be 1..{MAX_LIVE_GRANT_SECONDS} seconds.")
-        raise typer.Exit(code=2)
-    try:
-        parsed_actions = frozenset(
-            LiveAction(item.strip().lower())
-            for item in actions.split(",")
-            if item.strip()
-        )
-    except ValueError as exc:
-        console.print(f"Invalid live action: {exc}")
-        raise typer.Exit(code=2) from exc
-    state_changing = {LiveAction.SIGN, LiveAction.BROADCAST} & parsed_actions
-    if state_changing and not allow_state_change:
-        console.print("sign/broadcast requires --allow-state-change")
-        raise typer.Exit(code=2)
-    parsed_targets = frozenset(
-        item.strip() for item in targets.split(",") if item.strip()
-    )
-    parsed_selectors = frozenset(
-        item.strip() for item in selectors.split(",") if item.strip()
-    )
-    if state_changing and (not parsed_targets or not parsed_selectors):
-        console.print("sign/broadcast requires explicit targets and selectors")
-        raise typer.Exit(code=2)
-
-    now = int(time.time())
-    try:
-        grant = LiveActionGrant(
-            chain_id=chain_id,
-            issued_at=now,
-            expires_at=now + duration,
-            actions=parsed_actions,
-            allowed_targets=parsed_targets,
-            allowed_selectors=parsed_selectors,
-            max_value_wei=max_value_wei,
-        )
-    except ValueError as exc:
-        console.print(f"Invalid grant: {exc}")
-        raise typer.Exit(code=2) from exc
-    LiveGrantStore(root / "live_grants").save(grant)
-    console.print(f"Live grant: {grant.grant_id}")
-    console.print(f"Expires   : {grant.expires_at}")
-    console.print(f"Actions   : {', '.join(sorted(item.value for item in grant.actions))}")
-
-
-@app.command("revoke-live")
-def revoke_live(
-    grant_id: str,
-    root: Path = typer.Option(default_root(), help="Autonomy state directory."),
-) -> None:
-    try:
-        LiveGrantStore(root / "live_grants").revoke(grant_id)
-    except ValueError as exc:
-        console.print(str(exc))
-        raise typer.Exit(code=2) from exc
-    console.print(f"Live grant revoked: {grant_id}")
-
-
-@app.command("live-grants")
-def live_grants(
-    root: Path = typer.Option(default_root(), help="Autonomy state directory."),
-) -> None:
-    grants = LiveGrantStore(root / "live_grants").active(now=int(time.time()))
-    if not grants:
-        console.print("No active live grants.")
-        return
-    for grant in grants:
-        actions = ",".join(sorted(item.value for item in grant.actions))
-        console.print(
-            f"{grant.grant_id} chain={grant.chain_id} "
-            f"expires={grant.expires_at} actions={actions}"
-        )
 
 
 def main() -> None:

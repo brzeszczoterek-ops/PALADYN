@@ -2,7 +2,7 @@
 setlocal
 title PALADYN / V-Core
 
-wsl.exe -- bash -lc "cd ~/PALADYN && source .venv/bin/activate && exec v-core"
+wsl.exe -- bash -lc "cd ~/PALADYN && source .venv/bin/activate && exec paladyn-ui"
 
 if errorlevel 1 (
     echo.

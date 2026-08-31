@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from uuid import uuid4
 
 
 class MemoryKind(str, Enum):
@@ -115,6 +116,31 @@ class KnowledgeEntry:
     kind: MemoryKind = MemoryKind.FACT
 
     source: MemorySource = MemorySource.INFERRED
+
+
+@dataclass
+class ProposalEntry:
+    """A model suggestion awaiting runtime or owner disposition."""
+
+    proposal_id: str = field(default_factory=lambda: uuid4().hex)
+
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+    title: str = ""
+
+    suggestion: str = ""
+
+    reason: str = ""
+
+    confidence: float = 0.0
+
+    kind: MemoryKind = MemoryKind.LESSON
+
+    source: MemorySource = MemorySource.SELF_GENERATED
+
+    status: str = "pending"
+
+    decided_at: str = ""
 
 
 @dataclass

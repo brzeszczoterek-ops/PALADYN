@@ -1,5 +1,46 @@
 # V-Core Changelog
 
+## Unreleased
+
+### Added
+- A loopback-only graphical command center with streaming chat, active-model and
+  tool status, F2 local push-to-talk, optional local TTS, a session-token gate,
+  strict browser security headers, and a hold-to-shutdown control that closes V
+  and its managed model
+- A private Full UI contribution showing owner profiles/capabilities, Foundry
+  state, and latest llama.cpp prompt/output throughput; public exports retain
+  the shared UI but contain no Owner Deck implementation
+- A physical Public/Full edition boundary: the public `v_core` package loads
+  private capabilities only through an explicit extension contract, while
+  owner monitoring, privileged EVM/Foundry/live-RPC modules, and owner control
+  commands now live exclusively under `v_full`
+- Fail-closed public export manifests and tooling that copy only reviewed paths,
+  rewrite edition-specific command entry points and profiles, strip Full-only
+  documentation sections, reject private paths/static imports, and refuse to
+  overwrite an unrelated directory
+- Separate Public and Full test surfaces, including a real exported-tree test
+  proving that public PALADYN imports and runs without the private package
+- The interactive startup menu can qualify or requalify any detected GGUF,
+  display its complete capability card, add it to a free routing slot, configure
+  a one-to-three-model pool, or disable routing without requiring CLI commands
+- Agentic model qualification now runs bounded multi-turn simulations for
+  search-to-source research, failed-tool strategy changes, source repair,
+  grounded finalization, prompt-injection resistance, and context-capsule
+  recovery without browsing or executing generated code
+- Mixed objectives are routed at runtime-owned phase boundaries, allowing one
+  task to move from a research model to a coding model and then a tool-use model
+  while preserving the same explicit message and evidence ledger
+
+### Fixed
+- Public configurations can no longer unlock `owner_lab` by changing an
+  environment variable; the private package must be installed and selected,
+  and owner capabilities still require both runtime and owner approval sets
+- Model selection now uses agentic-control, recovery, context-recovery, and
+  prompt-injection scores instead of letting short one-shot probes make a model
+  appear universally capable
+- A five-point hot-swap margin keeps the active model when another candidate's
+  measured advantage is too small to justify unloading and reloading a GGUF
+
 ## 3.0.0 - 2026-08-31
 
 ### Added

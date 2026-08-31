@@ -16,6 +16,7 @@ from .autonomy import (
 from .autonomy.runner import StepDriver
 from .config import load_config
 from .config import Config
+from .edition import launch_edition_monitor, resolve_edition
 from .model_loader import (
     LlamaServerStartError,
     LlamaServerUnavailable,
@@ -24,7 +25,6 @@ from .model_loader import (
     RoutedModelRuntime,
     bootstrap_interactive_model,
 )
-from .owner_monitor import launch_owner_monitor
 from .speech import (
     NoSpeechDetected,
     SpeechConfig,
@@ -74,7 +74,9 @@ class VCore:
             storage
         )
 
-        session = Session()
+        session = Session(
+            self.config.memory_root / "conversation"
+        )
 
         reflection = Reflection(
             llm
@@ -115,6 +117,16 @@ class VCore:
             config=self.config,
             memory=memory,
             llm=llm,
+            phase_router=(
+                self.model_runtime.ensure_for_phase
+                if self.model_runtime is not None
+                else None
+            ),
+            response_fallback_router=(
+                self.model_runtime.retry_after_rejection
+                if self.model_runtime is not None
+                else None
+            ),
         )
 
         self.autonomy = AutonomousRunner(
@@ -201,7 +213,10 @@ async def chat():
         config.model_runtime_root,
         mode=config.model_loader_mode,
     )
-    owner_monitor_started = launch_owner_monitor(model_session)
+    owner_monitor_started = launch_edition_monitor(
+        getattr(config, "edition", None) or resolve_edition("public"),
+        model_session,
+    )
     model_runtime: RoutedModelRuntime | None = None
     try:
         if model_session is None:

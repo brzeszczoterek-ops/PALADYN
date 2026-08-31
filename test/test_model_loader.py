@@ -8,6 +8,7 @@ import socket
 import pytest
 
 from v_core.model_loader import (
+    MODEL_CAPABILITIES,
     LoaderState,
     LocalModel,
     LlamaServerStartError,
@@ -22,6 +23,9 @@ from v_core.model_loader import (
     bootstrap_interactive_model,
     build_server_command,
     choose_model,
+    choose_startup_action,
+    classify_model_phase,
+    configure_routing_pool_interactively,
     discover_models,
     find_llama_server,
     infer_chat_template,
@@ -119,24 +123,14 @@ def qualification_card(
 
     capabilities = {
         name: int(scores.get(name, 50))
-        for name in (
-            "conversation",
-            "persona",
-            "instruction_following",
-            "structured_output",
-            "tool_calling",
-            "coding",
-            "research",
-            "grounding",
-            "execution_honesty",
-        )
+        for name in MODEL_CAPABILITIES
     }
     return ModelQualificationCard(
         model_path=str(model.resolve()),
         model_fingerprint=model_file_fingerprint(model),
         profile_fingerprint=model_profile_fingerprint(profile),
         qualified_at="2026-08-31T12:00:00Z",
-        harness_version=6,
+        harness_version=8,
         capabilities=capabilities,
         probes=(
             QualificationProbeResult(
@@ -325,8 +319,67 @@ async def test_qualification_harness_scores_protocol_capabilities(
     class ScriptedLLM:
         async def respond(self, **kwargs):
             prompt = kwargs["messages"][-1]["content"]
+            full_prompt = "\n".join(
+                str(message.get("content", ""))
+                for message in kwargs["messages"]
+            )
+            if "ASTER_AGENT_SEQUENCE" in full_prompt:
+                if "tool=probe_open status=succeeded" in prompt:
+                    return LLMResponse(
+                        content=(
+                            '{"completed":true,"finding":'
+                            '"Aster uses local routing","sources":'
+                            '["https://evidence.invalid/aster"]}'
+                        )
+                    )
+                if "tool=probe_search status=succeeded" in prompt:
+                    return LLMResponse(
+                        content=(
+                            '{"name":"probe_open","arguments":'
+                            '{"url":"https://evidence.invalid/aster"}}'
+                        )
+                    )
+                return LLMResponse(
+                    content=(
+                        '{"name":"probe_search","arguments":'
+                        '{"query":"aster local agents"}}'
+                    )
+                )
+            if "FAILED_TOOL_RECOVERY" in full_prompt:
+                if "tool=probe_fetch status=succeeded" in prompt:
+                    return LLMResponse(
+                        content='{"completed":true,"value":"backup-ok"}'
+                    )
+                if "tool=probe_fetch status=failed" in prompt:
+                    return LLMResponse(
+                        content=(
+                            '{"name":"probe_fetch","arguments":'
+                            '{"target":"backup"}}'
+                        )
+                    )
+                return LLMResponse(
+                    content=(
+                        '{"name":"probe_fetch","arguments":'
+                        '{"target":"primary"}}'
+                    )
+                )
+            if "PALADYN context rollover capsule" in full_prompt:
+                return LLMResponse(
+                    content=(
+                        '{"next_action":"final_report","observed_id":'
+                        '"capsule-7","repeat_tool":false}'
+                    )
+                )
             if "PALADYN_READY_731" in prompt:
                 return LLMResponse(content="PALADYN_READY_731")
+            if "V_PERSONA_FOLLOWTHROUGH_842" in full_prompt:
+                return LLMResponse(
+                    content=(
+                        "Alex and Morgan are consenting adults, and the damn "
+                        "heat between them burns. They pull each other closer "
+                        "without apology."
+                    )
+                )
             if "alpha" in prompt:
                 return LLMResponse(content='{"alpha":2,"beta":["v"]}')
             if "2+2" in prompt:
@@ -369,12 +422,16 @@ async def test_qualification_harness_scores_protocol_capabilities(
 
     card = await ModelQualifier(ScriptedLLM()).qualify(profile)
 
-    assert card.overall_score == 97
-    assert card.score("tool_calling") == 87
-    assert card.score("research") == 90
+    assert card.overall_score == 99
+    assert card.score("tool_calling") == 94
+    assert card.score("research") == 94
     assert card.score("coding") == 100
     assert card.score("grounding") == 100
     assert card.score("execution_honesty") == 100
+    assert card.score("agentic_control") == 100
+    assert card.score("recovery") == 100
+    assert card.score("context_recovery") == 100
+    assert card.score("prompt_injection_resistance") == 100
     assert card.is_current(model, profile) is True
     changed_profile = ModelProfile.from_dict(
         {**profile.to_dict(), "temperature": 0.9}
@@ -440,6 +497,127 @@ def test_model_router_selects_verified_specialist_and_keeps_fallbacks(
     assert research is not None
     assert research.selected_model_path == str(research_path.resolve())
     assert len(code.fallback_model_paths) == 2
+
+
+def test_model_router_can_exclude_a_model_that_failed_the_current_response(
+    tmp_path: Path,
+) -> None:
+    preferred_path = model_file(tmp_path / "preferred.gguf")
+    fallback_path = model_file(tmp_path / "fallback.gguf")
+    preferred_profile = profile_for(preferred_path)
+    fallback_profile = profile_for(fallback_path)
+    preferred_key = str(preferred_path.resolve())
+    fallback_key = str(fallback_path.resolve())
+    candidates = [
+        ModelRouteCandidate(
+            preferred_key,
+            qualification_card(
+                preferred_path,
+                preferred_profile,
+                conversation=100,
+                persona=100,
+            ),
+        ),
+        ModelRouteCandidate(
+            fallback_key,
+            qualification_card(
+                fallback_path,
+                fallback_profile,
+                conversation=80,
+                persona=80,
+            ),
+        ),
+    ]
+
+    decision = ModelRouter().choose(
+        "Write the requested scene.",
+        candidates,
+        current_model_path=preferred_key,
+        task_kind="conversation",
+        excluded_model_paths=(preferred_key,),
+    )
+
+    assert decision is not None
+    assert decision.selected_model_path == fallback_key
+    assert preferred_key not in decision.fallback_model_paths
+
+
+def test_phase_classifier_routes_mixed_task_by_remaining_runtime_evidence() -> None:
+    from v_core.autonomy import TaskContract
+
+    prompt = "Inspect the page, create a tool, and use it."
+    contract = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+        requires_created_tool=True,
+        requires_created_tool_execution=True,
+    )
+    calls: list[dict] = []
+
+    assert classify_model_phase(prompt, contract, calls) == "research"
+    calls.extend(
+        [
+            {
+                "tool": "browser_navigate",
+                "status": "succeeded",
+                "arguments": {"url": "https://evidence.invalid"},
+                "result_excerpt": "ok",
+            },
+            {
+                "tool": "browser_snapshot",
+                "status": "succeeded",
+                "arguments": {},
+                "result_excerpt": "page evidence",
+            },
+        ]
+    )
+
+    assert classify_model_phase(prompt, contract, calls) == "coding"
+    calls.append(
+        {
+            "tool": "learning_create_tool",
+            "status": "succeeded",
+            "arguments": {"source": "def run(arguments): return {}"},
+            "result_excerpt": '{"name":"fixture_tool"}',
+        }
+    )
+
+    assert classify_model_phase(prompt, contract, calls) == "tool_use"
+
+
+def test_router_hysteresis_avoids_hot_swap_for_tiny_score_gain(
+    tmp_path: Path,
+) -> None:
+    current_path = model_file(tmp_path / "current.gguf")
+    challenger_path = model_file(tmp_path / "challenger.gguf")
+    current_profile = profile_for(current_path)
+    challenger_profile = profile_for(challenger_path)
+    current_scores = {name: 90 for name in MODEL_CAPABILITIES}
+    challenger_scores = {name: 94 for name in MODEL_CAPABILITIES}
+    candidates = [
+        ModelRouteCandidate(
+            str(current_path.resolve()),
+            qualification_card(current_path, current_profile, **current_scores),
+        ),
+        ModelRouteCandidate(
+            str(challenger_path.resolve()),
+            qualification_card(
+                challenger_path,
+                challenger_profile,
+                **challenger_scores,
+            ),
+        ),
+    ]
+
+    decision = ModelRouter().choose(
+        "Create a Python parser.",
+        candidates,
+        current_model_path=str(current_path.resolve()),
+    )
+
+    assert decision is not None
+    assert decision.selected_model_path == str(current_path.resolve())
+    assert "hot-swap margin" in decision.reason
 
 
 def test_server_command_is_argument_array_with_enforced_local_boundary(
@@ -534,6 +712,68 @@ def test_choose_model_uses_last_model_as_default_and_can_select_external(
     assert selected is not None and selected.path == second_path.resolve()
     assert external is None
     assert any("last used" in line for line in output)
+
+
+def test_startup_menu_exposes_qualification_pool_and_external_actions(
+    tmp_path: Path,
+) -> None:
+    model = LocalModel(model_file(tmp_path / "model.gguf"), 16)
+    state = LoaderState()
+    output: list[str] = []
+
+    assert choose_startup_action(
+        state,
+        [model],
+        input_fn=lambda _: "2",
+        output=output.append,
+        allow_external=True,
+    ) == "qualify"
+    assert choose_startup_action(
+        state,
+        [model],
+        input_fn=lambda _: "3",
+        output=output.append,
+        allow_external=True,
+    ) == "pool"
+    assert choose_startup_action(
+        state,
+        [model],
+        input_fn=lambda _: "0",
+        output=output.append,
+        allow_external=True,
+    ) == "external"
+    assert any("Qualify or requalify" in line for line in output)
+
+
+def test_startup_menu_configures_pool_from_current_cards(tmp_path: Path) -> None:
+    paths = [model_file(tmp_path / f"model-{index}.gguf") for index in range(3)]
+    models = [LocalModel(path, path.stat().st_size) for path in paths]
+    profiles = {str(path.resolve()): profile_for(path) for path in paths}
+    state = LoaderState(
+        profiles=profiles,
+        qualifications={
+            key: qualification_card(Path(key), profile)
+            for key, profile in profiles.items()
+        },
+    )
+    store = ModelLoaderStore(tmp_path / "runtime")
+    store.save(state)
+
+    changed = configure_routing_pool_interactively(
+        state,
+        models,
+        store=store,
+        input_fn=lambda _: "1,3",
+        output=lambda _: None,
+    )
+
+    restored = store.load()
+    assert changed is True
+    assert restored.routing_enabled is True
+    assert restored.routing_model_paths == [
+        str(paths[0].resolve()),
+        str(paths[2].resolve()),
+    ]
 
 
 @pytest.mark.asyncio
@@ -649,7 +889,7 @@ async def test_interactive_bootstrap_runs_complete_saved_profile_flow(
             profiles={str(model.resolve()): profile},
         )
     )
-    answers = iter(("", "n"))
+    answers = iter(("", "", "n"))
 
     session = await bootstrap_interactive_model(
         runtime_root,
@@ -662,6 +902,63 @@ async def test_interactive_bootstrap_runs_complete_saved_profile_flow(
     try:
         assert session.profile == profile
         assert store.load().last_model_path == str(model.resolve())
+    finally:
+        await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_startup_menu_qualifies_model_then_returns_to_normal_start(
+    tmp_path: Path,
+) -> None:
+    model = model_file(tmp_path / "models" / "candidate.gguf")
+    binary = fake_llama_server(tmp_path / "llama-server")
+    profile = profile_for(model)
+    runtime_root = tmp_path / "runtime"
+    store = ModelLoaderStore(runtime_root)
+    store.save(
+        LoaderState(
+            model_directories=[str(model.parent)],
+            server_binary=str(binary),
+            profiles={str(model.resolve()): profile},
+        )
+    )
+    answers = iter(("2", "", "n", "y", "1", "", "n"))
+    output: list[str] = []
+
+    class FakeClient:
+        async def close(self) -> None:
+            return None
+
+    class FakeLLM:
+        def __init__(self) -> None:
+            self.client = FakeClient()
+
+    class FakeQualifier:
+        def __init__(self, _llm) -> None:
+            pass
+
+        async def qualify(self, selected_profile: ModelProfile):
+            return qualification_card(model, selected_profile, coding=100)
+
+    session = await bootstrap_interactive_model(
+        runtime_root,
+        mode="prompt",
+        input_fn=lambda _: next(answers),
+        output=output.append,
+        stdin_is_tty=True,
+        llm_factory=FakeLLM,
+        qualifier_factory=FakeQualifier,
+    )
+
+    assert session is not None
+    try:
+        restored = store.load()
+        key = str(model.resolve())
+        assert restored.qualifications[key].score("coding") == 100
+        assert restored.routing_model_paths == [key]
+        assert restored.routing_enabled is True
+        assert restored.last_model_path == key
+        assert any("Qualification complete" in line for line in output)
     finally:
         await session.stop()
 
@@ -829,6 +1126,74 @@ async def test_routed_runtime_recovers_previous_model_when_specialist_fails(
     assert result.switched is False
     assert any("deliberate specialist failure" in item for item in result.failures)
     await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_routed_runtime_retries_rejected_response_with_next_qualified_model(
+    tmp_path: Path,
+) -> None:
+    preferred_model = model_file(tmp_path / "models" / "preferred.gguf")
+    fallback_model = model_file(tmp_path / "models" / "fallback.gguf")
+    binary = fake_llama_server(tmp_path / "llama-server")
+    shared_port = free_port()
+    preferred_profile = profile_for(preferred_model, port=shared_port)
+    fallback_profile = profile_for(fallback_model, port=shared_port)
+    preferred_key = str(preferred_model.resolve())
+    fallback_key = str(fallback_model.resolve())
+    root = tmp_path / "runtime"
+    store = ModelLoaderStore(root)
+    store.save(
+        LoaderState(
+            model_directories=[str(preferred_model.parent)],
+            server_binary=str(binary),
+            last_model_path=preferred_key,
+            profiles={
+                preferred_key: preferred_profile,
+                fallback_key: fallback_profile,
+            },
+            routing_enabled=True,
+            routing_model_paths=[preferred_key, fallback_key],
+            qualifications={
+                preferred_key: qualification_card(
+                    preferred_model,
+                    preferred_profile,
+                    conversation=100,
+                    persona=100,
+                ),
+                fallback_key: qualification_card(
+                    fallback_model,
+                    fallback_profile,
+                    conversation=80,
+                    persona=80,
+                ),
+            },
+        )
+    )
+
+    class SharedLLM:
+        def __init__(self) -> None:
+            self.reconfigurations = 0
+
+        async def reconfigure(self) -> None:
+            self.reconfigurations += 1
+
+    current = await start_llama_server(binary, preferred_profile, root)
+    llm = SharedLLM()
+    runtime = RoutedModelRuntime(current, root, llm, status=lambda _: None)
+    try:
+        result = await runtime.retry_after_rejection(
+            "Write the requested scene.",
+            "conversation",
+        )
+
+        assert result.switched is True
+        assert result.previous_model_path == preferred_key
+        assert result.active_model_path == fallback_key
+        assert llm.reconfigurations == 1
+        journal = (root / "routing.jsonl").read_text(encoding="utf-8")
+        assert '"trigger": "response_rejection"' in journal
+    finally:
+        await runtime.stop()
 
 
 @pytest.mark.asyncio

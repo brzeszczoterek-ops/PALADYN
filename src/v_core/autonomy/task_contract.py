@@ -129,6 +129,10 @@ _FILE_TARGET = re.compile(
     r"xml|ya?ml)\b)",
     re.IGNORECASE,
 )
+_EXPLICIT_LOCAL_PATH = re.compile(
+    r"(?:^|[\s'\"`])(?:[a-z]:[\\/]|/|~/|\.\.?/)[^\s'\"`<>]+",
+    re.IGNORECASE,
+)
 _REPORT_RESULT = re.compile(
     r"\b(?:answer|describe|explain|extract|find|give|identify|list|report|summari[sz]e|tell|what|which|"
     r"co|jakie|które|ktore|opisz\w*|podaj\w*|powiedz\w*|stre[śs]c\w*|wyciagn\w*|wyciągn\w*|"
@@ -293,6 +297,26 @@ class TaskContract:
 
         return bool(_DISABLE_WEB.search(prompt))
 
+    @staticmethod
+    def has_explicit_local_file_target(prompt: str) -> bool:
+        """Return whether the message names a file-like object or local path.
+
+        Extensions and path syntax are structural across human languages. This
+        lets semantic routing support multilingual file requests without letting
+        a model turn an abstract word such as "plan" into an invented plan.txt.
+        """
+
+        without_urls = re.sub(
+            r"https?://[^\s<>]+",
+            "",
+            prompt,
+            flags=re.IGNORECASE,
+        )
+        return bool(
+            _FILE_TARGET.search(without_urls)
+            or _EXPLICIT_LOCAL_PATH.search(without_urls)
+        )
+
     def without_web(self) -> "TaskContract":
         """Remove network requirements while preserving all local task evidence."""
 
@@ -362,11 +386,10 @@ class TaskContract:
             or bool(_ONLINE_ACTION.search(prompt) and _ONLINE_RESOURCE.search(prompt))
         )
         file_prompt = re.sub(r"https?://[^\s<>]+", "", prompt, flags=re.IGNORECASE)
-        file_read = bool(
-            _READ_FILE.search(file_prompt) and _FILE_TARGET.search(file_prompt)
-        )
+        explicit_file_target = cls.has_explicit_local_file_target(file_prompt)
+        file_read = bool(_READ_FILE.search(file_prompt) and explicit_file_target)
         file_mutation = bool(
-            _MUTATE_FILE.search(file_prompt) and _FILE_TARGET.search(file_prompt)
+            _MUTATE_FILE.search(file_prompt) and explicit_file_target
         )
         command_execution = bool(
             not online and _RUN_COMMAND.search(prompt) and _COMMAND_TARGET.search(prompt)

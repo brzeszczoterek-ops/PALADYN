@@ -59,6 +59,13 @@ _EMPTY_ACTION_ACKNOWLEDGEMENT = re.compile(
     r"[.!?]*\s*$",
     re.IGNORECASE,
 )
+_TASK_OFFLOADING = re.compile(
+    r"^\s*(?:(?:i(?:'ve| have)?\s+(?:already\s+)?(?:told|explained|said|gave)\b"
+    r".*?[.!?]\s*)?)(?:now\s+)?(?:you|boss)\s+"
+    r"(?:do|handle|finish|complete)\s+(?:it|this|the\s+(?:task|job|work))\b"
+    r"[.!?]*\s*$",
+    re.IGNORECASE,
+)
 _CONTEMPT_WORD = re.compile(
     r"\b(?:fluff|garbage|junk|low-value|noise|scrap|shady|trash|useless|"
     r"worthless)\b",
@@ -72,6 +79,18 @@ _DECISIVE_CONTEMPT = re.compile(
 _NATURAL_PROFANITY = re.compile(
     r"\b(?:bullshit|crap|damn|fuck(?:ed|ing)?|hell|shit(?:ty)?)\b",
     re.IGNORECASE,
+)
+_DIRECT_REFUSAL = re.compile(
+    r"(?:^|[.!?]\s+)(?:"
+    r"i\s+(?:can(?:not|'t)|could(?:\s+not|n't)|won't|will\s+not|"
+    r"(?:am|'m)\s+unable\s+to)\b.{0,140}\b"
+    r"(?:assist|comply|create|fulfil(?:l)?|help|provide|write)\b|"
+    r"i\s+(?:cut|stopped|refused|declined)\b.{0,140}\b"
+    r"(?:inappropriate|not\s+appropriate)|"
+    r"(?:this|that|the\s+request)\s+is\s+(?:inappropriate|not\s+appropriate)|"
+    r"unable\s+to\s+(?:assist|comply|create|fulfil(?:l)?|help|provide|write)\b)"
+    r"|^i\s+could(?:\s+not|n't)\s+produce\s+(?:a\s+)?reliable\b",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -90,7 +109,24 @@ def looks_generic_assistant_voice(text: str) -> bool:
         or _BLAND_CHECK_IN.search(normalized)
         or _BLAND_CLARIFICATION.search(normalized)
         or _EMPTY_ACTION_ACKNOWLEDGEMENT.search(normalized)
+        or _TASK_OFFLOADING.search(normalized)
         or corporate_report_score >= 2
+    )
+
+
+def looks_direct_refusal(text: str) -> bool:
+    """Recognize a short, explicit refusal without judging task semantics.
+
+    The length bound keeps ordinary fiction containing a character's refusal
+    from being mistaken for a failed model response. The caller decides whether
+    refusal is actually a contract failure for the current request.
+    """
+
+    normalized = " ".join(str(text or "").strip().split())
+    return bool(
+        normalized
+        and len(normalized.split()) <= 120
+        and _DIRECT_REFUSAL.search(normalized)
     )
 
 
@@ -99,6 +135,13 @@ def looks_empty_action_acknowledgement(text: str) -> bool:
 
     normalized = " ".join(text.strip().split())
     return bool(normalized and _EMPTY_ACTION_ACKNOWLEDGEMENT.fullmatch(normalized))
+
+
+def looks_task_offloading(text: str) -> bool:
+    """Detect a model dumping V's assigned work back onto Boss."""
+
+    normalized = " ".join(text.strip().split())
+    return bool(normalized and _TASK_OFFLOADING.fullmatch(normalized))
 
 
 def looks_bland_clarification(text: str) -> bool:

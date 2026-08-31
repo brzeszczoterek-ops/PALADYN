@@ -12,7 +12,30 @@ dist/
 
 # Environment
 .env
+.env.*
+!.env.example
 .venv/
+
+# Local models and adapters
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+/model/
+/models/
+/model2/
+/modele*/
+/adapters/
+
+# Credentials and private keys
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
 
 # Memory data
 memory/
@@ -25,3 +48,13 @@ memory/
 
 # Logs
 *.log
+
+# Local voice, session, and database artifacts
+/recordings/
+/voice_recordings/
+/voice_cache/
+/sessions/
+*.pcm
+*.sqlite
+*.sqlite3
+*.db

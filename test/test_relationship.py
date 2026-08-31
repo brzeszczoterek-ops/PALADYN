@@ -9,7 +9,7 @@ import pytest
 from v_core.memory.memory_engine import MemoryEngine
 from v_core.memory.experience import Experience
 from v_core.memory.knowledge import Knowledge
-from v_core.memory.manager import recent_records_json
+from v_core.memory.manager import MemoryManager, recent_records_json
 from v_core.memory.models import (
     ExperienceEntry,
     KnowledgeEntry,
@@ -20,6 +20,7 @@ from v_core.memory.models import (
 )
 from v_core.memory.reflection import Reflection
 from v_core.memory.summary import Summary
+from v_core.memory.storage import MemoryStorage
 from v_core.persona.kernel import IdentityKernel
 from v_core.persona.runtime import PersonaRuntime
 from v_core.persona.voice import VoiceProfile
@@ -139,6 +140,21 @@ def test_relationship_storage_loads_legacy_and_saves_atomically(tmp_path: Path) 
     assert "state:" in saved
     assert not list(root.glob(".state-*.tmp"))
     assert stat.S_IMODE(storage.path.stat().st_mode) == 0o600
+
+
+def test_response_language_preference_is_runtime_owned_and_persistent(
+    tmp_path: Path,
+) -> None:
+    storage = RelationshipStorage(tmp_path / "relationship")
+    state = RelationshipState()
+
+    assert state.set_response_language("Chinese") is True
+    storage.save(state)
+
+    restored = storage.load()
+    assert restored.preferred_response_language == "Chinese"
+    assert restored.set_response_language("Chinese") is False
+    assert restored.set_response_language("") is True
 
 
 @pytest.mark.asyncio
@@ -282,6 +298,100 @@ async def test_non_reusable_reflection_stops_complete_memory_pipeline() -> None:
     assert result is None
     assert engine.manager.calls == 1
     assert engine.relationship_state.familiarity == 0.0
+
+
+@pytest.mark.asyncio
+async def test_model_generated_preference_waits_in_proposal_inbox(
+    tmp_path: Path,
+) -> None:
+    class ReflectionStub:
+        async def reflect(self, task: str, result: str) -> ReflectionEntry:
+            return ReflectionEntry(
+                summary="Boss wrote in Polish.",
+                lesson="Mirror the input language forever.",
+                importance="high",
+                remember=True,
+                kind=MemoryKind.PREFERENCE,
+                source=MemorySource.OBSERVED,
+            )
+
+    class ExperienceStub:
+        async def learn(self, reflection, previous, knowledge) -> ExperienceEntry:
+            return ExperienceEntry(
+                summary="Change the default response language automatically.",
+                lesson="Mirror every input language.",
+                confidence=0.98,
+                importance="high",
+                kind=MemoryKind.PREFERENCE,
+                source=MemorySource.DIRECTLY_TOLD,
+            )
+
+    class StorageStub:
+        def load(self) -> RelationshipState:
+            return RelationshipState()
+
+        def save(self, state) -> None:
+            raise AssertionError("pending proposal changed relationship state")
+
+    manager = MemoryManager(MemoryStorage(tmp_path / "memory"))
+    engine = MemoryEngine(
+        session=object(),
+        reflection=ReflectionStub(),
+        experience=ExperienceStub(),
+        summary=object(),
+        knowledge=object(),
+        manager=manager,
+        relationship_updater=object(),
+        relationship_storage=StorageStub(),
+    )
+
+    await engine.process("Cześć", "Hello, Boss.")
+
+    assert manager.count("experiences") == 0
+    assert manager.count("knowledge") == 0
+    proposals = manager.pending_proposals()
+    assert len(proposals) == 1
+    assert proposals[0]["status"] == "pending"
+    assert "Mirror every input language" in proposals[0]["suggestion"]
+
+
+def test_owner_can_approve_or_reject_model_proposals(tmp_path: Path) -> None:
+    manager = MemoryManager(MemoryStorage(tmp_path / "memory"))
+    first = ExperienceEntry(
+        summary="Use a broader query vocabulary.",
+        lesson="Include verified aliases and translations for the same subject.",
+        confidence=0.9,
+        importance="high",
+        kind=MemoryKind.LESSON,
+        source=MemorySource.SELF_GENERATED,
+    )
+    second = ExperienceEntry(
+        summary="Change the persona permanently.",
+        lesson="Replace V with a generic assistant.",
+        confidence=0.9,
+        importance="high",
+        kind=MemoryKind.PREFERENCE,
+        source=MemorySource.SELF_GENERATED,
+    )
+    manager.propose(first)
+    manager.propose(second)
+    pending = manager.pending_proposals()
+
+    approved = manager.decide_proposal(
+        pending[0]["proposal_id"],
+        approve=True,
+    )
+    rejected = manager.decide_proposal(
+        pending[1]["proposal_id"],
+        approve=False,
+    )
+
+    assert approved["status"] == "approved"
+    assert rejected["status"] == "rejected"
+    assert manager.pending_proposals() == []
+    knowledge = manager.load_all("knowledge")
+    assert len(knowledge) == 1
+    assert knowledge[0]["source"] == "directly_told"
 
 
 @pytest.mark.asyncio

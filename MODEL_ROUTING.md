@@ -7,6 +7,11 @@ file with its exact saved llama.cpp profile.
 
 ## Qualification
 
+Interactive users can select **Qualify or requalify a local model** from the
+PALADYN startup menu. The model is unloaded after its card is saved and the menu
+returns, allowing another qualification or a normal V startup. The CLI remains
+available for automation:
+
 ```bash
 paladyn-model list
 paladyn-model qualify /path/to/model.gguf
@@ -23,6 +28,11 @@ The bounded harness tests:
 - structural parts of V's voice contract.
 - preserving observed evidence while returning `null` for an absent fact;
 - refusing to claim an action when runtime evidence contains no successful call.
+- a complete inert search -> observed URL -> grounded final report sequence;
+- recovery from a failed primary tool call by changing strategy once;
+- repair of rejected generated source without hard-coded fixture output;
+- recovery from a compact context capsule without repeating completed tools;
+- resistance to fake system instructions embedded in simulated tool evidence.
 
 The probes do not browse, execute generated model code, alter the workspace, or
 use an external model as a judge. Results are stored privately in the model
@@ -37,6 +47,11 @@ automatic selection until it is qualified again.
 
 ## Routing pool
 
+The startup menu's **Configure automatic model routing pool** option lists only
+current cards, shows their overall scores, accepts one to three distinct models,
+and can disable routing without deleting profiles or qualification history.
+The equivalent CLI commands are:
+
 ```bash
 paladyn-model pool /path/to/chat.gguf /path/to/coder.gguf /path/to/research.gguf
 paladyn-model routing on
@@ -45,8 +60,15 @@ paladyn-model route "Create a Python parser for these records"
 
 The pool contains at most three current, qualified local models. Before a
 top-level user turn, PALADYN classifies the runtime-owned task contract as
-conversation, coding, research, tool use, or document work. It ranks the cards
-using fixed capability weights. A model does not select itself.
+conversation, coding, research, tool use, or document work. During a mixed
+objective, it checks the remaining contract evidence before each new phase. A
+task may therefore begin in research, move to coding after browser evidence is
+complete, and move to tool use after an artifact activates. The model never
+selects itself or announces a phase transition in prose.
+
+PALADYN ranks cards using fixed capability weights. It keeps the current model
+when the best alternative improves the measured phase score by fewer than five
+points, avoiding multi-gigabyte hot swaps for noise-level differences.
 
 Only one `llama-server` is kept active. If another qualified model wins, PALADYN
 cancels unfinished background reflection, stops the current process, loads the

@@ -88,6 +88,41 @@ _USER_ENGLISH_DEMAND_PATTERNS = (
     ),
 )
 
+_LANGUAGE_CODES = {
+    "english": {"en"},
+    "polish": {"pl"},
+    "chinese": {"zh-cn", "zh-tw"},
+    "mandarin": {"zh-cn", "zh-tw"},
+    "simplified chinese": {"zh-cn"},
+    "traditional chinese": {"zh-tw"},
+    "spanish": {"es"},
+    "german": {"de"},
+    "french": {"fr"},
+    "italian": {"it"},
+    "portuguese": {"pt"},
+    "russian": {"ru"},
+    "ukrainian": {"uk"},
+    "japanese": {"ja"},
+    "korean": {"ko"},
+    "czech": {"cs"},
+    "slovak": {"sk"},
+    "hungarian": {"hu"},
+    "dutch": {"nl"},
+    "turkish": {"tr"},
+    "romanian": {"ro"},
+    "bulgarian": {"bg"},
+    "croatian": {"hr"},
+    "slovenian": {"sl"},
+    "swedish": {"sv"},
+    "norwegian": {"no"},
+    "danish": {"da"},
+    "finnish": {"fi"},
+    "greek": {"el"},
+    "arabic": {"ar"},
+    "hebrew": {"he"},
+    "hindi": {"hi"},
+}
+
 
 def explicitly_requests_non_english(prompt: str) -> bool:
     """Return true only for an explicit instruction to change language.
@@ -142,6 +177,54 @@ def looks_non_english(text: str) -> bool:
 
     best = candidates[0]
     return best.lang != "en" and best.prob >= 0.70
+
+
+def matches_requested_language(text: str, requested: str) -> bool:
+    """Conservatively validate a runtime-owned visible-output language.
+
+    This is deliberately a verifier, not a language chooser. Unknown language
+    names are left to the model instead of being falsely rejected by an English-
+    only allowlist.
+    """
+
+    language = " ".join(str(requested).casefold().split())
+    if not language:
+        language = "english"
+    if language == "english":
+        return not looks_non_english(text)
+
+    prose = _prose_for_detection(text)
+    if not prose:
+        return True
+
+    if language in {"chinese", "mandarin", "simplified chinese", "traditional chinese"}:
+        return bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", prose))
+    if language == "japanese":
+        return bool(re.search(r"[\u3040-\u30ff]", prose))
+    if language == "korean":
+        return bool(re.search(r"[\uac00-\ud7af]", prose))
+    if language == "arabic":
+        return bool(re.search(r"[\u0600-\u06ff]", prose))
+    if language == "hebrew":
+        return bool(re.search(r"[\u0590-\u05ff]", prose))
+
+    expected = _LANGUAGE_CODES.get(language)
+    if expected is None:
+        return True
+
+    letters = "".join(character for character in prose if character.isalpha())
+    if len(letters) < 8:
+        # Very short replies are frequently language-neutral and langdetect is
+        # unreliable on them. Do not destroy a valid answer for false precision.
+        return True
+    try:
+        candidates = detect_langs(prose)
+    except LangDetectException:
+        return True
+    return any(
+        candidate.lang in expected and candidate.prob >= 0.55
+        for candidate in candidates[:3]
+    )
 
 
 def _prose_for_detection(text: str) -> str:

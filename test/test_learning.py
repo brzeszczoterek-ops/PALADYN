@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from importlib.util import find_spec
 import json
+import os
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
@@ -69,6 +71,10 @@ OUTPUT_SCHEMA = {
     "required": ["result"],
     "additionalProperties": False,
 }
+FULL_EDITION_AVAILABLE = (
+    os.getenv("PALADYN_EDITION", "auto").casefold() != "public"
+    and find_spec("v_full") is not None
+)
 DOUBLE_SOURCE = """
 def run(arguments):
     return {"result": arguments["value"] * 2}
@@ -475,6 +481,10 @@ async def test_mcp_user_correction_preserves_raw_user_message(tmp_path: Path) ->
     assert result["verified"] is False
 
 
+@pytest.mark.skipif(
+    not FULL_EDITION_AVAILABLE,
+    reason="private PALADYN-Full extension is not installed",
+)
 def test_learning_profiles_keep_persistent_promotion_owner_only(tmp_path: Path) -> None:
     def configured(profile: str, suffix: str) -> MCPTools:
         return MCPTools(
@@ -485,6 +495,7 @@ def test_learning_profiles_keep_persistent_promotion_owner_only(tmp_path: Path) 
                 learning_root=tmp_path / f"learning-{suffix}",
                 learning_profile=profile,
                 evm_profile="client",
+                edition=("full" if profile == "owner_lab" else "public"),
             )
         )
 
@@ -501,6 +512,10 @@ def test_learning_profiles_keep_persistent_promotion_owner_only(tmp_path: Path) 
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.skipif(
+    not FULL_EDITION_AVAILABLE,
+    reason="private PALADYN-Full extension is not installed",
+)
 @pytest.mark.asyncio
 async def test_owner_profile_allows_privileged_code_inside_sandbox(
     tmp_path: Path,
@@ -514,6 +529,7 @@ async def test_owner_profile_allows_privileged_code_inside_sandbox(
                 learning_root=tmp_path / f"learning-{suffix}",
                 learning_profile=profile,
                 evm_profile="client",
+                edition=("full" if profile == "owner_lab" else "public"),
             )
         )
 
@@ -571,6 +587,10 @@ def run(arguments):
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.skipif(
+    not FULL_EDITION_AVAILABLE,
+    reason="private PALADYN-Full extension is not installed",
+)
 @pytest.mark.asyncio
 async def test_blueprint_normalizes_invalid_optional_version(tmp_path: Path) -> None:
     tools = MCPTools(
@@ -581,6 +601,7 @@ async def test_blueprint_normalizes_invalid_optional_version(tmp_path: Path) -> 
             learning_root=tmp_path / "learning",
             learning_profile="owner_lab",
             evm_profile="client",
+            edition="full",
         )
     )
     blueprint = {

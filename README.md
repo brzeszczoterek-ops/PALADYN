@@ -57,6 +57,11 @@ The current owner runtime can:
 Creating or configuring a new personal persona after first working with V
 remains planned for a later version.
 
+The private repository is the canonical development tree. `src/v_core` is the
+public personal-agent foundation, while `src/v_full` contains owner/developer
+extensions that are physically absent from public exports. See
+[EDITIONS.md](EDITIONS.md) for the capability boundary and export contract.
+
 The three-model limit is intentional. It is enough to give the agent genuinely
 different strengths without turning a personal system into an unnecessarily
 complex model farm. Only locally qualified models are eligible for automatic
@@ -82,8 +87,19 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env
 # PALADYN can now discover and start a local GGUF model itself:
-v-core
+paladyn-ui
 ```
+
+`paladyn-ui` keeps model selection in the terminal and then opens the local
+command center at `http://127.0.0.1:8765/`. It streams V's visible answer,
+shows the active model and loaded tools, supports F2 push-to-talk and optional
+local speech output, and closes the managed model when the UI server exits. It
+downloads no fonts, scripts, or other interface assets. Every state-changing UI
+request requires a random per-launch session token, and the server is hard-bound
+to loopback.
+
+Use `v-core` when the terminal-only interface is preferred. Set
+`PALADYN_UI_PORT` or pass `paladyn-ui --port PORT` to choose another local port.
 
 On the first interactive launch PALADYN asks for a directory containing GGUF
 models. It scans that directory recursively, presents the local models, lets
@@ -92,6 +108,18 @@ the user configure a llama.cpp profile, starts `llama-server`, verifies
 profiles, last selection, private logs, and selected binary are kept under
 `model_runtime`.
 
+Every interactive start now begins with a compact startup menu:
+
+1. start V normally;
+2. qualify or requalify any detected local model;
+3. configure the automatic one-to-three-model routing pool;
+4. use the external server from `.env` when that startup mode allows it.
+
+Qualification loads only the selected GGUF, runs the bounded local harness,
+saves its capability card, releases the model, and returns to the startup menu.
+The operator may immediately add the card to a free routing-pool slot; replacing
+a member of a full pool is handled by menu option 3. No CLI command is required.
+
 Set `LLAMA_CPP_SERVER` when `llama-server` is not on `PATH`. Set
 `PALADYN_MODEL_LOADER=off` to keep using the external endpoint from
 `V_CORE_BASE_URL` and `V_CORE_MODEL`; `prompt` provides that external server as
@@ -99,12 +127,16 @@ menu option `0`, while `required` refuses to start without a local model. The
 loader binds only to `127.0.0.1`, uses llama.cpp's offline/API-only modes, and
 stops the process when PALADYN exits.
 
-Use `paladyn-model qualify MODEL` to create a capability card for the exact GGUF
+The same operations remain available for scripting. Use
+`paladyn-model qualify MODEL` to create a capability card for the exact GGUF
 and saved profile. `paladyn-model pool MODEL...` enables deterministic routing
 across at most three qualified local models. PALADYN unloads the current model
 before loading another, keeps a verified fallback order, and never lets an LLM
-award itself a capability score. See [MODEL_ROUTING.md](MODEL_ROUTING.md) for the
-probe contract, commands, invalidation rules, and limitations.
+award itself a capability score. Mixed tasks can switch at executor-owned phase
+boundaries—for example research, then generated-source coding, then tool use—
+without asking the model which model it wants. See
+[MODEL_ROUTING.md](MODEL_ROUTING.md) for the probe contract, commands,
+invalidation rules, and limitations.
 
 Profiles currently expose context size, GPU layers, CPU threads, batch and
 micro-batch size, parallel slots, Flash Attention, K/V cache quantization,
@@ -172,28 +204,6 @@ default source and sink are used unless `PALADYN_AUDIO_INPUT_TARGET` or
 configurable threshold, start timeout, end silence, and maximum recording time.
 Push-to-talk capture is also bounded by the configured maximum recording time.
 
-## Owner performance monitor
-
-`PALADYN_OWNER_MONITOR=1` opens a separate local terminal after a managed
-llama.cpp model becomes ready. The monitor shows the selected model, reasoning
-and KV-cache modes, slot/context use, cumulative tokens, exact prompt and
-generation throughput for the latest completed response, request state, and
-Jetson `tegrastats` data. It exits when the managed model process stops.
-
-Every launch creates one private append-only JSONL journal under
-`PALADYN_MODEL_RUNTIME_ROOT/monitor_sessions/`. Its name combines the model-log
-timestamp and server PID, so samples from separate PALADYN sessions never mix.
-The active window reads only the current server and current llama.cpp log; older
-journals remain an archive and are never loaded into a new monitor. The journal
-records session metadata, context/KV/request state, throughput, cumulative tokens,
-last-response timing, and hardware telemetry every five seconds by default. Set
-`PALADYN_OWNER_MONITOR_RECORD_INTERVAL` between 1 and 300 seconds to change it.
-
-This is an owner/developer diagnostic and defaults to disabled. The managed
-server exposes `/metrics` and `/slots` only on its enforced `127.0.0.1`
-listener; the monitor neither publishes telemetry nor contacts an external
-service. Set `PALADYN_OWNER_TERMINAL` to override `gnome-terminal`, or run
-`paladyn-monitor` manually with explicit target arguments.
 
 Short chat, explicit tool-result, and research responses use guarded token
 streaming. Short conversational messages additionally use a compact prompt.
@@ -328,7 +338,7 @@ namespace used by Bubblewrap:
 sudo install -o root -g root -m 0644 \
   packaging/apparmor/paladyn /etc/apparmor.d/paladyn
 sudo apparmor_parser -r /etc/apparmor.d/paladyn
-aa-exec -p paladyn -- v-core
+aa-exec -p paladyn -- paladyn-ui
 ```
 
 The profile leaves PALADYN otherwise unconfined, as it already is during a
@@ -400,52 +410,14 @@ explicitly re-arm PALADYN with `paladyn-control reset-panic`.
 ## Isolated EVM lab
 
 PALADYN includes local, deterministic EVM tools and an external Bubblewrap
-sandbox. The current owner build exposes:
+sandbox. The public core exposes:
 
 - exact ERC-20 ABI/interface checks;
 - Chainlink-style oracle round, freshness, bounds, and L2 sequencer checks;
 - conservative Solidity security-wrapper linting;
-- Uniswap v4 hook-address permission decoding;
-- Uniswap v2/v3 flash-swap repayment and fee calculations;
 - offline command execution with a private PID/network namespace, no host home,
   a task-only writable workspace, and process/resource/output/time limits.
 
-Set `PALADYN_EVM_PROFILE=client` to hide advanced Uniswap and flash-simulation
-tools. `owner_lab` enables them through an owner-approved capability set. Neither
-profile grants live signing or transaction broadcasting. Those are deliberately
-separate capabilities and remain disabled.
-
-Real-chain work is a separate owner-operations boundary. Public observation and
-RPC simulation are distinct from signing and broadcasting. A state-changing
-operation must pass both an `owner:` runtime capability and a maximum 15-minute
-grant restricted by chain ID, target contracts, function selectors, value, and
-fresh owner confirmation. Grants never contain private keys; the future signer
-will run out of process.
-
-Create a short read-only grant and use the separate live process as follows:
-
-```bash
-paladyn-control grant-live \
-  --chain-id 1 \
-  --actions observe,simulate \
-  --duration 600
-
-# Use the grant ID printed above:
-paladyn-live pending-block \
-  --endpoint https://YOUR_RPC_ENDPOINT \
-  --chain-id 1 \
-  --grant-id GRANT_ID
-```
-
-`paladyn-live` also provides `transaction`, `txpool`, and `simulate`. It has no
-sign or broadcast command. The client checks the remote chain ID and only
-accepts an explicit allowlist of read-only JSON-RPC methods.
-
-The repository contains `evm_lab`, a dependency-free Foundry harness for the
-ERC-20/oracle/Uniswap arithmetic boundary. On this development machine Foundry
-v1.7.1 and solc v0.8.35 ARM64 are installed under `~/.foundry/bin`. PALADYN binds
-those two verified binaries read-only into Bubblewrap, recompiles offline, and
-runs unit, fuzz, and invariant tests without exposing the host home or network.
 
 Bubblewrap and `prlimit` must be installed for `sandbox_execute_offline`. The
 sandbox accepts an argument array, never a shell command string. Networking is

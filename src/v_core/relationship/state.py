@@ -72,6 +72,10 @@ class RelationshipState:
         default_factory=list
     )
 
+    # Empty means PALADYN's configured default (currently English). This is
+    # runtime-owned state: the relationship model never writes it.
+    preferred_response_language: str = ""
+
     def __post_init__(self) -> None:
         self.created_at = _text(self.created_at, limit=80) or _now()
         self.updated_at = _text(self.updated_at, limit=80) or self.created_at
@@ -89,6 +93,10 @@ class RelationshipState:
             self.preferred_forms_of_address,
             limit=self.MAX_FORMS_OF_ADDRESS,
             item_limit=80,
+        )
+        self.preferred_response_language = _text(
+            self.preferred_response_language,
+            limit=48,
         )
 
     def touch(self) -> None:
@@ -142,3 +150,11 @@ class RelationshipState:
             return True
 
         return False
+
+    def set_response_language(self, language: str) -> bool:
+        language = _text(language, limit=48)
+        if language.casefold() == self.preferred_response_language.casefold():
+            return False
+        self.preferred_response_language = language
+        self.touch()
+        return True

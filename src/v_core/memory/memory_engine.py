@@ -8,6 +8,7 @@ from .experience import Experience
 from .summary import Summary
 from .knowledge import Knowledge
 from .manager import MemoryManager
+from .models import MemoryKind, MemorySource
 
 from ..relationship import (
     RelationshipStorage,
@@ -41,6 +42,14 @@ class MemoryEngine:
         self.relationship_state = (
             relationship_storage.load()
         )
+
+    def set_preferred_response_language(self, language: str) -> bool:
+        """Persist an explicit runtime-classified preference from Boss."""
+
+        if not self.relationship_state.set_response_language(language):
+            return False
+        self.relationship_storage.save(self.relationship_state)
+        return True
 
     async def process(
         self,
@@ -104,6 +113,24 @@ class MemoryEngine:
                 previous_experience,
                 current_knowledge,
             )
+
+            # The memory LLM may propose behavioural lessons and preferences,
+            # but it never gets to turn its own interpretation into active policy.
+            # Verified lessons backed by runtime evidence may remain automatic;
+            # inferred behaviour and every generated preference wait for Boss.
+            if (
+                experience.source in {
+                    MemorySource.SELF_GENERATED,
+                    MemorySource.INFERRED,
+                }
+                or experience.kind is MemoryKind.PREFERENCE
+                or (
+                    experience.kind is MemoryKind.LESSON
+                    and experience.source is not MemorySource.VERIFIED
+                )
+            ):
+                self.manager.propose(experience)
+                return experience
 
             stored_experience = self.manager.remember(
                 "experiences",

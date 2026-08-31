@@ -6,6 +6,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .edition import Edition, resolve_edition
+
 
 @dataclass(slots=True)
 class Config:
@@ -31,12 +33,16 @@ class Config:
 
     browser_server: list[str]
 
+    edition: Edition
+
 
 def load_config() -> Config:
 
     load_dotenv()
 
     project_root = Path.cwd()
+
+    edition = resolve_edition(os.getenv("PALADYN_EDITION", "auto"))
 
     workspace_value = os.getenv("V_CORE_MCP_FILESYSTEM", "agent_workspace")
     workspace = Path(workspace_value).expanduser()
@@ -80,16 +86,25 @@ def load_config() -> Config:
         voice_root = project_root / voice_root
     voice_root.mkdir(parents=True, exist_ok=True)
 
-    evm_profile = os.getenv("PALADYN_EVM_PROFILE", "owner_lab").strip().lower()
+    evm_profile = os.getenv(
+        "PALADYN_EVM_PROFILE", edition.default_evm_profile
+    ).strip().lower()
     if evm_profile not in {"client", "owner_lab"}:
         raise ValueError("PALADYN_EVM_PROFILE must be 'client' or 'owner_lab'")
 
     learning_profile = os.getenv(
-        "PALADYN_LEARNING_PROFILE", "owner_lab"
+        "PALADYN_LEARNING_PROFILE", edition.default_learning_profile
     ).strip().lower()
     if learning_profile not in {"client", "owner_lab"}:
         raise ValueError(
             "PALADYN_LEARNING_PROFILE must be 'client' or 'owner_lab'"
+        )
+    if not edition.is_full and (
+        evm_profile == "owner_lab" or learning_profile == "owner_lab"
+    ):
+        raise ValueError(
+            "owner_lab profiles require PALADYN-Full; public PALADYN supports "
+            "the client profiles only"
         )
 
     model_loader_mode = os.getenv(
@@ -130,4 +145,5 @@ def load_config() -> Config:
             "@playwright/mcp",
             "--browser=firefox",
         ],
+        edition=edition,
     )

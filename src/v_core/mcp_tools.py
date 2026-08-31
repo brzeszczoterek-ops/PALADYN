@@ -11,12 +11,15 @@ from uuid import uuid4
 
 from .autonomy import AuthorizationEnvelope, AuthorizationGuard, review_task
 from .config import Config
+from .edition import (
+    PUBLIC_EDITION,
+    Edition,
+    load_edition_extension,
+    resolve_edition,
+)
 from .evm import (
     EVMAccessProfile,
-    EVMCapability,
     EVMToolkit,
-    FoundrySandboxRunner,
-    FoundryUnavailable,
     OraclePolicy,
     OracleRound,
     SequencerStatus,
@@ -58,6 +61,15 @@ class MCPTools:
         config: Config,
     ):
         self.learning_profile = getattr(config, "learning_profile", "client")
+        configured_edition = getattr(config, "edition", PUBLIC_EDITION)
+        self.edition = (
+            resolve_edition(configured_edition)
+            if isinstance(configured_edition, str)
+            else configured_edition
+        )
+        if not isinstance(self.edition, Edition):
+            raise TypeError("config.edition must be an Edition or edition name")
+        self.edition_extension = load_edition_extension(self.edition)
         #
         # MCP clients
         #
@@ -98,20 +110,12 @@ class MCPTools:
         envelope = AuthorizationEnvelope(
             workspace=str(config.workspace),
         )
-        profile = (
-            EVMAccessProfile.owner_lab()
-            if config.evm_profile == "owner_lab"
-            else EVMAccessProfile.client()
+        EVMAccessProfile.client().apply(envelope)
+        self.edition_extension.configure_authorization(
+            envelope,
+            evm_profile=getattr(config, "evm_profile", "client"),
+            learning_profile=self.learning_profile,
         )
-        profile.apply(envelope)
-        if self.learning_profile == "owner_lab":
-            persistent_learning = {
-                "owner:create_persistent_artifacts",
-                "owner:activate_persistent_artifacts",
-                "owner:privileged_generated_code",
-            }
-            envelope.capabilities.update(persistent_learning)
-            envelope.owner_approved_capabilities.update(persistent_learning)
         self.authorization = AuthorizationGuard(
             Path.cwd(),
             envelope,
@@ -124,12 +128,7 @@ class MCPTools:
                 backend,
             )
             self.sandbox_error = ""
-            try:
-                self.foundry = FoundrySandboxRunner(backend)
-                self.foundry_error = ""
-            except FoundryUnavailable as exc:
-                self.foundry = None
-                self.foundry_error = str(exc)
+            self.edition_extension.bind_runtime(self.authorization, backend)
             learning_root = Path(
                 getattr(config, "learning_root", config.workspace / ".paladyn_learning")
             )
@@ -142,8 +141,7 @@ class MCPTools:
         except SandboxUnavailable as exc:
             self.sandbox = None
             self.sandbox_error = str(exc)
-            self.foundry = None
-            self.foundry_error = str(exc)
+            self.edition_extension.bind_runtime(self.authorization, None)
             self.learning = None
             self.learning_error = str(exc)
 
@@ -954,10 +952,8 @@ class MCPTools:
             "learning_stage_skill": "Stage a generated skill in quarantine.",
             "learning_list_artifacts": "List generated artifact lifecycle records.",
             "evm_validate_oracle": "Validate oracle round data against a local policy.",
-            "evm_decode_uniswap_v4_hook": "Decode Uniswap v4 hook address flags.",
-            "evm_quote_flash_swap": "Calculate a local flash-swap repayment quote.",
-            "evm_foundry_test_offline": "Run Foundry tests inside the offline sandbox.",
         }
+        schemas.update(self.edition_extension.tool_definitions())
         if self.learning is not None:
             for definition in self.learning.active_tool_definitions():
                 schemas[str(definition["name"])] = (
@@ -1085,16 +1081,7 @@ class MCPTools:
             "learning_list_artifacts",
             "runtime_review_task",
         ]
-        if self.authorization.envelope.allows(
-            EVMCapability.UNISWAP_HOOKS_SIMULATE.value
-        ):
-            names.extend(
-                [
-                    "evm_decode_uniswap_v4_hook",
-                    "evm_quote_flash_swap",
-                    "evm_foundry_test_offline",
-                ]
-            )
+        names.extend(self.edition_extension.tool_names())
         if self.learning is not None:
             names.extend(self.learning.active_tool_names())
         return list(dict.fromkeys(names))
@@ -1191,6 +1178,10 @@ class MCPTools:
                 item = structured.get(name, default)
                 return str(item) if item is not None else default
             return arguments or default
+
+        edition_extension = getattr(self, "edition_extension", None)
+        if edition_extension is not None and edition_extension.handles_tool(tool):
+            return await edition_extension.call_tool(tool, structured)
 
         #
         # Filesystem aliases + native MCP names
@@ -1524,60 +1515,6 @@ class MCPTools:
                         ]
                     }
                 )
-
-            case "evm_decode_uniswap_v4_hook":
-                if structured is None:
-                    return "evm_decode_uniswap_v4_hook requires an address."
-                return self._json(asdict(self.evm.decode_hook(value("address"))))
-
-            case "evm_quote_flash_swap":
-                if structured is None:
-                    return "evm_quote_flash_swap requires structured arguments."
-                protocol = value("protocol").lower()
-                if protocol == "v2_same_token":
-                    amount = self.evm.quote_v2_same_token_flash(
-                        int(structured["amount_out"])
-                    )
-                    return self._json({"minimum_repayment": amount})
-                if protocol == "v2_cross_token":
-                    amount = self.evm.quote_v2_cross_token_flash(
-                        int(structured["amount_out"]),
-                        int(structured["reserve_in"]),
-                        int(structured["reserve_out"]),
-                    )
-                    return self._json({"minimum_repayment": amount})
-                if protocol == "v3":
-                    fee = self.evm.quote_v3_flash_fee(
-                        int(structured["amount"]),
-                        int(structured["fee_pips"]),
-                    )
-                    return self._json(
-                        {
-                            "fee": fee,
-                            "total_owed": int(structured["amount"]) + fee,
-                        }
-                    )
-                return "Unknown protocol. Use v2_same_token, v2_cross_token, or v3."
-
-            case "evm_foundry_test_offline":
-                self.authorization.require(
-                    EVMCapability.ARBITRARY_HARNESS.value
-                )
-                if structured is None:
-                    return "evm_foundry_test_offline requires structured arguments."
-                if self.foundry is None:
-                    return f"Foundry unavailable: {self.foundry_error}"
-                project = self.authorization.resolve_task_path(
-                    value("project", "evm_lab"),
-                    write=True,
-                )
-                result = await self.foundry.test(
-                    project,
-                    fuzz_runs=int(structured.get("fuzz_runs", 256)),
-                    invariant_runs=int(structured.get("invariant_runs", 64)),
-                    timeout_seconds=float(structured.get("timeout_seconds", 300)),
-                )
-                return self._json(asdict(result))
 
             case "sandbox_execute_offline":
                 if structured is None or not isinstance(structured.get("command"), list):

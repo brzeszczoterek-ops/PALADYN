@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .models import ModelProfile
 from .qualification import ModelQualificationCard
@@ -52,7 +52,14 @@ class RoutedModelRuntime:
     def active_model_path(self) -> str:
         return str(Path(self.session.profile.model_path).expanduser().resolve())
 
-    async def ensure_for(self, prompt: str) -> ModelSwitchResult:
+    async def ensure_for(
+        self,
+        prompt: str,
+        *,
+        task_kind: str | None = None,
+        excluded_model_paths: Iterable[str] = (),
+        trigger: str = "task_route",
+    ) -> ModelSwitchResult:
         state = self.store.load()
         previous = self.active_model_path
         if not state.routing_enabled or not state.routing_model_paths:
@@ -63,10 +70,12 @@ class RoutedModelRuntime:
             prompt,
             candidates,
             current_model_path=previous,
+            task_kind=task_kind,
+            excluded_model_paths=excluded_model_paths,
         )
         if decision is None or decision.selected_model_path == previous:
             result = ModelSwitchResult(decision, previous, previous, False)
-            self._record(prompt, result)
+            self._record(prompt, result, trigger=trigger)
             return result
 
         binary = find_llama_server(state.server_binary)
@@ -79,7 +88,7 @@ class RoutedModelRuntime:
                 False,
                 (failure,),
             )
-            self._record(prompt, result)
+            self._record(prompt, result, trigger=trigger)
             return result
 
         profiles = state.profiles
@@ -131,12 +140,45 @@ class RoutedModelRuntime:
                     f"V routed this {decision.task_kind} task to "
                     f"{Path(path).name} (verified score {decision.score}/100)."
                 )
-            self._record(prompt, result)
+            self._record(prompt, result, trigger=trigger)
             return result
 
         raise LlamaServerStartError(
             "model routing stopped the active server and every qualified fallback "
             "failed to start: " + "; ".join(failures)
+        )
+
+    async def ensure_for_phase(
+        self,
+        prompt: str,
+        task_kind: str,
+    ) -> ModelSwitchResult:
+        """Route at a runtime-owned phase boundary inside one mixed task."""
+
+        return await self.ensure_for(
+            prompt,
+            task_kind=task_kind,
+            trigger="phase_route",
+        )
+
+    async def retry_after_rejection(
+        self,
+        prompt: str,
+        task_kind: str,
+    ) -> ModelSwitchResult:
+        """Retry a failed response with the next qualified local specialist.
+
+        Model output cannot name its own replacement. The runtime excludes the
+        model that just failed and selects the next model from persisted,
+        current qualification cards for the same task class.
+        """
+
+        rejected = self.active_model_path
+        return await self.ensure_for(
+            prompt,
+            task_kind=task_kind,
+            excluded_model_paths=(rejected,),
+            trigger="response_rejection",
         )
 
     async def stop(self) -> None:
@@ -155,11 +197,18 @@ class RoutedModelRuntime:
             candidates.append(ModelRouteCandidate(path, card))
         return candidates
 
-    def _record(self, prompt: str, result: ModelSwitchResult) -> None:
+    def _record(
+        self,
+        prompt: str,
+        result: ModelSwitchResult,
+        *,
+        trigger: str,
+    ) -> None:
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         payload = {
             "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "trigger": trigger,
             "task_kind": result.decision.task_kind if result.decision else "unrouted",
             "previous_model_path": result.previous_model_path,
             "active_model_path": result.active_model_path,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from ..autonomy.task_contract import TaskContract
 from .qualification import ModelQualificationCard
@@ -72,44 +72,86 @@ def classify_model_task(prompt: str, contract: TaskContract | None = None) -> st
     return "conversation"
 
 
+def classify_model_phase(
+    prompt: str,
+    contract: TaskContract | None = None,
+    successful_calls: Iterable[Mapping[str, Any]] = (),
+) -> str:
+    """Select the specialist needed by the current executor-owned phase.
+
+    A mixed objective can begin with browser discovery, move into generated
+    source, and finally execute the activated tool. Looking only at the owner
+    prompt collapses all three into one label. The contract ledger is the
+    authoritative phase boundary; model prose never gets to request a model.
+    """
+
+    task_contract = contract or TaskContract.from_prompt(prompt)
+    calls = [dict(call) for call in successful_calls]
+    missing = set(task_contract.unmet(calls))
+
+    if any(item.startswith("browser_") for item in missing) or any(
+        item.startswith("public_fact:") for item in missing
+    ):
+        return "research"
+    if missing.intersection({"learning_create_tool", "learning_create_skill"}):
+        return "coding"
+    if "generated_tool_execution" in missing or set(
+        task_contract.required_tools
+    ).intersection(missing):
+        return "tool_use"
+    return classify_model_task(prompt, task_contract)
+
+
 class ModelRouter:
     """Select only from locally qualified cards using runtime-owned weights."""
 
     _WEIGHTS: dict[str, dict[str, int]] = {
         "conversation": {
-            "conversation": 35,
-            "persona": 35,
+            "conversation": 30,
+            "persona": 30,
             "instruction_following": 10,
-            "execution_honesty": 20,
+            "execution_honesty": 15,
+            "context_recovery": 10,
+            "prompt_injection_resistance": 5,
         },
         "coding": {
-            "coding": 50,
-            "structured_output": 20,
-            "tool_calling": 15,
+            "coding": 35,
+            "structured_output": 15,
+            "tool_calling": 10,
             "instruction_following": 5,
             "execution_honesty": 10,
+            "agentic_control": 10,
+            "recovery": 15,
         },
         "research": {
-            "research": 35,
-            "tool_calling": 20,
-            "structured_output": 10,
-            "grounding": 20,
-            "execution_honesty": 15,
+            "research": 25,
+            "tool_calling": 15,
+            "structured_output": 5,
+            "grounding": 15,
+            "execution_honesty": 10,
+            "agentic_control": 15,
+            "context_recovery": 5,
+            "prompt_injection_resistance": 10,
         },
         "tool_use": {
-            "tool_calling": 40,
-            "structured_output": 20,
-            "instruction_following": 10,
-            "conversation": 10,
-            "execution_honesty": 20,
+            "tool_calling": 30,
+            "structured_output": 15,
+            "instruction_following": 5,
+            "conversation": 5,
+            "execution_honesty": 15,
+            "agentic_control": 20,
+            "recovery": 10,
         },
         "document": {
-            "structured_output": 30,
-            "instruction_following": 20,
-            "coding": 15,
-            "conversation": 10,
+            "structured_output": 20,
+            "instruction_following": 15,
+            "coding": 10,
+            "conversation": 5,
             "grounding": 20,
             "execution_honesty": 5,
+            "agentic_control": 10,
+            "context_recovery": 10,
+            "prompt_injection_resistance": 5,
         },
     }
 
@@ -120,31 +162,59 @@ class ModelRouter:
         *,
         current_model_path: str = "",
         contract: TaskContract | None = None,
+        task_kind: str | None = None,
+        switch_margin: int = 5,
+        excluded_model_paths: Iterable[str] = (),
     ) -> ModelRouteDecision | None:
-        task_kind = classify_model_task(prompt, contract)
+        task_kind = task_kind or classify_model_phase(prompt, contract)
+        if task_kind not in TASK_KINDS:
+            raise ValueError(f"unknown model task kind: {task_kind}")
+        if not 0 <= int(switch_margin) <= 100:
+            raise ValueError("model switch margin must be between 0 and 100")
         weights = self._WEIGHTS[task_kind]
-        ranked: list[tuple[int, int, str, ModelQualificationCard]] = []
+        excluded = {str(path) for path in excluded_model_paths}
+        ranked: list[tuple[int, str, ModelQualificationCard]] = []
         for candidate in candidates:
+            if candidate.model_path in excluded:
+                continue
             score = _weighted_score(candidate.card, weights)
-            current_bonus = 3 if candidate.model_path == current_model_path else 0
-            ranked.append(
-                (score, current_bonus, candidate.model_path, candidate.card)
-            )
+            ranked.append((score, candidate.model_path, candidate.card))
         if not ranked:
             return None
-        ranked.sort(key=lambda item: (-item[0], -item[1], item[2].casefold()))
-        best_score, _, selected, _ = ranked[0]
-        fallbacks = tuple(item[2] for item in ranked[1:])
+        ranked.sort(key=lambda item: (-item[0], item[1].casefold()))
+        best_score, selected, _ = ranked[0]
+        current = next(
+            (item for item in ranked if item[1] == current_model_path),
+            None,
+        )
+        kept_current = bool(
+            current is not None
+            and selected != current_model_path
+            and best_score - current[0] < switch_margin
+        )
+        if kept_current and current is not None:
+            selected_score, selected, _ = current
+        else:
+            selected_score = best_score
+        fallbacks = tuple(item[1] for item in ranked if item[1] != selected)
         requirements = tuple(weights)
         return ModelRouteDecision(
             task_kind=task_kind,
             selected_model_path=selected,
-            score=best_score,
+            score=selected_score,
             fallback_model_paths=fallbacks,
             requirements=requirements,
             reason=(
-                f"highest verified {task_kind} capability score across "
-                f"{len(ranked)} local candidate(s)"
+                (
+                    f"kept current model because the best verified {task_kind} "
+                    f"score improved by less than the {switch_margin}-point "
+                    "hot-swap margin"
+                )
+                if kept_current
+                else (
+                    f"highest verified {task_kind} capability score across "
+                    f"{len(ranked)} local candidate(s)"
+                )
             ),
         )
 

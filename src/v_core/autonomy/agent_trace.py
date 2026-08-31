@@ -528,12 +528,67 @@ class AgentTaskTrace:
         # predate task contracts or for actions the deterministic parser did
         # not yet classify.
         for context in parsed:
-            if any(bool(value) for value in context["requirements"].values()):
+            if AgentTaskTrace.context_has_action_route(
+                {**context, "tool_calls": []}
+            ):
                 return context
         for context in parsed:
-            if context["tool_calls"]:
+            if AgentTaskTrace.context_has_action_route(
+                {**context, "requirements": {}}
+            ):
                 return context
         return None
+
+    @staticmethod
+    def context_has_action_route(context: dict[str, Any] | None) -> bool:
+        """Return whether a checkpoint is safe to resume as executable work.
+
+        Reporting flags alone are not an execution route. A runtime-review-only
+        checkpoint is accepted only when its own objective explicitly describes
+        diagnostics; this keeps a bad semantic classification from becoming the
+        parent of every later ``continue`` turn.
+        """
+
+        if not isinstance(context, dict):
+            return False
+        requirements = context.get("requirements", {})
+        if not isinstance(requirements, dict):
+            requirements = {}
+        concrete_flags = (
+            "requires_browser_navigation",
+            "requires_browser_snapshot",
+            "requires_web_discovery",
+            "requires_distinct_detail_page",
+            "requires_file_read",
+            "requires_file_mutation",
+            "requires_command_execution",
+            "requires_created_tool",
+            "requires_created_tool_execution",
+            "requires_created_skill",
+            "allows_artifact_fallback",
+        )
+        if any(bool(requirements.get(name)) for name in concrete_flags):
+            return True
+        if requirements.get("required_tools"):
+            return True
+        if requirements.get("requires_runtime_review"):
+            # Import locally to keep the persistence module lightweight and to
+            # avoid making checkpoint loading depend on intent-router startup.
+            from .task_contract import TaskContract
+
+            objective = str(context.get("objective", ""))
+            if TaskContract.from_prompt(objective).requires_runtime_review:
+                return True
+
+        calls = context.get("tool_calls", [])
+        if not isinstance(calls, list):
+            return False
+        return any(
+            isinstance(call, dict)
+            and str(call.get("tool", ""))
+            and str(call.get("tool", "")) != "runtime_review_task"
+            for call in calls
+        )
 
     def _save(self, *, result: dict[str, Any] | None = None) -> None:
         path = self._checkpoint_root / f"{self.task_id}.json"

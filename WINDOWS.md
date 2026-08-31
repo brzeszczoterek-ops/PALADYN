@@ -171,7 +171,7 @@ wydajność. Skopiowanie dużego GGUF oczywiście zajmie dodatkowe miejsce na dy
 ```bash
 cd ~/PALADYN
 source .venv/bin/activate
-v-core
+paladyn-ui
 ```
 
 Przy pierwszym uruchomieniu PALADYN zapyta o katalog modeli. Podaj:
@@ -180,7 +180,10 @@ Przy pierwszym uruchomieniu PALADYN zapyta o katalog modeli. Podaj:
 /home/twoja_nazwa/models
 ```
 
-Następnie wybierz model i profil. Na pierwszy test warto użyć ostrożnych
+Najpierw w terminalu wybierz model i profil. Po jego uruchomieniu PALADYN otworzy
+lokalny interfejs w domyślnej przeglądarce pod adresem
+`http://127.0.0.1:8765/`. Interfejs nie jest wystawiany do sieci lokalnej ani do
+Internetu. Na pierwszy test warto użyć ostrożnych
 ustawień:
 
 - `Context size`: `8192`;
@@ -204,6 +207,13 @@ teście.
 Po starcie zadaj proste pytanie, a potem sprawdź narzędzie, na przykład prosząc
 V o odczytanie nagłówka `README.md`. Sam tekst modelu mówiący, że wykonał
 narzędzie, nie jest dowodem wykonania — sprawdź widoczny wynik i dziennik sesji.
+Klawisz `F2` rozpoczyna i kończy nagrywanie push-to-talk, jeżeli lokalna warstwa
+mowy została skonfigurowana. Przełącznik `V SPEAKS` steruje odczytywaniem
+odpowiedzi. Przytrzymanie `HOLD TO KILL` zatrzymuje interfejs, V oraz model zarządzany
+przez PALADYNA.
+
+Jeżeli potrzebny jest wyłącznie stary interfejs terminalowy, uruchom zamiast tego
+`v-core`.
 
 ## 7. Skrót uruchamiający z Windowsa
 
@@ -212,7 +222,7 @@ pulpit Windows. Zakłada on, że repozytorium znajduje się w `~/PALADYN` w
 domyślnej dystrybucji WSL.
 
 Po dwukrotnym kliknięciu plik otworzy sesję WSL, aktywuje `.venv` i uruchomi
-`v-core`. Jeżeli repozytorium znajduje się gdzie indziej, zmień ścieżkę
+`paladyn-ui`. Jeżeli repozytorium znajduje się gdzie indziej, zmień ścieżkę
 `~/PALADYN` wewnątrz pliku.
 
 ## 8. Sprawdzenie instalacji
@@ -298,7 +308,8 @@ pamięć cache, ale nie zmniejsza samych wag zapisanych w GGUF.
 
 ### `local model loader requires an interactive terminal`
 
-Uruchom `v-core` bezpośrednio w Windows Terminalu/Ubuntu albo przez
+Uruchom `paladyn-ui` (lub terminalowe `v-core`) bezpośrednio w Windows
+Terminalu/Ubuntu albo przez
 `PALADYN-WSL.cmd`. Nie przekierowuj standardowego wejścia podczas wyboru modelu.
 
 ### Test Bubblewrap nie przechodzi

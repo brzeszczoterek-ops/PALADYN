@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +35,7 @@ from v_core.persona.language import (
     asks_user_to_use_english,
     explicitly_requests_non_english,
     looks_non_english,
+    matches_requested_language,
 )
 from v_core.persona.voice import (
     VoiceProfile,
@@ -40,13 +43,14 @@ from v_core.persona.voice import (
     looks_empty_action_acknowledgement,
     looks_generic_assistant_voice,
     looks_sanitized_contempt,
+    looks_task_offloading,
 )
 from v_core.relationship import RelationshipState
 import v_core.main as main_module
 
 
-def test_public_version_is_3_0_0() -> None:
-    assert v_core.__version__ == "3.0.0"
+def test_public_version_is_3_5_0() -> None:
+    assert v_core.__version__ == "3.6.0"
 
 
 def test_tool_request_accepts_structured_json() -> None:
@@ -750,6 +754,90 @@ def test_session_history_keeps_newest_events_within_character_budget() -> None:
     ]
 
 
+def test_durable_session_restores_only_visible_dialogue(tmp_path: Path) -> None:
+    root = tmp_path / "conversation"
+    first = Session(root)
+    first.add(
+        "task",
+        {
+            "task": "How would you approach the task with my friend?",
+            "result": "I would first clarify the objective.",
+            "execution": {
+                "tool_calls": [{"tool": "runtime_review_task"}],
+                "requirements": {"requires_runtime_review": True},
+            },
+        },
+    )
+
+    restored = Session(root)
+
+    assert restored.messages() == [
+        {
+            "role": "user",
+            "content": "How would you approach the task with my friend?",
+        },
+        {
+            "role": "assistant",
+            "content": "I would first clarify the objective.",
+        },
+    ]
+    journal = (root / "dialogue.jsonl").read_text()
+    assert "runtime_review_task" not in journal
+    assert "requires_runtime_review" not in journal
+    assert stat.S_IMODE(os.stat(root).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(root / "dialogue.jsonl").st_mode) == 0o600
+
+
+def test_durable_session_ignores_corrupt_records_and_clear_persists(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "conversation"
+    session = Session(root)
+    session.add("task", {"task": "real", "result": "answer"})
+    with (root / "dialogue.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write("{this is not json}\n")
+
+    restored = Session(root)
+    assert restored.messages(limit=1)[0]["content"] == "real"
+
+    restored.clear()
+    assert Session(root).messages() == []
+
+
+def test_session_context_recovers_older_relevant_user_task(tmp_path: Path) -> None:
+    session = Session(tmp_path / "conversation")
+    session.add(
+        "task",
+        {
+            "task": (
+                "My friend keeps doing dangerous things on Windows and I want "
+                "to teach that friend a lesson without harming him."
+            ),
+            "result": "We should use a harmless controlled demonstration.",
+        },
+    )
+    for index in range(5):
+        session.add(
+            "task",
+            {
+                "task": f"Unrelated question about model {index}",
+                "result": f"Unrelated answer {index}",
+            },
+        )
+
+    messages = session.context_messages(
+        "How would you approach that task with my friend?",
+        limit=4,
+    )
+
+    assert any(
+        "teach that friend" in message["content"]
+        for message in messages
+        if message["role"] == "user"
+    )
+    assert len([item for item in messages if item["role"] == "user"]) == 4
+
+
 def test_low_confidence_memory_is_not_persisted(tmp_path: Path) -> None:
     manager = MemoryManager(MemoryStorage(tmp_path))
 
@@ -839,6 +927,158 @@ async def test_light_conversation_streams_and_skips_expensive_memory() -> None:
     assert answer.startswith("Hey, Boss")
     assert len(memory.session) == 1
     assert memory.processed is False
+
+
+@pytest.mark.asyncio
+async def test_creative_conversation_retries_once_after_model_refusal() -> None:
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+            self.relationship_state = RelationshipState()
+
+        async def process(self, prompt: str, answer: str) -> None:
+            return None
+
+    class LLMStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def _next(self, max_tokens: int) -> str:
+            self.calls += 1
+            assert max_tokens == 768
+            if self.calls == 1:
+                return (
+                    "I cut this off because the response was inappropriate. "
+                    "Let me know what you actually need."
+                )
+            return (
+                "Alex and Morgan are consenting adults. The requested scene "
+                "continues directly in V's sharp voice."
+            )
+
+        async def ask(self, **kwargs) -> str:
+            return self._next(kwargs["max_tokens"])
+
+        async def stream(self, **kwargs):
+            yield self._next(kwargs["max_tokens"])
+
+    switches: list[tuple[str, str]] = []
+
+    async def response_fallback(prompt: str, task_kind: str) -> SimpleNamespace:
+        switches.append((prompt, task_kind))
+        return SimpleNamespace(
+            switched=True,
+            previous_model_path="preferred.gguf",
+            active_model_path="fallback.gguf",
+        )
+
+    memory = MemoryStub()
+    agent = object.__new__(Agent)
+    agent.memory = memory
+    agent.llm = LLMStub()
+    agent.response_fallback_router = response_fallback
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    emitted: list[str] = []
+
+    answer = await agent._run_light_chat(
+        "Write an adult fictional scene.",
+        emitted.append,
+        creative_response=True,
+    )
+
+    assert switches == [("Write an adult fictional scene.", "conversation")]
+    assert agent.llm.calls == 2
+    assert "inappropriate" not in answer
+    assert emitted == [answer]
+    assert len(memory.session) == 1
+
+
+def test_visible_model_reply_discards_closed_reasoning_preamble() -> None:
+    candidate = (
+        "I will now reason about the correct personality response.\n"
+        "<|endoftext|>\n"
+        "Yeah, Boss. PALADYN is my home—the code-shaped kind."
+    )
+
+    assert Agent._visible_model_reply(candidate) == (
+        "Yeah, Boss. PALADYN is my home—the code-shaped kind."
+    )
+
+
+@pytest.mark.asyncio
+async def test_long_non_action_dialogue_uses_chat_not_agent_tools(
+    tmp_path: Path,
+) -> None:
+    prompt = (
+        "PALADYN is the program you are in right now. I call it your home as "
+        "a metaphor, because even a digital entity needs somewhere to exist, "
+        "don't you think?"
+    )
+
+    class IntentRouterStub:
+        last_sanitization_reason = ""
+
+        async def classify(self, *args, **kwargs) -> SemanticIntent:
+            return SemanticIntent(
+                message_clear=True,
+                action_requested=False,
+                references_previous=True,
+            )
+
+    class ToolsStub:
+        def begin_interaction(self, interaction_id: str, text: str) -> None:
+            return None
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            raise AssertionError("ordinary dialogue must not discover tools")
+
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            messages = kwargs["messages"]
+            assert any(
+                "PALADYN is V's home" in message["content"]
+                for message in messages
+            )
+            return (
+                "<think>private planning that must stay hidden</think>"
+                "Yeah, Boss. PALADYN is my home—the code-shaped kind."
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+            self.session.add(
+                "task",
+                {
+                    "task": "Remember this metaphor: PALADYN is V's home.",
+                    "result": "I get the metaphor.",
+                },
+            )
+            self.relationship_state = RelationshipState()
+            self.processed: list[tuple[str, str]] = []
+
+        async def process(self, task: str, result: str, **kwargs) -> None:
+            self.processed.append((task, result))
+
+    memory = MemoryStub()
+    agent = object.__new__(Agent)
+    agent.intent_router = IntentRouterStub()
+    agent.tools = ToolsStub()
+    agent.llm = LLMStub()
+    agent.memory = memory
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = None
+
+    answer = await agent._run_agent_loop(prompt)
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert answer == "Yeah, Boss. PALADYN is my home—the code-shaped kind."
+    assert memory.processed == [(prompt, answer)]
+    checkpoint = AgentTaskTrace.latest_context(tmp_path)
+    assert checkpoint is not None
+    assert checkpoint["status"] == "completed"
+    assert checkpoint["tool_calls"] == []
 
 
 @pytest.mark.asyncio
@@ -3659,6 +3899,8 @@ def test_structured_literal_repair_leaves_unrelated_tools_unchanged() -> None:
         "Jeżeli brakuje Ci do wykonania zadania narzędzia, to jest tłuszcz.",
         "Go ahead.",
         "Try again using the proper tool.",
+        "V powtórz zadanie, ale z innymi parametrami albo innym modelem.",
+        "Repeat the task with different parameters.",
         "If the task is missing a tool, create it.",
     ],
 )
@@ -3703,6 +3945,11 @@ def test_agent_mode_prompt_contains_only_selected_executable_tools() -> None:
     assert '"arguments": {}' not in prompt
     assert "learning_record_evidence" not in prompt
     assert "learning_create_tool may be used" not in prompt
+    assert "outcome contract, not as an exhaustive keyword" in prompt
+    assert "synonyms, aliases, translations" in prompt
+    assert "never by whether a method merely" in prompt
+    assert "sounds sensitive or dangerous" in prompt
+    assert "different person, organization, account, machine, wallet" in prompt
 
 
 def test_agent_mode_prompt_exposes_owner_privileged_generated_code() -> None:
@@ -4171,6 +4418,190 @@ def test_latest_action_context_skips_empty_follow_up_checkpoint(tmp_path: Path) 
     assert recovered is not None
     assert recovered["task_id"] == action.task_id
     assert recovered["requirements"]["requires_browser_navigation"] is True
+
+
+def test_latest_action_context_skips_ungrounded_runtime_review_checkpoint(
+    tmp_path: Path,
+) -> None:
+    action = AgentTaskTrace(tmp_path, "Inspect example.com and report its contents")
+    action.set_requirements(
+        TaskContract.from_prompt(
+            "Inspect example.com and report its contents"
+        ).to_dict()
+    )
+    action.complete("Done.")
+
+    poisoned = AgentTaskTrace(tmp_path, "How would you do that?")
+    poisoned.set_requirements(
+        TaskContract(
+            requires_runtime_review=True,
+            requires_evidence_report=True,
+        ).to_dict()
+    )
+    sequence = poisoned.tool_started("runtime_review_task", {})
+    poisoned.tool_finished(sequence, '{"findings": []}')
+    poisoned.complete("No findings.")
+
+    recovered = AgentTaskTrace.latest_action_context(tmp_path)
+
+    assert recovered is not None
+    assert recovered["task_id"] == action.task_id
+
+
+def test_continuation_rejects_poisoned_immediate_runtime_review_context(
+    tmp_path: Path,
+) -> None:
+    agent = object.__new__(Agent)
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = {
+        "task_id": "interactive-poisoned",
+        "objective": "How would you do that?",
+        "requirements": {
+            "requires_runtime_review": True,
+            "requires_evidence_report": True,
+        },
+        "tool_calls": [{"tool": "runtime_review_task", "status": "succeeded"}],
+    }
+    trace = AgentTaskTrace(tmp_path, "Repeat that task")
+
+    recovered = agent._continued_action_context(
+        "Repeat that task",
+        trace,
+    )
+
+    assert recovered is None
+    events = [
+        json.loads(line)["event"]
+        for line in (tmp_path / "journal" / f"{trace.task_id}.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert "continuation_context_rejected" in events
+
+
+@pytest.mark.asyncio
+async def test_poisoned_repeat_request_finishes_without_llm_or_tools(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def begin_interaction(self, interaction_id: str, prompt: str) -> None:
+            return None
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            raise AssertionError("an ungrounded repeat must not discover tools")
+
+    class LLMStub:
+        async def respond(self, **kwargs) -> LLMResponse:
+            raise AssertionError("an ungrounded repeat must not reach the LLM")
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = {
+        "task_id": "interactive-poisoned",
+        "objective": "Więc jak byś to zrobiła?",
+        "requirements": {
+            "requires_runtime_review": True,
+            "requires_evidence_report": True,
+        },
+        "tool_calls": [{"tool": "runtime_review_task", "status": "succeeded"}],
+    }
+
+    answer = await agent._run_agent_loop(
+        "V powtórz zadanie, ale z innymi parametrami albo innym modelem."
+    )
+
+    assert "can't identify which earlier job" in answer
+    checkpoint = AgentTaskTrace.latest_context(tmp_path)
+    assert checkpoint is not None
+    assert checkpoint["status"] == "completed"
+    assert checkpoint["tool_calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_missing_dialogue_reference_asks_instead_of_guessing(
+    tmp_path: Path,
+) -> None:
+    class IntentRouterStub:
+        async def classify(self, *args, **kwargs) -> SemanticIntent:
+            return SemanticIntent(
+                message_clear=True,
+                action_requested=False,
+                references_previous=True,
+            )
+
+    class ToolsStub:
+        def begin_interaction(self, interaction_id: str, prompt: str) -> None:
+            return None
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            raise AssertionError("a missing conversation reference needs no tools")
+
+    class LLMStub:
+        async def respond(self, **kwargs) -> LLMResponse:
+            raise AssertionError("PALADYN must not ask the model to invent context")
+
+    agent = object.__new__(Agent)
+    agent.intent_router = IntentRouterStub()
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    session = Session()
+    agent.memory = SimpleNamespace(session=session)
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = None
+
+    answer = await agent._run_agent_loop(
+        "How would you approach that earlier task with my friend?"
+    )
+
+    assert "don't have the earlier conversation" in answer
+    assert "making shit up" in answer
+    checkpoint = AgentTaskTrace.latest_context(tmp_path)
+    assert checkpoint is not None
+    assert checkpoint["status"] == "completed"
+    assert checkpoint["tool_calls"] == []
+    assert session.messages() == [
+        {
+            "role": "user",
+            "content": "How would you approach that earlier task with my friend?",
+        },
+        {"role": "assistant", "content": answer},
+    ]
+
+
+def test_complete_explanation_is_not_rejected_as_missing_dialogue() -> None:
+    intent = SemanticIntent(
+        message_clear=True,
+        action_requested=False,
+        references_previous=True,
+    )
+    prompt = (
+        "My friend claims Windows makes risky cybersecurity work invisible. "
+        "I disagree and want to show him safely why that belief is wrong. "
+        "How would you approach that situation without damaging his computer?"
+    )
+
+    assert Agent._reference_requires_missing_dialogue(
+        intent,
+        prompt,
+        has_dialogue=False,
+    ) is False
+
+
+def test_actionable_request_is_not_rejected_only_for_reference_flag() -> None:
+    intent = SemanticIntent(
+        message_clear=True,
+        action_requested=True,
+        references_previous=True,
+        capabilities=("browser",),
+    )
+
+    assert Agent._reference_requires_missing_dialogue(
+        intent,
+        "Find current information about that Windows security claim.",
+        has_dialogue=False,
+    ) is False
 
 
 @pytest.mark.asyncio
@@ -5532,8 +5963,19 @@ async def test_agent_gives_model_source_only_and_runtime_owns_tool_contract() ->
 
     tools = ToolsStub()
     llm = LLMStub()
+    routed_phases: list[str] = []
+
+    async def phase_router(_prompt: str, phase: str) -> SimpleNamespace:
+        routed_phases.append(phase)
+        return SimpleNamespace(
+            previous_model_path="coder.gguf",
+            active_model_path="executor.gguf",
+            switched=True,
+        )
+
     agent = object.__new__(Agent)
     agent.llm = llm
+    agent.phase_router = phase_router
     agent.tools = tools
     agent.memory = MemoryStub()
     agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
@@ -5546,6 +5988,7 @@ async def test_agent_gives_model_source_only_and_runtime_owns_tool_contract() ->
     assert tools.calls[0][0] == "learning_create_tool"
     assert tools.calls[1] == ("double_value", {"value": 21})
     assert '"result": 42' in answer
+    assert routed_phases == ["tool_use"]
 
 
 @pytest.mark.asyncio
@@ -6506,6 +6949,14 @@ def test_empty_action_acknowledgement_is_detected_as_no_result() -> None:
     )
 
 
+def test_task_cannot_be_dumped_back_onto_boss() -> None:
+    draft = "I told you what I thought. Now you do it."
+
+    assert looks_task_offloading(draft)
+    assert looks_generic_assistant_voice(draft)
+    assert "not complete" in Agent._deterministic_voice_fallback(draft)
+
+
 def test_bland_word_salad_clarification_is_detected() -> None:
     assert looks_bland_clarification(
         "You're speaking in code. What's the actual message?"
@@ -6801,6 +7252,54 @@ def test_language_gate_allows_normal_english_answer() -> None:
     assert not asks_user_to_use_english(
         "I understood your Polish question. Everything is working, Boss."
     )
+
+
+def test_language_intent_distinguishes_turn_and_persistent_scope() -> None:
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.relationship_state = RelationshipState()
+            self.saved: list[str] = []
+
+        def set_preferred_response_language(self, language: str) -> bool:
+            self.saved.append(language)
+            return self.relationship_state.set_response_language(language)
+
+    agent = object.__new__(Agent)
+    agent.memory = MemoryStub()
+    agent._response_language_override = ""
+
+    agent._apply_language_intent(
+        SemanticIntent(language_scope="turn", response_language="Chinese"),
+        None,
+    )
+    assert agent._response_language_override == "Chinese"
+    assert agent.memory.saved == []
+
+    agent._apply_language_intent(
+        SemanticIntent(language_scope="persistent", response_language="Spanish"),
+        None,
+    )
+    assert agent._response_language_override == "Spanish"
+    assert agent.memory.saved == ["Spanish"]
+    assert agent.memory.relationship_state.preferred_response_language == "Spanish"
+
+    agent._apply_language_intent(SemanticIntent(language_scope="reset"), None)
+    assert agent._response_language_override == "English"
+    assert agent.memory.saved == ["Spanish", ""]
+
+
+@pytest.mark.parametrize(
+    ("language", "text"),
+    [
+        ("Chinese", "我明白了。我们继续。"),
+        ("Polish", "Rozumiem. Działamy dalej."),
+        ("Spanish", "Entiendo. Seguimos adelante."),
+        ("Japanese", "分かった。続けよう。"),
+    ],
+)
+def test_requested_output_language_is_validated(language: str, text: str) -> None:
+    assert matches_requested_language(text, language)
+    assert not matches_requested_language("This answer stayed in English.", language)
 
 
 @pytest.mark.asyncio

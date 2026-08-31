@@ -4,8 +4,11 @@ from .interactive import (
     ModelLoaderInteractionError,
     bootstrap_interactive_model,
     choose_model,
+    choose_startup_action,
+    configure_routing_pool_interactively,
     default_profile,
     edit_profile,
+    qualify_model_interactively,
     render_profile,
 )
 from .models import LoaderState, LocalModel, ModelProfile
@@ -21,6 +24,7 @@ from .router import (
     ModelRouteCandidate,
     ModelRouteDecision,
     ModelRouter,
+    classify_model_phase,
     classify_model_task,
 )
 from .routed_runtime import ModelSwitchResult, RoutedModelRuntime
@@ -57,7 +61,10 @@ __all__ = [
     "build_server_command",
     "bootstrap_interactive_model",
     "choose_model",
+    "choose_startup_action",
+    "classify_model_phase",
     "classify_model_task",
+    "configure_routing_pool_interactively",
     "default_profile",
     "edit_profile",
     "find_llama_server",
@@ -65,6 +72,7 @@ __all__ = [
     "infer_chat_template",
     "model_file_fingerprint",
     "model_profile_fingerprint",
+    "qualify_model_interactively",
     "render_profile",
     "resolve_chat_template",
     "start_llama_server",

@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
+from datetime import UTC, datetime
 from enum import Enum
 import json
 import math
+from pathlib import Path
 from typing import Any, Iterable
 from uuid import uuid4
 
 from .models import (
     ExperienceEntry,
     KnowledgeEntry,
+    MemoryKind,
+    MemorySource,
+    ProposalEntry,
     ReflectionEntry,
     SummaryEntry,
 )
@@ -168,7 +173,92 @@ class MemoryManager:
                 self.storage.load(file)
             )
 
-        return items
+        return sorted(
+            items,
+            key=lambda item: str(
+                item.get("timestamp", "") if isinstance(item, dict) else ""
+            ),
+        )
+
+    def propose(self, experience: ExperienceEntry) -> Path | None:
+        """Quarantine a useful model-derived suggestion pending approval."""
+
+        if experience.importance not in {"medium", "high"}:
+            return None
+        if not self._reliable(experience.confidence, 0.65):
+            return None
+        suggestion = " ".join(
+            part.strip()
+            for part in (experience.summary, experience.lesson)
+            if part and part.strip()
+        )[:2_000]
+        if not suggestion:
+            return None
+        normalized = " ".join(suggestion.casefold().split())
+        for existing in self.load_all("proposals"):
+            if not isinstance(existing, dict) or existing.get("status") != "pending":
+                continue
+            old = " ".join(str(existing.get("suggestion", "")).casefold().split())
+            if old == normalized:
+                return None
+        proposal = ProposalEntry(
+            title=(experience.summary or experience.lesson)[:160],
+            suggestion=suggestion,
+            reason="Model-generated lesson awaiting owner validation.",
+            confidence=float(experience.confidence),
+            kind=experience.kind,
+            source=experience.source,
+        )
+        return self.remember("proposals", proposal)
+
+    def pending_proposals(self, *, limit: int = 12) -> list[dict[str, Any]]:
+        pending = [
+            item
+            for item in self.load_all("proposals")
+            if isinstance(item, dict) and item.get("status") == "pending"
+        ]
+        return pending[-max(0, limit):]
+
+    def decide_proposal(self, proposal_id: str, *, approve: bool) -> dict[str, Any]:
+        proposal_id = str(proposal_id).strip()
+        if not proposal_id or not all(
+            character in "0123456789abcdef" for character in proposal_id.casefold()
+        ):
+            raise ValueError("invalid proposal id")
+        matches: list[Path] = []
+        for path in self.storage.list("proposals"):
+            payload = self.storage.load(path)
+            if (
+                isinstance(payload, dict)
+                and str(payload.get("proposal_id", "")) == proposal_id
+            ):
+                matches.append(path)
+        if len(matches) != 1:
+            raise ValueError("proposal not found")
+        path = matches[0]
+        payload = self.storage.load(path)
+        if payload.get("status") != "pending":
+            raise ValueError("proposal is no longer pending")
+        payload["status"] = "approved" if approve else "rejected"
+        payload["decided_at"] = datetime.now(UTC).isoformat()
+        self.storage.save("proposals", path.name, payload)
+        if approve:
+            try:
+                kind = MemoryKind(str(payload.get("kind", "lesson")))
+            except ValueError:
+                kind = MemoryKind.LESSON
+            self.remember(
+                "knowledge",
+                KnowledgeEntry(
+                    title=str(payload.get("title", "Approved proposal"))[:160],
+                    content=str(payload.get("suggestion", ""))[:2_000],
+                    reason="Explicitly approved by Boss from the proposal inbox.",
+                    confidence=1.0,
+                    kind=kind,
+                    source=MemorySource.DIRECTLY_TOLD,
+                ),
+            )
+        return payload
 
     def latest(
         self,

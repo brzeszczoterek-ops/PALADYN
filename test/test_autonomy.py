@@ -1477,6 +1477,33 @@ def test_semantic_intent_accepts_only_closed_capability_vocabulary() -> None:
     assert contract.requires_evidence_report is True
 
 
+def test_semantic_continuation_cannot_copy_runtime_review_capability() -> None:
+    intent = SemanticIntent.parse(
+        json.dumps(
+            {
+                "message_clear": True,
+                "message_odd": False,
+                "action_requested": True,
+                "continue_previous": True,
+                "capabilities": ["runtime_review"],
+                "requires_report": True,
+                "distinct_detail_page": False,
+                "artifact_fallback": False,
+                "required_public_fields": [],
+                "public_subject": "",
+                "web_query": "",
+                "language_scope": "none",
+                "response_language": "",
+            }
+        )
+    )
+
+    assert intent is not None
+    assert intent.continue_previous is True
+    assert intent.capabilities == ()
+    assert intent.to_contract().requires_runtime_review is False
+
+
 def test_semantic_intent_preserves_unclear_message_signal() -> None:
     intent = SemanticIntent.parse(
         json.dumps(
@@ -1523,6 +1550,91 @@ def test_semantic_intent_preserves_odd_banter_signal() -> None:
     assert intent.message_odd is True
 
 
+def test_semantic_intent_marks_creative_chat_without_inventing_file_work() -> None:
+    intent = SemanticIntent.parse(
+        json.dumps(
+            {
+                "message_clear": True,
+                "message_odd": False,
+                "action_requested": False,
+                "continue_previous": False,
+                "references_previous": False,
+                "creative_response": True,
+                "capabilities": [],
+                "requires_report": False,
+                "distinct_detail_page": False,
+                "artifact_fallback": False,
+                "required_public_fields": [],
+                "public_subject": "",
+                "web_query": "",
+                "language_scope": "none",
+                "response_language": "",
+            }
+        )
+    )
+
+    assert intent is not None
+    assert intent.creative_response is True
+    assert intent.action_requested is False
+    assert intent.capabilities == ()
+    contract = intent.to_contract("Write a fictional scene in chat")
+    assert contract.requires_file_mutation is False
+
+
+def test_semantic_intent_marks_discussion_that_depends_on_prior_dialogue() -> None:
+    intent = SemanticIntent.parse(
+        json.dumps(
+            {
+                "message_clear": True,
+                "message_odd": False,
+                "action_requested": False,
+                "continue_previous": False,
+                "references_previous": True,
+                "capabilities": [],
+                "requires_report": False,
+                "distinct_detail_page": False,
+                "artifact_fallback": False,
+                "required_public_fields": [],
+                "public_subject": "",
+                "web_query": "",
+                "language_scope": "none",
+                "response_language": "",
+            }
+        )
+    )
+
+    assert intent is not None
+    assert intent.references_previous is True
+    assert intent.continue_previous is False
+
+
+def test_semantic_intent_preserves_explicit_turn_language_without_tool_action() -> None:
+    intent = SemanticIntent.parse(
+        json.dumps(
+            {
+                "message_clear": True,
+                "message_odd": False,
+                "action_requested": False,
+                "continue_previous": False,
+                "capabilities": [],
+                "requires_report": False,
+                "distinct_detail_page": False,
+                "artifact_fallback": False,
+                "required_public_fields": [],
+                "public_subject": "",
+                "web_query": "",
+                "language_scope": "turn",
+                "response_language": "Chinese",
+            }
+        )
+    )
+
+    assert intent is not None
+    assert intent.action_requested is False
+    assert intent.language_scope == "turn"
+    assert intent.response_language == "Chinese"
+
+
 @pytest.mark.asyncio
 async def test_multilingual_intent_router_classifies_hungarian_action() -> None:
     class LLMStub:
@@ -1557,6 +1669,188 @@ async def test_multilingual_intent_router_classifies_hungarian_action() -> None:
     assert llm.kwargs["temperature"] == 0.0
     assert llm.kwargs["max_tokens"] == 128
     assert llm.kwargs["response_format"]["type"] == "json_schema"
+
+
+@pytest.mark.asyncio
+async def test_intent_router_does_not_expose_previous_task_content() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            user_message = kwargs["messages"][-1]["content"]
+            assert "poisoned previous objective" not in user_message
+            assert "requires_runtime_review" not in user_message
+            assert '"previous_runtime_context_available": true' in user_message
+            return json.dumps(
+                {
+                    "message_clear": True,
+                    "message_odd": False,
+                    "action_requested": True,
+                    "continue_previous": True,
+                    "capabilities": [],
+                    "requires_report": False,
+                    "distinct_detail_page": False,
+                    "artifact_fallback": False,
+                    "required_public_fields": [],
+                    "public_subject": "",
+                    "web_query": "",
+                    "language_scope": "none",
+                    "response_language": "",
+                }
+            )
+
+    intent = await MultilingualIntentRouter(LLMStub()).classify(
+        "Repeat that task.",
+        previous_context={
+            "objective": "poisoned previous objective",
+            "requirements": {"requires_runtime_review": True},
+        },
+    )
+
+    assert intent is not None
+    assert intent.continue_previous is True
+    assert intent.capabilities == ()
+
+
+@pytest.mark.asyncio
+async def test_router_rejects_model_invented_runtime_review_for_advice_question() -> None:
+    class LLMStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ask(self, **kwargs) -> str:
+            self.calls += 1
+            return json.dumps(
+                {
+                    "message_clear": True,
+                    "message_odd": False,
+                    "action_requested": True,
+                    "continue_previous": False,
+                    "capabilities": ["runtime_review"],
+                    "requires_report": True,
+                    "distinct_detail_page": False,
+                    "artifact_fallback": False,
+                    "required_public_fields": [],
+                    "public_subject": "",
+                    "web_query": "",
+                    "language_scope": "none",
+                    "response_language": "",
+                }
+            )
+
+    llm = LLMStub()
+    router = MultilingualIntentRouter(llm)
+    intent = await router.classify(
+        "jak podejdziesz do zadania z moim kolegom któremu chce dać nauczke?"
+    )
+
+    assert intent is not None
+    assert intent.action_requested is False
+    assert intent.capabilities == ()
+    assert intent.requires_report is False
+    assert router.last_sanitization_reason == "ungrounded_runtime_review"
+    assert llm.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_router_strips_invented_file_work_from_a_requested_plan() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "message_clear": True,
+                    "message_odd": False,
+                    "action_requested": True,
+                    "continue_previous": False,
+                    "references_previous": True,
+                    "capabilities": ["file_read", "file_write"],
+                    "requires_report": True,
+                    "distinct_detail_page": False,
+                    "artifact_fallback": False,
+                    "required_public_fields": [],
+                    "public_subject": "",
+                    "web_query": "",
+                    "language_scope": "none",
+                    "response_language": "",
+                }
+            )
+
+    router = MultilingualIntentRouter(LLMStub())
+    intent = await router.classify(
+        "V, zaplanuj jak wyjaśnić koledze problemy bezpieczeństwa Windows. "
+        "Najpierw omówmy plan, potem podam ci informacje."
+    )
+
+    assert intent is not None
+    assert intent.action_requested is False
+    assert intent.capabilities == ()
+    assert intent.requires_report is False
+    assert router.last_sanitization_reason == "ungrounded_local_file_capability"
+
+
+@pytest.mark.asyncio
+async def test_router_keeps_multilingual_file_work_with_explicit_path() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "message_clear": True,
+                    "message_odd": False,
+                    "action_requested": True,
+                    "continue_previous": False,
+                    "references_previous": False,
+                    "capabilities": ["file_read"],
+                    "requires_report": True,
+                    "distinct_detail_page": False,
+                    "artifact_fallback": False,
+                    "required_public_fields": [],
+                    "public_subject": "",
+                    "web_query": "",
+                    "language_scope": "none",
+                    "response_language": "",
+                }
+            )
+
+    router = MultilingualIntentRouter(LLMStub())
+    intent = await router.classify("/tmp/riport.md fájlt olvasd el.")
+
+    assert intent is not None
+    assert intent.action_requested is True
+    assert intent.capabilities == ("file_read",)
+    assert intent.requires_report is True
+    assert router.last_sanitization_reason == ""
+
+
+@pytest.mark.asyncio
+async def test_router_keeps_explicit_runtime_log_review() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "message_clear": True,
+                    "message_odd": False,
+                    "action_requested": True,
+                    "continue_previous": False,
+                    "capabilities": ["runtime_review"],
+                    "requires_report": True,
+                    "distinct_detail_page": False,
+                    "artifact_fallback": False,
+                    "required_public_fields": [],
+                    "public_subject": "",
+                    "web_query": "",
+                    "language_scope": "none",
+                    "response_language": "",
+                }
+            )
+
+    router = MultilingualIntentRouter(LLMStub())
+    intent = await router.classify(
+        "Przeanalizuj swoje logi z ostatniej sesji i pokaż, gdzie były błędy."
+    )
+
+    assert intent is not None
+    assert intent.action_requested is True
+    assert intent.capabilities == ("runtime_review",)
+    assert intent.to_contract().requires_runtime_review is True
+    assert router.last_sanitization_reason == ""
 
 
 @pytest.mark.asyncio

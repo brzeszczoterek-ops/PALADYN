@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import os
 from pathlib import Path
 import re
 import shlex
 import sys
-from typing import Callable
+from typing import Any, Callable
 
+from ..llm import LLM
 from .discovery import discover_models, human_size
 from .chat_templates import CHAT_TEMPLATE_PROFILES, infer_chat_template
 from .models import LoaderState, LocalModel, ModelProfile
+from .qualification import ModelQualifier
 from .runtime import LlamaServerSession, find_llama_server, start_llama_server
 from .storage import ModelLoaderStore
 
@@ -29,6 +33,8 @@ async def bootstrap_interactive_model(
     input_fn: Input = input,
     output: Output = print,
     stdin_is_tty: bool | None = None,
+    llm_factory: Callable[[], Any] = LLM,
+    qualifier_factory: Callable[[Any], Any] = ModelQualifier,
 ) -> LlamaServerSession | None:
     selected_mode = mode.strip().casefold()
     if selected_mode not in {"off", "prompt", "required"}:
@@ -66,6 +72,50 @@ async def bootstrap_interactive_model(
             state.model_directories.append(rendered)
         store.save(state)
         models = discover_models(state.model_directories)
+
+    while True:
+        action = choose_startup_action(
+            state,
+            models,
+            input_fn=input_fn,
+            output=output,
+            allow_external=(selected_mode != "required"),
+        )
+        if action == "external":
+            return None
+        if action == "qualify":
+            try:
+                await qualify_model_interactively(
+                    runtime_root,
+                    state,
+                    models,
+                    store=store,
+                    input_fn=input_fn,
+                    output=output,
+                    llm_factory=llm_factory,
+                    qualifier_factory=qualifier_factory,
+                )
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except Exception as error:
+                output(
+                    "Model qualification failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+            state = store.load()
+            models = discover_models(state.model_directories)
+            continue
+        if action == "pool":
+            configure_routing_pool_interactively(
+                state,
+                models,
+                store=store,
+                input_fn=input_fn,
+                output=output,
+            )
+            state = store.load()
+            continue
+        break
 
     model = choose_model(
         models,
@@ -116,6 +166,209 @@ async def bootstrap_interactive_model(
         await session.stop()
         raise
     return session
+
+
+def choose_startup_action(
+    state: LoaderState,
+    models: list[LocalModel],
+    *,
+    input_fn: Input,
+    output: Output,
+    allow_external: bool,
+) -> str:
+    """Choose startup work before any multi-gigabyte model is loaded."""
+
+    current_cards = sum(
+        1
+        for model in models
+        if str(model.path) in state.profiles
+        and str(model.path) in state.qualifications
+        and state.qualifications[str(model.path)].is_current(
+            model.path,
+            state.profiles[str(model.path)],
+        )
+    )
+    output("\nPALADYN startup:")
+    output("  1. Start V")
+    output(
+        "  2. Qualify or requalify a local model "
+        f"({current_cards}/{len(models)} current)"
+    )
+    output(
+        "  3. Configure automatic model routing pool "
+        f"({len(state.routing_model_paths)}/3 selected)"
+    )
+    if allow_external:
+        output("  0. Use the server configured in .env")
+    while True:
+        raw = _read(input_fn, "Select startup action [Enter = 1]: ").strip()
+        if not raw or raw == "1":
+            return "start"
+        if raw == "2":
+            return "qualify"
+        if raw == "3":
+            return "pool"
+        if raw == "0" and allow_external:
+            return "external"
+        output("Enter a startup action number from the list.")
+
+
+async def qualify_model_interactively(
+    runtime_root: Path,
+    state: LoaderState,
+    models: list[LocalModel],
+    *,
+    store: ModelLoaderStore,
+    input_fn: Input,
+    output: Output,
+    llm_factory: Callable[[], Any] = LLM,
+    qualifier_factory: Callable[[Any], Any] = ModelQualifier,
+) -> bool:
+    """Qualify one exact GGUF/profile and return to the startup menu."""
+
+    model = choose_model(
+        models,
+        last_model_path=state.last_model_path,
+        input_fn=input_fn,
+        output=output,
+        allow_external=False,
+    )
+    assert model is not None
+    key = str(model.path)
+    saved_profile = state.profiles.get(key)
+    profile = (
+        saved_profile
+        if saved_profile is not None
+        and Path(saved_profile.model_path).resolve() == model.path
+        else default_profile(model)
+    )
+    output(render_profile(profile))
+    edit = _read(
+        input_fn,
+        "Edit this model profile before qualification? [y/N]: ",
+    ).strip().casefold()
+    if edit in {"y", "yes", "t", "tak"}:
+        profile = edit_profile(profile, input_fn=input_fn, output=output)
+
+    binary = find_llama_server(state.server_binary)
+    while binary is None:
+        supplied = _read(
+            input_fn,
+            "Path to llama-server for qualification (Enter = cancel): ",
+        ).strip()
+        if not supplied:
+            output("Qualification cancelled; no card was changed.")
+            return False
+        binary = find_llama_server(supplied)
+        if binary is None:
+            output("That file is missing or is not executable.")
+
+    state.server_binary = str(binary)
+    state.profiles[key] = profile
+    store.save(state)
+    output(
+        f"\nQualifying {model.path.name}. This runs bounded local tests and may "
+        "take several minutes..."
+    )
+    session = await start_llama_server(binary, profile, runtime_root, status=output)
+    llm: Any | None = None
+    try:
+        llm = llm_factory()
+        card = await qualifier_factory(llm).qualify(profile)
+    finally:
+        if llm is not None:
+            client = getattr(llm, "client", None)
+            close = getattr(client, "close", None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        await session.stop()
+
+    state = store.load()
+    state.server_binary = str(binary)
+    state.profiles[key] = profile
+    state.qualifications[key] = card
+    output(f"\nQualification complete: {model.path.name} = {card.overall_score}/100")
+    for capability, score in card.capabilities.items():
+        output(f"  {capability}: {score}/100")
+
+    if key in state.routing_model_paths:
+        output("This model is already in the automatic routing pool.")
+    elif len(state.routing_model_paths) >= 3:
+        output(
+            "The routing pool is full. The card was saved; use startup option 3 "
+            "to replace a pool member."
+        )
+    else:
+        add = _read(
+            input_fn,
+            "Add this qualified model to the automatic routing pool? [Y/n]: ",
+        ).strip().casefold()
+        if add not in {"n", "no", "nie"}:
+            state.routing_model_paths.append(key)
+            state.routing_enabled = True
+            output("Model added to the automatic routing pool.")
+    store.save(state)
+    return True
+
+
+def configure_routing_pool_interactively(
+    state: LoaderState,
+    models: list[LocalModel],
+    *,
+    store: ModelLoaderStore,
+    input_fn: Input,
+    output: Output,
+) -> bool:
+    """Configure one to three current cards without a separate CLI command."""
+
+    eligible: list[tuple[LocalModel, int]] = []
+    for model in models:
+        key = str(model.path)
+        profile = state.profiles.get(key)
+        card = state.qualifications.get(key)
+        if profile is None or card is None or not card.is_current(model.path, profile):
+            continue
+        eligible.append((model, card.overall_score))
+    if not eligible:
+        output("No current qualification cards exist. Run startup option 2 first.")
+        return False
+
+    output("\nQualified models available for automatic routing:")
+    for index, (model, score) in enumerate(eligible, start=1):
+        marker = " (current pool)" if str(model.path) in state.routing_model_paths else ""
+        output(f"  {index}. {model.path.name} — {score}/100{marker}")
+    output("  0. Disable automatic routing")
+    while True:
+        raw = _read(
+            input_fn,
+            "Select 1-3 model numbers separated by commas [Enter = keep current]: ",
+        ).strip()
+        if not raw:
+            return False
+        if raw == "0":
+            state.routing_enabled = False
+            store.save(state)
+            output("Automatic model routing disabled; saved cards were kept.")
+            return True
+        try:
+            indices = [int(item.strip()) - 1 for item in raw.split(",")]
+        except ValueError:
+            output("Enter one to three comma-separated model numbers.")
+            continue
+        if (
+            not 1 <= len(indices) <= 3
+            or len(set(indices)) != len(indices)
+            or any(index < 0 or index >= len(eligible) for index in indices)
+        ):
+            output("Choose one to three distinct model numbers from the list.")
+            continue
+        state.routing_model_paths = [str(eligible[index][0].path) for index in indices]
+        state.routing_enabled = True
+        store.save(state)
+        output("Automatic model routing pool updated.")
+        return True
 
 
 def choose_model(

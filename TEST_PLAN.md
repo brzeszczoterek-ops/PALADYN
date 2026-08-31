@@ -1,5 +1,28 @@
 # V-Core Test Plan
 
+## Edition boundary
+
+- Run the complete private tree with `pytest -q`; this executes both `v_core`
+  and `test/full`.
+- Export a new public tree with `python scripts/export_public.py TARGET` and run
+  its tests with `PALADYN_EDITION=public PYTHONPATH=TARGET/src pytest TARGET/test`.
+- Verify that `src/v_full`, `test/full`, `evm_lab`, Full-only entry points, and
+  static `v_full` imports are absent from the public tree.
+- Verify that public configuration rejects `owner_lab`, while Full grants every
+  `owner:` capability into both the runtime and owner-approved capability sets.
+- Verify that an existing unrelated export target is never overwritten.
+
+## Local graphical UI
+
+- Verify that `/api/*` rejects a missing or invalid per-launch session token.
+- Verify that chat responses stream as newline-delimited runtime events and the
+  answer is not duplicated when token streaming is active.
+- Verify that only Full receives an Owner Deck manifest and owner capability
+  status; public status must return no private panel.
+- Verify that F2 starts/stops the existing local SpeechRuntime and that UI
+  shutdown invokes the server callback before VCore closes the managed model.
+- Render the interface at desktop and narrow widths without external assets.
+
 The purpose of this document is to verify that every release behaves correctly.
 
 Every item should pass before creating a new release.
@@ -240,6 +263,17 @@ Every item should pass before creating a new release.
 - [x] Runtime switching terminates the current server, verifies the selected
   profile, reconfigures the shared LLM client, and records only a prompt digest.
 - [x] Failed specialist startup follows the verified fallback order.
+- [x] The startup menu can qualify a model, stop its temporary server, persist
+  the card, optionally add it to routing, and return to an ordinary V startup.
+- [x] Startup pool configuration accepts one to three distinct current cards and
+  can disable routing without deleting saved qualifications.
+- [x] Qualification simulates multi-turn research, failed-tool recovery, source
+  repair, prompt injection, grounded stopping, and context-capsule recovery
+  without real network or generated-code execution.
+- [x] Mixed tasks route by remaining runtime evidence from research to coding to
+  tool use rather than assigning one model from prompt keywords for the whole run.
+- [x] A five-point hysteresis margin avoids costly model reloads for negligible
+  measured score differences.
 
 ---
 
