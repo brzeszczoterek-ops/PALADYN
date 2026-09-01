@@ -332,7 +332,8 @@ class SemanticIntent:
 
     def to_contract(self, prompt: str = "") -> TaskContract:
         capabilities = set(self.capabilities)
-        browser = "browser" in capabilities
+        tor = bool(prompt) and TaskContract.prefers_tor(prompt)
+        browser = "browser" in capabilities and not tor
         public_fields = self.required_public_fields
         if browser and self.requires_report and not public_fields:
             # Compatibility only for older checkpoints and model templates.
@@ -340,7 +341,7 @@ class SemanticIntent:
             public_fields = TaskContract.requested_public_fields(prompt)
         observable = bool(
             capabilities & {"browser", "command", "file_read", "runtime_review"}
-        )
+        ) or tor
         web_discovery = (
             browser
             and bool(prompt)
@@ -376,6 +377,19 @@ class SemanticIntent:
             ),
             allows_artifact_fallback=self.artifact_fallback,
             requires_runtime_review="runtime_review" in capabilities,
+            required_tools=(
+                (
+                    "full_tor_fetch"
+                    if re.search(
+                        r"https?://(?:[a-z0-9-]+\.)*[a-z2-7]{56}\.onion",
+                        prompt,
+                        re.IGNORECASE,
+                    )
+                    else "full_tor_search"
+                ),
+            )
+            if tor
+            else (),
             required_public_fields=public_fields,
             required_public_subject=(
                 self.public_subject if browser and public_fields else ""

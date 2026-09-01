@@ -18,11 +18,13 @@ an `owner_lab` profile without the private package fails closed.
 
 The private Full edition adds `src/v_full`. It owns privileged generated-code
 authorization, the owner performance monitor, advanced EVM simulation and
-Foundry integration, and short-lived live-operation grants. These capabilities
-are registered through the edition-extension contract; `v_core` does not import
-their implementations directly. The shared graphical shell asks that extension
-for an optional UI contribution. Public PALADYN receives none; Full supplies the
-private Owner Deck and its local operational status.
+Foundry integration, short-lived live-operation grants, and a bounded bridge to
+the host Tor service. The bridge exposes fixed status/search/fetch operations,
+not a shell or general package installer; generated tools remain offline. These
+capabilities are registered through the edition-extension contract; `v_core`
+does not import their implementations directly. The shared graphical shell asks
+that extension for an optional UI contribution. Public PALADYN receives none;
+Full supplies the private Owner Deck and its local operational status.
 
 Both editions retain the execution-evidence contract, external emergency stop,
 capability ownership, generated-code validation, audit trail, and protected

@@ -24,6 +24,21 @@ _ONLINE_RESOURCE = re.compile(
     r"witryn\w*)\b",
     re.IGNORECASE,
 )
+_TOR_ACCESS_REQUEST = re.compile(
+    r"(?:\b(?:w|przez)\s+(?:darknet\w*|sieci\s+tor)\b|"
+    r"\b(?:in|on|through|via)\s+(?:the\s+)?"
+    r"(?:darknet|dark\s*web|tor\s+network)\b|"
+    r"\b(?:przeszuk\w*|wejd\w*)\s+(?:do\s+|w\s+)?(?:darknet\w*|sie[cć]\s+tor)\b|"
+    r"\b(?:search|browse|visit|open|inspect)\s+(?:the\s+)?"
+    r"(?:darknet|dark\s*web|tor\s+network)\b|"
+    r"\b(?:using|używ\w*|uzyw\w*)\s+(?:the\s+)?tor(?:\s+browser)?\b|"
+    r"\.onion\b)",
+    re.IGNORECASE,
+)
+_EXPLICIT_ONION_ADDRESS = re.compile(
+    r"https?://(?:[a-z0-9-]+\.)*[a-z2-7]{56}\.onion(?:[^\s<>]*)?",
+    re.IGNORECASE,
+)
 _EXPLICIT_WEB_ADDRESS = re.compile(
     r"(?:https?://|www\.|\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z]{2,63}(?:[/:?#]|\b))",
@@ -330,8 +345,21 @@ class TaskContract:
             requires_browser_snapshot=False,
             requires_web_discovery=False,
             requires_distinct_detail_page=False,
+            required_tools=tuple(
+                name
+                for name in self.required_tools
+                if name not in {"full_tor_search", "full_tor_fetch"}
+            ),
             required_public_fields=(),
             required_public_subject="",
+        )
+
+    @staticmethod
+    def prefers_tor(prompt: str) -> bool:
+        """Return whether the requested online surface is Tor rather than clearnet."""
+
+        return bool(_TOR_ACCESS_REQUEST.search(prompt)) and not (
+            TaskContract.disables_web(prompt)
         )
 
     @staticmethod
@@ -385,7 +413,11 @@ class TaskContract:
     @classmethod
     def from_prompt(cls, prompt: str) -> "TaskContract":
         web_disabled = bool(_DISABLE_WEB.search(prompt))
-        online = not web_disabled and (
+        tor_requested = not web_disabled and bool(_TOR_ACCESS_REQUEST.search(prompt)) and (
+            bool(_ONLINE_ACTION.search(prompt))
+            or bool(_EXPLICIT_ONION_ADDRESS.search(prompt))
+        )
+        online = not tor_requested and not web_disabled and (
             requests_web_access(prompt)
             or bool(_ONLINE_ACTION.search(prompt) and _ONLINE_RESOURCE.search(prompt))
         )
@@ -430,7 +462,7 @@ class TaskContract:
         runtime_review = bool(_RUNTIME_REVIEW.search(prompt))
         web_discovery = online and cls.needs_web_discovery(prompt)
         evidence_report = runtime_review or (
-            (online or file_read or command_execution)
+            (online or tor_requested or file_read or command_execution)
             and bool(_REPORT_RESULT.search(prompt))
         )
         public_fields = (
@@ -466,6 +498,15 @@ class TaskContract:
             ),
             allows_artifact_fallback=conditional_artifact,
             requires_runtime_review=runtime_review,
+            required_tools=(
+                (
+                    "full_tor_fetch"
+                    if _EXPLICIT_ONION_ADDRESS.search(prompt)
+                    else "full_tor_search"
+                ),
+            )
+            if tor_requested
+            else (),
             required_public_fields=public_fields,
         )
 
@@ -816,6 +857,8 @@ class TaskContract:
                 "sandbox_execute_offline",
                 "evm_foundry_test_offline",
                 "runtime_review_task",
+                "full_tor_search",
+                "full_tor_fetch",
             }
             and call.get("result_excerpt")
         ]
@@ -825,7 +868,10 @@ class TaskContract:
         if _RAW_BROWSER_SCAFFOLD.search(answer):
             return ["answer:browser_scaffolding_is_not_a_finding"]
 
-        if self.requires_browser_navigation:
+        if self.requires_browser_navigation or any(
+            name in {"full_tor_search", "full_tor_fetch"}
+            for name in self.required_tools
+        ):
             grounding_text = (request + "\n" + "\n".join(observations)).casefold()
             observed_url_keys = {
                 key

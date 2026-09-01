@@ -2,7 +2,13 @@
 
 ## Unreleased
 
+## 3.8 - 2026-09-01
+
 ### Added
+- A private Full-edition host-service broker with owner capabilities for local
+  Tor readiness, onion-index discovery through SOCKS5 hostname resolution, and
+  bounded Tor v3 page fetches; generated tools remain offline and no arbitrary
+  host shell, package manager, credentials, redirects, or JavaScript are exposed
 - A loopback-only graphical command center with streaming chat, active-model and
   tool status, F2 local push-to-talk, optional local TTS, a session-token gate,
   strict browser security headers, and a hold-to-shutdown control that closes V

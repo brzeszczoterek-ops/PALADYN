@@ -4323,6 +4323,10 @@ Rules:
   network-exploitation, or system-compromise tool. Never claim a call, message,
   login, remote connection, exploit, or compromise. Browser activity does not
   constitute evidence for any of those actions.
+- When `full_tor_search` or `full_tor_fetch` appears in the current catalog, it
+  is a real bounded bridge to the host Tor service. Use Tor tools for darknet
+  work; never substitute the ordinary browser or claim that a Tor Browser GUI
+  was controlled.
 - Use filesystem tools only for local files.
 - For public-web discovery, call `web_search` with a focused query, then copy an
   exact returned URL into `web_read`. These tools own search navigation and page
@@ -4371,13 +4375,28 @@ Rules:
             selected.update(explicitly_named)
             matched = True
 
+        tor_tools = {
+            name
+            for name in contract.required_tools
+            if name in {"full_tor_search", "full_tor_fetch"}
+        }
+        if tor_tools:
+            selected.update(tor_tools)
+            selected.add("full_host_status")
+            if "full_tor_search" in tor_tools:
+                selected.add("full_tor_fetch")
+            matched = True
+
         if (
-            contract.requires_browser_navigation
-            or "browser" in hints
-            or re.search(
-                r"\b(?:browser|darknet|internet\w*|interne\w*|online|osint|"
-                r"sieci|stron\w*|web|website|witryn\w*)\b",
-                text,
+            not tor_tools
+            and (
+                contract.requires_browser_navigation
+                or "browser" in hints
+                or re.search(
+                    r"\b(?:browser|internet\w*|interne\w*|online|osint|"
+                    r"sieci|stron\w*|web|website|witryn\w*)\b",
+                    text,
+                )
             )
         ):
             selected.update(

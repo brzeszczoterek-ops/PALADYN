@@ -50,7 +50,7 @@ import v_core.main as main_module
 
 
 def test_public_version_matches_release() -> None:
-    assert v_core.__version__ == "3.7"
+    assert v_core.__version__ == "3.8"
 
 
 def test_tool_request_accepts_structured_json() -> None:
