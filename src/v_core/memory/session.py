@@ -43,6 +43,10 @@ class Session:
             self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.root, 0o700)
             self._load()
+        # Events loaded from disk belong to earlier application sessions. They
+        # remain available for explicit/relevant recall but must not be injected
+        # as the automatic opening context of a fresh conversation.
+        self._current_session_start = len(self.events)
 
     @staticmethod
     def _safe_text(value: Any) -> str:
@@ -195,6 +199,7 @@ class Session:
     def clear(self) -> None:
         with self._lock:
             self.events.clear()
+            self._current_session_start = 0
             if self.path is not None:
                 self._compact()
 
@@ -275,7 +280,11 @@ class Session:
         events = self._task_events()
         if not events:
             return []
-        recent_start = max(0, len(events) - min(3, limit))
+        session_start = min(
+            max(0, int(getattr(self, "_current_session_start", 0))),
+            len(events),
+        )
+        recent_start = max(session_start, len(events) - min(3, limit))
         chosen = set(range(recent_start, len(events)))
         query_tokens = self._match_tokens(prompt)
         ranked: list[tuple[int, int]] = []
@@ -286,10 +295,6 @@ class Session:
                 ranked.append((score, index))
         ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
         for _, index in ranked:
-            if len(chosen) >= limit:
-                break
-            chosen.add(index)
-        for index in range(recent_start - 1, -1, -1):
             if len(chosen) >= limit:
                 break
             chosen.add(index)

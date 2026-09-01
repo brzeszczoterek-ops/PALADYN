@@ -38,7 +38,7 @@ credentials*.json
 secrets*.json
 
 # Memory data
-memory/
+/memory/
 /autonomy/
 /learning/
 /model_runtime/

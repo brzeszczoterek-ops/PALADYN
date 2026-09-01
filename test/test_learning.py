@@ -1297,7 +1297,7 @@ async def test_mcp_runtime_builds_full_tool_contract_from_source_only(
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
 @pytest.mark.asyncio
-async def test_source_only_builder_marks_runtime_derived_smoke_contract(
+async def test_source_only_builder_marks_runtime_derived_tool_smoke_test(
     tmp_path: Path,
 ) -> None:
     learning = runtime(tmp_path)
@@ -1310,7 +1310,7 @@ async def test_source_only_builder_marks_runtime_derived_smoke_contract(
 
     assert created.status is ArtifactStatus.ACTIVE
     assert manifest.tests[0].name == (
-        "runtime-derived deterministic contract smoke test"
+        "runtime-derived deterministic tool smoke test"
     )
     assert manifest.tests[0].expected == {"result": 6}
     assert await learning.execute_tool("smoke_double", {"value": 5}) == {

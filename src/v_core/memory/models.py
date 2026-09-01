@@ -117,6 +117,11 @@ class KnowledgeEntry:
 
     source: MemorySource = MemorySource.INFERRED
 
+    # "always" is reserved for stable preferences and generic reversible
+    # behavioural lessons. Topic memories remain dormant until explicitly
+    # recalled so they cannot steer an unrelated new conversation.
+    activation_mode: str = "on_recall"
+
 
 @dataclass
 class ProposalEntry:
@@ -141,6 +146,12 @@ class ProposalEntry:
     status: str = "pending"
 
     decided_at: str = ""
+
+    decision_mode: str = "owner_review"
+
+    triage_reason: str = ""
+
+    triage_scope: str = ""
 
 
 @dataclass

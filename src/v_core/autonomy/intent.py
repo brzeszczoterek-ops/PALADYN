@@ -47,6 +47,9 @@ _INTENT_RESPONSE_FORMAT: dict[str, Any] = {
                 "requires_report": {"type": "boolean"},
                 "distinct_detail_page": {"type": "boolean"},
                 "artifact_fallback": {"type": "boolean"},
+                "execute_created_artifact": {"type": "boolean"},
+                "recall_memory": {"type": "boolean"},
+                "memory_query": {"type": "string", "maxLength": 220},
                 "required_public_fields": {
                     "type": "array",
                     "items": {"type": "string", "enum": sorted(_PUBLIC_FIELDS)},
@@ -71,6 +74,9 @@ _INTENT_RESPONSE_FORMAT: dict[str, Any] = {
                 "requires_report",
                 "distinct_detail_page",
                 "artifact_fallback",
+                "execute_created_artifact",
+                "recall_memory",
+                "memory_query",
                 "required_public_fields",
                 "public_subject",
                 "web_query",
@@ -94,6 +100,8 @@ Return exactly one JSON object with this shape:
 "continue_previous":false,"references_previous":false,
 "creative_response":false,"capabilities":[],
 "requires_report":false,"distinct_detail_page":false,"artifact_fallback":false,
+"execute_created_artifact":false,
+"recall_memory":false,"memory_query":"",
 "required_public_fields":[],
 "public_subject":"",
 "web_query":"","language_scope":"none","response_language":""}
@@ -130,8 +138,12 @@ Rules:
   similar composition. Creative writing is not file_write unless the current
   message also explicitly names a local file or path. Questions that ask whether
   V can write something and then tell her to write it are creative_response=true.
-- continue_previous is true only when the current message tells PALADYN to resume,
-  retry, proceed with, or keep doing the previous concrete task.
+- continue_previous is true when the current message tells PALADYN to resume,
+  retry, proceed with, or keep doing the previous concrete task. It is also true
+  when the user says the previous answer misunderstood or ignored the request,
+  corrects the subject, and expects the original concrete task to be done
+  properly. A correction such as "you answered about contracts, but I asked for
+  tools" is a retry, not mere discussion.
 - references_previous is true when the meaning of the current message depends on
   an earlier conversation turn, person, subject, event, or task. This includes
   questions such as "How would you approach that task with my friend?". It is
@@ -149,6 +161,15 @@ Rules:
 - artifact_fallback is true when creating a tool or skill is conditional on an
   earlier attempt failing or finding no suitable result. Keep the corresponding
   learning capability, but do not treat creation as unconditionally required.
+- execute_created_artifact is true when the user expects the newly created tool
+  or skill to be run, demonstrated, tested on an input, or to produce results.
+  "Create it and show me the results" means true in every language. It is false
+  when the user asks only to write, stage, validate, or activate the artifact.
+- recall_memory is true only when the user explicitly asks V to remember, recall,
+  revisit, continue from, or use information saved in an earlier conversation.
+  Merely asking a new question on a similar domain is false. memory_query is a
+  short English subject phrase naming what should be recalled, or an empty string
+  when no subject was supplied. Stored topic memory must otherwise remain dormant.
 - required_public_fields contains standardized fields explicitly requested from
   public online information: count, address, contact, opening_hours. Map the
   user's meaning to these labels regardless of language. Do not add an unasked field.
@@ -199,6 +220,9 @@ class SemanticIntent:
     requires_report: bool = False
     distinct_detail_page: bool = False
     artifact_fallback: bool = False
+    execute_created_artifact: bool = False
+    recall_memory: bool = False
+    memory_query: str = ""
     required_public_fields: tuple[str, ...] = ()
     public_subject: str = ""
     web_query: str = ""
@@ -267,6 +291,10 @@ class SemanticIntent:
             response_language = ""
         elif not response_language:
             language_scope = "none"
+        recall_memory = payload.get("recall_memory") is True
+        memory_query = " ".join(str(payload.get("memory_query", "")).split())[:220]
+        if not recall_memory:
+            memory_query = ""
         explicit_action = payload.get("action_requested") is True and bool(
             capabilities
         )
@@ -290,6 +318,11 @@ class SemanticIntent:
             requires_report=requires_report,
             distinct_detail_page=payload.get("distinct_detail_page") is True,
             artifact_fallback=payload.get("artifact_fallback") is True,
+            execute_created_artifact=(
+                payload.get("execute_created_artifact") is True
+            ),
+            recall_memory=recall_memory,
+            memory_query=memory_query,
             required_public_fields=public_fields,
             public_subject=public_subject,
             web_query=web_query,
@@ -332,6 +365,11 @@ class SemanticIntent:
             requires_evidence_report=self.requires_report and observable,
             requires_created_tool=(
                 "learning_tool" in capabilities and not self.artifact_fallback
+            ),
+            requires_created_tool_execution=(
+                "learning_tool" in capabilities
+                and not self.artifact_fallback
+                and self.execute_created_artifact
             ),
             requires_created_skill=(
                 "learning_skill" in capabilities and not self.artifact_fallback
@@ -550,7 +588,7 @@ class MultilingualIntentRouter:
         ]
         response = await self.llm.ask(
             messages=messages,
-            max_tokens=128,
+            max_tokens=256,
             temperature=0.0,
             response_format=_INTENT_RESPONSE_FORMAT,
         )
@@ -588,7 +626,7 @@ class MultilingualIntentRouter:
                     ),
                 },
             ],
-            max_tokens=128,
+            max_tokens=256,
             temperature=0.0,
             response_format=_INTENT_RESPONSE_FORMAT,
         )

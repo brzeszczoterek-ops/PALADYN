@@ -41,6 +41,7 @@ from .memory.summary import Summary
 from .memory.knowledge import Knowledge
 from .memory.manager import MemoryManager
 from .memory.memory_engine import MemoryEngine
+from .memory.proposal_filter import ProposalFilter
 
 from .relationship import (
     RelationshipStorage,
@@ -111,6 +112,7 @@ class VCore:
             manager=manager,
             relationship_updater=relationship_updater,
             relationship_storage=relationship_storage,
+            proposal_filter=ProposalFilter(llm),
         )
 
         self.agent = Agent(

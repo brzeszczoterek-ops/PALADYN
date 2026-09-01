@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "v-core"
-version = "3.6.0"
+version = "3.7"
 description = "PALADYN Framework powered by V"
 readme = "README.md"
 requires-python = ">=3.12"

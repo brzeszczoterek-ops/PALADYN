@@ -63,6 +63,60 @@ def test_task_contract_detects_polish_local_tool_and_required_use() -> None:
     assert contract.unmet(calls) == []
 
 
+def test_created_tool_results_request_requires_real_execution() -> None:
+    contract = TaskContract.from_prompt(
+        "Stwórz takie narzędzie i pokaż mi rezultaty."
+    )
+
+    assert contract.requires_created_tool is True
+    assert contract.requires_created_tool_execution is True
+
+
+def test_semantic_created_artifact_results_require_execution_in_any_language() -> None:
+    intent = SemanticIntent(
+        action_requested=True,
+        capabilities=("learning_tool",),
+        requires_report=True,
+        execute_created_artifact=True,
+    )
+
+    contract = intent.to_contract("Create the requested capability.")
+
+    assert contract.requires_created_tool is True
+    assert contract.requires_created_tool_execution is True
+
+
+def test_created_tool_validation_report_names_tool_not_contract() -> None:
+    contract = TaskContract(requires_created_tool=True)
+    answer = contract.deterministic_answer(
+        [
+            {
+                "tool": "learning_create_tool",
+                "status": "succeeded",
+                "result_excerpt": json.dumps(
+                    {
+                        "name": "darknet_observer",
+                        "status": "active",
+                        "validation": {
+                            "passed": True,
+                            "tests": [
+                                {
+                                    "name": "deterministic tool smoke test",
+                                    "passed": True,
+                                }
+                            ],
+                        },
+                    }
+                ),
+            }
+        ]
+    )
+
+    assert answer is not None
+    assert "built the generated tool" in answer
+    assert "built the contract" not in answer
+
+
 def test_task_contract_accepts_deterministic_snapshot_tool_builder() -> None:
     contract = TaskContract(
         requires_created_tool=True,
@@ -1667,7 +1721,7 @@ async def test_multilingual_intent_router_classifies_hungarian_action() -> None:
     assert intent.requires_report is True
     assert intent.web_query == "internetes kutatási eredmények"
     assert llm.kwargs["temperature"] == 0.0
-    assert llm.kwargs["max_tokens"] == 128
+    assert llm.kwargs["max_tokens"] == 256
     assert llm.kwargs["response_format"]["type"] == "json_schema"
 
 

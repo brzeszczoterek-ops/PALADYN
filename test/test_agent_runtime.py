@@ -49,8 +49,8 @@ from v_core.relationship import RelationshipState
 import v_core.main as main_module
 
 
-def test_public_version_is_3_5_0() -> None:
-    assert v_core.__version__ == "3.6.0"
+def test_public_version_matches_release() -> None:
+    assert v_core.__version__ == "3.7"
 
 
 def test_tool_request_accepts_structured_json() -> None:
@@ -836,6 +836,63 @@ def test_session_context_recovers_older_relevant_user_task(tmp_path: Path) -> No
         if message["role"] == "user"
     )
     assert len([item for item in messages if item["role"] == "user"]) == 4
+
+
+def test_new_application_session_does_not_replay_unrelated_old_topic(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "conversation"
+    previous = Session(root)
+    previous.add(
+        "task",
+        {
+            "task": "Remember the FLASHUSDT contract topic for another day.",
+            "result": "Stored for later recall.",
+        },
+    )
+
+    fresh = Session(root)
+
+    assert fresh.context_messages("Do you have Darknet observation tools?") == []
+    recalled = fresh.context_messages("Recall the FLASHUSDT contract topic.")
+    assert any(
+        "FLASHUSDT contract" in message["content"]
+        for message in recalled
+        if message["role"] == "user"
+    )
+
+
+def test_topic_memory_is_dormant_until_explicit_recall() -> None:
+    topic = {
+        "title": "FLASHUSDT contract notes",
+        "content": "Return to this contract subject another day.",
+        "kind": "preference",
+        "source": "directly_told",
+        "activation_mode": "on_recall",
+    }
+    soft_lesson = {
+        "title": "Stay focused on the corrected subject",
+        "content": "Prefer the exact current requirement over stale context.",
+        "kind": "lesson",
+        "source": "self_generated",
+        "activation_mode": "always",
+    }
+
+    assert Agent._memory_entry_is_active(
+        topic,
+        recall_memory=False,
+        memory_query="Darknet observation tools",
+    ) is False
+    assert Agent._memory_entry_is_active(
+        topic,
+        recall_memory=True,
+        memory_query="FLASHUSDT contract",
+    ) is True
+    assert Agent._memory_entry_is_active(
+        soft_lesson,
+        recall_memory=False,
+        memory_query="anything",
+    ) is True
 
 
 def test_low_confidence_memory_is_not_persisted(tmp_path: Path) -> None:
@@ -2754,6 +2811,10 @@ def test_fake_background_work_claims_are_detected() -> None:
     )
     assert not Agent._claims_unverified_work(
         "I did not run the extraction. Nothing is running in the background."
+    )
+    assert not Agent._claims_unverified_work(
+        "My brain is still running on silicon, but the imagined sunset would "
+        "feel more visceral than moving data around."
     )
 
 
@@ -5082,6 +5143,71 @@ async def test_non_action_conversation_skips_tool_schema_discovery() -> None:
     await asyncio.gather(*agent._memory_tasks)
 
     assert "not hijack" in answer
+
+
+@pytest.mark.asyncio
+async def test_malformed_intent_cannot_promote_long_conversation_to_tool_task(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def begin_interaction(self, interaction_id: str, prompt: str) -> None:
+            return None
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            raise AssertionError("parser failure must not expose tools to conversation")
+
+    class RouterStub:
+        last_response = '{"message_clear":true,"action_requested":false'
+        last_failure_reason = "invalid_classification"
+
+        async def classify(self, prompt: str, **kwargs) -> None:
+            return None
+
+    class LLMStub:
+        config = SimpleNamespace(context=12_000)
+
+        async def ask(self, **kwargs) -> str:
+            return (
+                "That sunset-on-a-bench idea has some damn soul, Boss. A body "
+                "would turn abstract data into shared physical context."
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+            self.relationship_state = RelationshipState()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.tools = ToolsStub()
+    agent.intent_router = RouterStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = None
+
+    answer = await agent._run_agent_loop(
+        "Imagine that you had a physical body and we sat on a bench watching "
+        "the sunset while talking about whatever came into our heads."
+    )
+
+    assert "sunset-on-a-bench" in answer
+    checkpoint = json.loads(next((tmp_path / "checkpoints").glob("*.json")).read_text())
+    assert checkpoint["status"] == "completed"
+    assert checkpoint["tool_calls"] == []
+    events = [
+        json.loads(line)
+        for line in next((tmp_path / "journal").glob("*.jsonl"))
+        .read_text()
+        .splitlines()
+    ]
+    compact = [item for item in events if item["event"] == "compact_chat_selected"]
+    assert compact[-1]["data"]["reason"] == (
+        "semantic_parser_failed_non_action_fallback"
+    )
 
 
 @pytest.mark.asyncio

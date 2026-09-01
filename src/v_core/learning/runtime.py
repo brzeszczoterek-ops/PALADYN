@@ -326,7 +326,7 @@ class LearningRuntime:
             name=(
                 "owner-specified semantic oracle"
                 if blueprint.oracle == "owner_expected"
-                else "runtime-derived deterministic contract smoke test"
+                else "runtime-derived deterministic tool smoke test"
             ),
             arguments=blueprint.arguments,
             expected=expected,

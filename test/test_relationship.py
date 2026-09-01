@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 import stat
@@ -19,6 +20,7 @@ from v_core.memory.models import (
     SummaryEntry,
 )
 from v_core.memory.reflection import Reflection
+from v_core.memory.proposal_filter import ProposalFilter
 from v_core.memory.summary import Summary
 from v_core.memory.storage import MemoryStorage
 from v_core.persona.kernel import IdentityKernel
@@ -392,6 +394,270 @@ def test_owner_can_approve_or_reject_model_proposals(tmp_path: Path) -> None:
     knowledge = manager.load_all("knowledge")
     assert len(knowledge) == 1
     assert knowledge[0]["source"] == "directly_told"
+
+
+@pytest.mark.asyncio
+async def test_proposal_filter_auto_applies_only_low_impact_soft_learning() -> None:
+    class TriageLLM:
+        async def ask(self, prompt: str, **kwargs) -> str:
+            assert "Use concise failure reports" in prompt
+            assert "Boss approved direct error reports" in prompt
+            return json.dumps(
+                {
+                    "disposition": "auto_apply",
+                    "scope": "soft_behavior",
+                    "impact": "low",
+                    "reversible": True,
+                    "confidence": 0.96,
+                    "reason": "Matches Boss's approved preference for direct reports.",
+                }
+            )
+
+    experience = ExperienceEntry(
+        summary="Use concise failure reports.",
+        lesson="State the exact failed step before proposing a repair.",
+        confidence=0.95,
+        importance="high",
+        kind=MemoryKind.LESSON,
+        source=MemorySource.SELF_GENERATED,
+    )
+    decision = await ProposalFilter(TriageLLM()).evaluate(
+        experience,
+        [
+            {
+                "timestamp": "2026-09-01T00:00:00Z",
+                "suggestion": "Boss approved direct error reports.",
+                "status": "approved",
+                "decision_mode": "owner",
+            }
+        ],
+    )
+
+    assert decision.disposition == "auto_apply"
+    assert decision.scope == "soft_behavior"
+
+
+@pytest.mark.asyncio
+async def test_proposal_filter_suppresses_inferred_preference_without_owner_spam() -> None:
+    class TriageLLM:
+        async def ask(self, prompt: str, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "disposition": "auto_apply",
+                    "scope": "soft_behavior",
+                    "impact": "low",
+                    "reversible": True,
+                    "confidence": 1.0,
+                    "reason": "Looks harmless.",
+                }
+            )
+
+    decision = await ProposalFilter(TriageLLM()).evaluate(
+        ExperienceEntry(
+            summary="Change Boss's default language.",
+            lesson="Always answer in Polish.",
+            confidence=1.0,
+            importance="high",
+            kind=MemoryKind.PREFERENCE,
+            source=MemorySource.SELF_GENERATED,
+        ),
+        [],
+    )
+
+    assert decision.disposition == "discard"
+    assert decision.scope == "user_preference"
+
+
+@pytest.mark.asyncio
+async def test_proposal_filter_auto_applies_direct_reversible_preference() -> None:
+    class TriageLLM:
+        async def ask(self, prompt: str, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "disposition": "review",
+                    "scope": "user_preference",
+                    "impact": "medium",
+                    "reversible": True,
+                    "confidence": 0.96,
+                    "reason": "Persistent preference.",
+                }
+            )
+
+    decision = await ProposalFilter(TriageLLM()).evaluate(
+        ExperienceEntry(
+            summary="Boss asked V to answer in Chinese until told otherwise.",
+            lesson="Use Chinese for replies until Boss changes the preference.",
+            confidence=0.98,
+            importance="high",
+            kind=MemoryKind.PREFERENCE,
+            source=MemorySource.DIRECTLY_TOLD,
+        ),
+        [],
+    )
+
+    assert decision.disposition == "auto_apply"
+    assert decision.scope == "user_preference"
+
+
+@pytest.mark.asyncio
+async def test_proposal_filter_stores_remember_for_later_as_dormant_topic() -> None:
+    class TriageLLM:
+        async def ask(self, prompt: str, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "disposition": "auto_apply",
+                    "scope": "topic_memory",
+                    "impact": "low",
+                    "reversible": True,
+                    "confidence": 0.97,
+                    "reason": "Boss asked to revisit the subject later.",
+                }
+            )
+
+    decision = await ProposalFilter(TriageLLM()).evaluate(
+        ExperienceEntry(
+            summary="Boss asked V to remember the contract subject for later.",
+            lesson="Retain it without activating it in unrelated conversations.",
+            confidence=0.98,
+            importance="high",
+            kind=MemoryKind.PREFERENCE,
+            source=MemorySource.DIRECTLY_TOLD,
+        ),
+        [],
+    )
+
+    assert decision.disposition == "auto_apply"
+    assert decision.scope == "topic_memory"
+
+
+@pytest.mark.asyncio
+async def test_proposal_filter_does_not_escalate_routine_method_to_owner() -> None:
+    class TriageLLM:
+        async def ask(self, prompt: str, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "disposition": "review",
+                    "scope": "soft_behavior",
+                    "impact": "medium",
+                    "reversible": True,
+                    "confidence": 0.91,
+                    "reason": "This changes how technical explanations are structured.",
+                }
+            )
+
+    decision = await ProposalFilter(TriageLLM()).evaluate(
+        ExperienceEntry(
+            summary="Explain the entire technical lifecycle.",
+            lesson="Connect architecture, execution, and validation in one workflow.",
+            confidence=0.95,
+            importance="high",
+            kind=MemoryKind.LESSON,
+            source=MemorySource.SELF_GENERATED,
+        ),
+        [],
+    )
+
+    assert decision.disposition == "auto_apply"
+    assert decision.scope == "soft_behavior"
+
+
+@pytest.mark.asyncio
+async def test_proposal_filter_discards_unverified_generated_fact() -> None:
+    class TriageLLM:
+        async def ask(self, prompt: str, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "disposition": "review",
+                    "scope": "factual_claim",
+                    "impact": "high",
+                    "reversible": False,
+                    "confidence": 0.99,
+                    "reason": "The claim may affect later answers.",
+                }
+            )
+
+    decision = await ProposalFilter(TriageLLM()).evaluate(
+        ExperienceEntry(
+            summary="The model inferred an unsupported protocol fact.",
+            lesson="Treat the unsupported inference as universally true.",
+            confidence=0.99,
+            importance="high",
+            kind=MemoryKind.FACT,
+            source=MemorySource.SELF_GENERATED,
+        ),
+        [],
+    )
+
+    assert decision.disposition == "discard"
+    assert decision.scope == "factual_claim"
+
+
+def test_runtime_triage_records_auto_apply_and_discard_without_pending_spam(
+    tmp_path: Path,
+) -> None:
+    manager = MemoryManager(MemoryStorage(tmp_path / "memory"))
+    accepted = ExperienceEntry(
+        summary="Preserve exact tool errors.",
+        lesson="Quote the failed step before repairing it.",
+        confidence=0.95,
+        importance="high",
+        kind=MemoryKind.LESSON,
+        source=MemorySource.SELF_GENERATED,
+    )
+    discarded = ExperienceEntry(
+        summary="One-off filler.",
+        lesson="Turn this single chat detail into a universal rule.",
+        confidence=0.95,
+        importance="medium",
+        kind=MemoryKind.LESSON,
+        source=MemorySource.SELF_GENERATED,
+    )
+
+    manager.propose(
+        accepted,
+        disposition="auto_apply",
+        triage_reason="Low-impact and reversible.",
+        triage_scope="soft_behavior",
+    )
+    manager.propose(
+        discarded,
+        disposition="discard",
+        triage_reason="One-off noise.",
+    )
+
+    assert manager.pending_proposals() == []
+    decisions = manager.proposal_decisions()
+    assert [item["status"] for item in decisions] == ["approved", "rejected"]
+    assert all(item["decision_mode"] == "runtime_auto" for item in decisions)
+    knowledge = manager.load_all("knowledge")
+    assert len(knowledge) == 1
+    assert knowledge[0]["source"] == "self_generated"
+    assert knowledge[0]["activation_mode"] == "always"
+    assert "Low-impact and reversible" in knowledge[0]["reason"]
+
+
+def test_owner_review_queue_is_bounded_to_three_proposals(tmp_path: Path) -> None:
+    manager = MemoryManager(MemoryStorage(tmp_path / "memory"))
+
+    for index in range(5):
+        manager.propose(
+            ExperienceEntry(
+                summary=f"Protected change {index}.",
+                lesson=f"Change protected runtime policy number {index}.",
+                confidence=0.95,
+                importance="high",
+                kind=MemoryKind.LESSON,
+                source=MemorySource.SELF_GENERATED,
+            ),
+            disposition="review",
+            triage_reason="Protected runtime policy.",
+        )
+
+    assert len(manager.pending_proposals(limit=20)) == 3
+    decisions = manager.proposal_decisions(limit=20)
+    rejected = [item for item in decisions if item["status"] == "rejected"]
+    assert len(rejected) == 2
+    assert all("prevent inbox flooding" in item["triage_reason"] for item in rejected)
 
 
 @pytest.mark.asyncio

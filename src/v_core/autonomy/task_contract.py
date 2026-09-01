@@ -78,6 +78,10 @@ _USE_CREATED_TOOL = re.compile(
     r"(?:(?:new|newly\s+created|created)\s+)?tool|"
     r"a\s+nastepnie\s+uzyj|a\s+następnie\s+użyj|potem\s+uzyj|"
     r"potem\s+użyj|uzyj\s+go|użyj\s+go|"
+    r"(?:show|give|present|demonstrate)\s+(?:me\s+)?(?:the\s+)?"
+    r"(?:result|results|output|demo)|"
+    r"(?:pokaz|pokaż|przedstaw|podaj)\s+(?:mi\s+)?(?:jego\s+|jej\s+)?"
+    r"(?:rezultat\w*|wynik\w*|dzialani\w*|działani\w*)|"
     r"a\s+nast[eę]pnie\s+(?:wykonaj|uruchom)|"
     r"potem\s+(?:wykonaj|uruchom)|(?:wykonaj|uruchom)\s+(?:go|je))\b",
     re.IGNORECASE,
@@ -1037,7 +1041,7 @@ class TaskContract:
                     else " Validation passed in the offline sandbox."
                 )
                 return (
-                    f"Done. PALADYN built the contract, validated, and activated "
+                    f"Done. PALADYN built the generated tool, validated, and activated "
                     f"`{payload['name']}` from the generated source."
                     + test_report
                 )

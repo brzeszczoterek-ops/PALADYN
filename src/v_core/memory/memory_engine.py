@@ -9,6 +9,7 @@ from .summary import Summary
 from .knowledge import Knowledge
 from .manager import MemoryManager
 from .models import MemoryKind, MemorySource
+from .proposal_filter import ProposalFilter
 
 from ..relationship import (
     RelationshipStorage,
@@ -28,6 +29,7 @@ class MemoryEngine:
         manager: MemoryManager,
         relationship_updater: RelationshipUpdater,
         relationship_storage: RelationshipStorage,
+        proposal_filter: ProposalFilter | None = None,
     ):
 
         self.session = session
@@ -36,6 +38,7 @@ class MemoryEngine:
         self.summary = summary
         self.knowledge = knowledge
         self.manager = manager
+        self.proposal_filter = proposal_filter
 
         self.relationship_updater = relationship_updater
         self.relationship_storage = relationship_storage
@@ -129,7 +132,23 @@ class MemoryEngine:
                     and experience.source is not MemorySource.VERIFIED
                 )
             ):
-                self.manager.propose(experience)
+                disposition = "review"
+                triage_reason = "No proposal filter was configured."
+                triage_scope = "unclear"
+                if self.proposal_filter is not None:
+                    triage = await self.proposal_filter.evaluate(
+                        experience,
+                        self.manager.proposal_decisions(limit=24),
+                    )
+                    disposition = triage.disposition
+                    triage_reason = triage.reason
+                    triage_scope = triage.scope
+                self.manager.propose(
+                    experience,
+                    disposition=disposition,
+                    triage_reason=triage_reason,
+                    triage_scope=triage_scope,
+                )
                 return experience
 
             stored_experience = self.manager.remember(

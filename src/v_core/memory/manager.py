@@ -21,6 +21,9 @@ from .models import (
 from .storage import MemoryStorage
 
 
+_MAX_PENDING_PROPOSALS = 3
+
+
 def clip_text(value: object, max_chars: int) -> str:
     """Bound untrusted memory evidence without losing both ends of the text."""
 
@@ -180,8 +183,15 @@ class MemoryManager:
             ),
         )
 
-    def propose(self, experience: ExperienceEntry) -> Path | None:
-        """Quarantine a useful model-derived suggestion pending approval."""
+    def propose(
+        self,
+        experience: ExperienceEntry,
+        *,
+        disposition: str = "review",
+        triage_reason: str = "",
+        triage_scope: str = "",
+    ) -> Path | None:
+        """Persist a triaged suggestion and promote only soft auto-approvals."""
 
         if experience.importance not in {"medium", "high"}:
             return None
@@ -195,21 +205,65 @@ class MemoryManager:
         if not suggestion:
             return None
         normalized = " ".join(suggestion.casefold().split())
-        for existing in self.load_all("proposals"):
-            if not isinstance(existing, dict) or existing.get("status") != "pending":
+        if disposition not in {"auto_apply", "review", "discard"}:
+            raise ValueError("invalid proposal disposition")
+        existing_proposals = self.load_all("proposals")
+        for existing in existing_proposals:
+            if not isinstance(existing, dict):
                 continue
             old = " ".join(str(existing.get("suggestion", "")).casefold().split())
             if old == normalized:
                 return None
+        if disposition == "review":
+            pending_count = sum(
+                1
+                for existing in existing_proposals
+                if isinstance(existing, dict) and existing.get("status") == "pending"
+            )
+            if pending_count >= _MAX_PENDING_PROPOSALS:
+                disposition = "discard"
+                queue_reason = (
+                    "Owner review queue already contains three unresolved proposals; "
+                    "the new model suggestion was suppressed to prevent inbox flooding."
+                )
+                triage_reason = " ".join(
+                    part for part in (str(triage_reason).strip(), queue_reason) if part
+                )
+        now = datetime.now(UTC).isoformat()
+        status = {
+            "auto_apply": "approved",
+            "review": "pending",
+            "discard": "rejected",
+        }[disposition]
+        mode = "runtime_auto" if disposition != "review" else "owner_review"
         proposal = ProposalEntry(
             title=(experience.summary or experience.lesson)[:160],
             suggestion=suggestion,
-            reason="Model-generated lesson awaiting owner validation.",
+            reason=(
+                "Model-generated lesson awaiting owner validation."
+                if disposition == "review"
+                else "Model-generated lesson processed by runtime triage."
+            ),
             confidence=float(experience.confidence),
             kind=experience.kind,
             source=experience.source,
+            status=status,
+            decided_at="" if status == "pending" else now,
+            decision_mode=mode,
+            triage_reason=str(triage_reason)[:300],
+            triage_scope=str(triage_scope)[:80],
         )
-        return self.remember("proposals", proposal)
+        path = self.remember("proposals", proposal)
+        if path is not None and status == "approved":
+            self._promote_proposal(
+                {
+                    **asdict(proposal),
+                    "kind": proposal.kind.value,
+                    "source": proposal.source.value,
+                },
+                owner_approved=False,
+            )
+        return path
 
     def pending_proposals(self, *, limit: int = 12) -> list[dict[str, Any]]:
         pending = [
@@ -218,6 +272,24 @@ class MemoryManager:
             if isinstance(item, dict) and item.get("status") == "pending"
         ]
         return pending[-max(0, limit):]
+
+    def proposal_decisions(self, *, limit: int = 24) -> list[dict[str, Any]]:
+        """Return bounded prior dispositions as evidence for adaptive triage."""
+
+        decided = [
+            {
+                "timestamp": str(item.get("decided_at") or item.get("timestamp", "")),
+                "suggestion": str(item.get("suggestion", ""))[:1_000],
+                "status": str(item.get("status", "")),
+                "decision_mode": str(item.get("decision_mode", "owner_legacy")),
+                "triage_reason": str(item.get("triage_reason", ""))[:300],
+                "triage_scope": str(item.get("triage_scope", ""))[:80],
+            }
+            for item in self.load_all("proposals")
+            if isinstance(item, dict)
+            and item.get("status") in {"approved", "rejected"}
+        ]
+        return decided[-max(0, limit):]
 
     def decide_proposal(self, proposal_id: str, *, approve: bool) -> dict[str, Any]:
         proposal_id = str(proposal_id).strip()
@@ -241,24 +313,57 @@ class MemoryManager:
             raise ValueError("proposal is no longer pending")
         payload["status"] = "approved" if approve else "rejected"
         payload["decided_at"] = datetime.now(UTC).isoformat()
+        payload["decision_mode"] = "owner"
         self.storage.save("proposals", path.name, payload)
         if approve:
-            try:
-                kind = MemoryKind(str(payload.get("kind", "lesson")))
-            except ValueError:
-                kind = MemoryKind.LESSON
-            self.remember(
-                "knowledge",
-                KnowledgeEntry(
-                    title=str(payload.get("title", "Approved proposal"))[:160],
-                    content=str(payload.get("suggestion", ""))[:2_000],
-                    reason="Explicitly approved by Boss from the proposal inbox.",
-                    confidence=1.0,
-                    kind=kind,
-                    source=MemorySource.DIRECTLY_TOLD,
-                ),
-            )
+            self._promote_proposal(payload, owner_approved=True)
         return payload
+
+    def _promote_proposal(
+        self,
+        payload: dict[str, Any],
+        *,
+        owner_approved: bool,
+    ) -> Path | None:
+        try:
+            kind = MemoryKind(str(payload.get("kind", "lesson")))
+        except ValueError:
+            kind = MemoryKind.LESSON
+        if owner_approved:
+            source = MemorySource.DIRECTLY_TOLD
+            reason = "Explicitly approved by Boss from the proposal inbox."
+            confidence = 1.0
+        else:
+            try:
+                source = MemorySource(str(payload.get("source", "self_generated")))
+            except ValueError:
+                source = MemorySource.SELF_GENERATED
+            reason = (
+                "Automatically accepted as a low-impact, reversible soft lesson. "
+                + str(payload.get("triage_reason", ""))[:300]
+            ).strip()
+            confidence = min(0.95, float(payload.get("confidence", 0.0)))
+        triage_scope = str(payload.get("triage_scope", "")).strip()
+        activation_mode = (
+            "always"
+            if (
+                kind is MemoryKind.PREFERENCE and triage_scope != "topic_memory"
+            )
+            or triage_scope in {"soft_behavior", "relationship_context"}
+            else "on_recall"
+        )
+        return self.remember(
+            "knowledge",
+            KnowledgeEntry(
+                title=str(payload.get("title", "Approved proposal"))[:160],
+                content=str(payload.get("suggestion", ""))[:2_000],
+                reason=reason,
+                confidence=confidence,
+                kind=kind,
+                source=source,
+                activation_mode=activation_mode,
+            ),
+        )
 
     def latest(
         self,

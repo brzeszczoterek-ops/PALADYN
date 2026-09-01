@@ -129,6 +129,8 @@ class Agent:
 
         # A turn-level language request must never leak into the next turn.
         self._response_language_override = ""
+        self._memory_recall_requested = False
+        self._memory_recall_query = ""
 
         # Visible user work always has priority over best-effort background
         # reflection from the previous turn.
@@ -913,6 +915,7 @@ Current relationship stage: {stage}.
         routing_prompt = prompt
         semantic_intent: SemanticIntent | None = None
         semantic_failure_reason = ""
+        semantic_classification_attempted = False
         preferred_web_query = ""
         preferred_web_target = extract_web_target(prompt) or ""
         inherited_contract: TaskContract | None = None
@@ -938,6 +941,7 @@ Current relationship stage: {stage}.
                 or not self._contract_has_execution_route(contract)
             )
         ):
+            semantic_classification_attempted = True
             try:
                 semantic_intent = await classify_intent(
                     prompt,
@@ -954,11 +958,12 @@ Current relationship stage: {stage}.
                         {"error": f"{type(error).__name__}: {error}"[:2_000]},
                     )
             else:
+                if semantic_intent is None:
+                    semantic_failure_reason = str(
+                        getattr(intent_router, "last_failure_reason", "")
+                    )
                 if trace is not None:
                     if semantic_intent is None:
-                        semantic_failure_reason = str(
-                            getattr(intent_router, "last_failure_reason", "")
-                        )
                         trace.record_event(
                             "semantic_intent_unparsed",
                             {
@@ -1000,6 +1005,11 @@ Current relationship stage: {stage}.
                                     semantic_intent.distinct_detail_page
                                 ),
                                 "artifact_fallback": semantic_intent.artifact_fallback,
+                                "execute_created_artifact": (
+                                    semantic_intent.execute_created_artifact
+                                ),
+                                "recall_memory": semantic_intent.recall_memory,
+                                "memory_query": semantic_intent.memory_query,
                                 "required_public_fields": list(
                                     semantic_intent.required_public_fields
                                 ),
@@ -1034,6 +1044,32 @@ Current relationship stage: {stage}.
         if semantic_intent is not None:
             self._apply_language_intent(semantic_intent, trace)
 
+        if (
+            semantic_classification_attempted
+            and semantic_intent is None
+            and semantic_failure_reason != "current_message_grounding"
+            and not lexical_continuation
+            and not deterministic_action
+            and not self._contract_has_execution_route(prompt_contract)
+        ):
+            # A malformed semantic JSON response cannot promote an ordinary
+            # conversation into the tool executor. This is a fail-closed chat
+            # fallback: no tools are exposed and no action is invented.
+            if trace is not None:
+                trace.record_event(
+                    "compact_chat_selected",
+                    {
+                        "reason": "semantic_parser_failed_non_action_fallback",
+                        "classification_failure": semantic_failure_reason,
+                    },
+                )
+            return await self._run_light_chat(
+                prompt,
+                on_token,
+                trace=trace,
+                remember=True,
+            )
+
         if semantic_intent is not None and self._reference_requires_missing_dialogue(
             semantic_intent,
             prompt,
@@ -1052,6 +1088,7 @@ Current relationship stage: {stage}.
             and not semantic_intent.action_requested
             and not semantic_intent.continue_previous
             and not semantic_intent.capabilities
+            and not semantic_intent.recall_memory
         ):
             if trace is not None:
                 trace.record_event(
@@ -1165,10 +1202,19 @@ Current relationship stage: {stage}.
             inherited_contract = TaskContract.from_dict(
                 continued_context.get("requirements")
             )
-            contract = contract.merged(inherited_contract)
             previous_objective = str(
                 continued_context.get("objective", "")
             ).strip()
+            # Re-derive structural requirements from the durable objective as
+            # well as loading its checkpoint. This upgrades older checkpoints
+            # after PALADYN learns a stronger language-independent completion
+            # rule (for example, "create it and show results" also requires
+            # executing the created tool).
+            if previous_objective:
+                inherited_contract = inherited_contract.merged(
+                    TaskContract.from_prompt(previous_objective)
+                )
+            contract = contract.merged(inherited_contract)
             if previous_objective:
                 routing_prompt = f"{previous_objective}\n\nFollow-up: {prompt}"
         elif lexical_continuation or bool(
@@ -1201,6 +1247,12 @@ Current relationship stage: {stage}.
                     },
                 )
 
+        self._memory_recall_requested = bool(
+            semantic_intent and semantic_intent.recall_memory
+        )
+        self._memory_recall_query = (
+            semantic_intent.memory_query if semantic_intent is not None else ""
+        )
         system_prompt = self._build_system_prompt(
             prompt,
             agent_mode=False,
@@ -2798,7 +2850,11 @@ Current relationship stage: {stage}.
                             "contract": (
                                 "generated_tool_execution"
                                 if contract.requires_created_tool_execution
-                                else "first_heading"
+                                else (
+                                    "generated_tool_validation"
+                                    if contract.requires_created_tool
+                                    else "first_heading"
+                                )
                             )
                         },
                     )
@@ -3901,7 +3957,15 @@ Current relationship stage: {stage}.
         prompt: str,
         *,
         agent_mode: bool,
+        recall_memory: bool | None = None,
+        memory_query: str | None = None,
     ) -> str:
+        if recall_memory is None:
+            recall_memory = bool(
+                getattr(self, "_memory_recall_requested", False)
+            )
+        if memory_query is None:
+            memory_query = str(getattr(self, "_memory_recall_query", ""))
         sections = [
             self.llm.config.system_prompt,
             "=== V PERSONA ===",
@@ -3909,7 +3973,11 @@ Current relationship stage: {stage}.
                 self.memory.relationship_state
             ),
             "=== V MEMORY CONTEXT ===",
-            self._build_persona_context(prompt).render(),
+            self._build_persona_context(
+                prompt,
+                recall_memory=recall_memory,
+                memory_query=memory_query,
+            ).render(),
         ]
 
         sections.extend(
@@ -5780,7 +5848,9 @@ schemas, validate it in quarantine, and activate it only after the checks pass.
             r"message|email|open|visit|download|upload)\b",
             r"\b(?:i'm|i am|we're|we are)\s+(?:now\s+)?using\s+"
             r"(?:a|an|the)?\s*(?:remote\s+desktop|exploit|payload|tool)\b",
-            r"\b(?:currently|still)\s+(?:working|running|processing|extracting|"
+            r"(?:^|[.!?]\s+)(?:(?:i'm|i am|we're|we are|"
+            r"(?:the\s+)?(?:work|task|scan|search|extraction|analysis|it)\s+is)\s+)?"
+            r"(?:currently|still)\s+(?:working|running|processing|extracting|"
             r"mining|gathering)\b",
             r"\b(?:work is in progress|already working on it|"
             r"report back (?:soon|later|shortly))\b",
@@ -6389,6 +6459,9 @@ swear mechanically. Output only the rewritten answer.
     def _build_persona_context(
         self,
         prompt: str,
+        *,
+        recall_memory: bool = False,
+        memory_query: str = "",
     ) -> PersonaContext:
 
         context = PersonaContext(
@@ -6411,11 +6484,14 @@ swear mechanically. Output only the rewritten answer.
             self.memory.relationship_state
         )
 
-        for item in relationship.shared_history[-12:]:
-
-            context.add_remembered_event(
-                str(item)
+        if recall_memory:
+            selected_history = self._select_recalled_texts(
+                relationship.shared_history,
+                memory_query or prompt,
+                limit=4,
             )
+            for item in selected_history:
+                context.add_remembered_event(str(item))
 
         #
         # Long-term knowledge
@@ -6433,7 +6509,17 @@ swear mechanically. Output only the rewritten answer.
 
             knowledge_entries = []
 
-        for entry in knowledge_entries[-8:]:
+        active_knowledge = [
+            entry
+            for entry in knowledge_entries
+            if self._memory_entry_is_active(
+                entry,
+                recall_memory=recall_memory,
+                memory_query=memory_query or prompt,
+            )
+        ]
+
+        for entry in active_knowledge[-8:]:
 
             self._add_memory_entry(
                 context,
@@ -6456,7 +6542,14 @@ swear mechanically. Output only the rewritten answer.
 
             experience_entries = []
 
-        for entry in experience_entries[-8:]:
+        active_experiences = [
+            entry
+            for entry in experience_entries
+            if recall_memory
+            and self._memory_text_matches(entry, memory_query or prompt)
+        ]
+
+        for entry in active_experiences[-8:]:
 
             self._add_memory_entry(
                 context,
@@ -6464,6 +6557,71 @@ swear mechanically. Output only the rewritten answer.
             )
 
         return context
+
+    @staticmethod
+    def _memory_match_tokens(value: object) -> set[str]:
+        stopwords = {
+            "about", "after", "again", "always", "because", "boss", "could",
+            "current", "future", "information", "lesson", "model", "paladyn",
+            "should", "specific", "task", "that", "their", "there", "these",
+            "this", "tool", "tools", "using", "when", "where", "which", "with",
+        }
+        return {
+            token[:9]
+            for token in re.findall(r"[^\W_]+", str(value).casefold(), re.UNICODE)
+            if len(token) >= 4 and token not in stopwords
+        }
+
+    @classmethod
+    def _memory_text_matches(cls, entry: Any, query: str) -> bool:
+        data = cls._normalize_entry(entry)
+        if not data:
+            return False
+        text = " ".join(
+            str(data.get(field, ""))
+            for field in ("title", "content", "summary", "lesson")
+        )
+        query_tokens = cls._memory_match_tokens(query)
+        return bool(query_tokens and query_tokens & cls._memory_match_tokens(text))
+
+    @classmethod
+    def _memory_entry_is_active(
+        cls,
+        entry: Any,
+        *,
+        recall_memory: bool,
+        memory_query: str,
+    ) -> bool:
+        data = cls._normalize_entry(entry)
+        if not data:
+            return False
+        kind = str(data.get("kind", "")).casefold()
+        activation_mode = str(data.get("activation_mode", "on_recall")).casefold()
+        if activation_mode == "always":
+            return True
+        if "activation_mode" not in data and kind == "preference":
+            # Backward compatibility for stable preferences written before
+            # activation metadata existed.
+            return True
+        return recall_memory and cls._memory_text_matches(data, memory_query)
+
+    @classmethod
+    def _select_recalled_texts(
+        cls,
+        values: list[str],
+        query: str,
+        *,
+        limit: int,
+    ) -> list[str]:
+        query_tokens = cls._memory_match_tokens(query)
+        if not query_tokens:
+            return values[-limit:]
+        matched = [
+            value
+            for value in values
+            if query_tokens & cls._memory_match_tokens(value)
+        ]
+        return matched[-limit:]
 
     @staticmethod
     def _add_memory_entry(
@@ -6513,10 +6671,12 @@ swear mechanically. Output only the rewritten answer.
             )
         ).strip().lower()
 
-        # Model-authored reflections are proposal candidates, never active
-        # persona instructions. Approved proposals re-enter knowledge with a
-        # directly_told provenance and are therefore visible here.
-        if source == "self_generated":
+        activation_mode = str(data.get("activation_mode", "on_recall")).casefold()
+
+        # A self-generated reflection is dormant by default. Runtime-triaged
+        # generic soft learning may be active, while topic memory is supplied
+        # only by the explicit recall selector above.
+        if source == "self_generated" and activation_mode != "always":
             return
 
         confidence = Agent._confidence(
