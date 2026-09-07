@@ -35,6 +35,8 @@ class UIRuntime:
     shutdown_callback: Callable[[], None] | None = None
     chat_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     speech_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    active_chat_task: asyncio.Task[Any] | None = None
+    closing: bool = False
     speech: SpeechRuntime | None = None
     activity_sample: dict[str, Any] = field(default_factory=dict)
 
@@ -112,7 +114,16 @@ class UIRuntime:
             self.speech = SpeechRuntime(SpeechConfig.load(self.config.voice_root))
         return self.speech
 
+    async def cancel_active_chat(self) -> None:
+        self.closing = True
+        task = self.active_chat_task
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
     async def close(self) -> None:
+        await self.cancel_active_chat()
         if self.speech is not None:
             with suppress(Exception):
                 await self.speech.close()
@@ -151,6 +162,8 @@ def create_app(runtime: UIRuntime) -> Starlette:
         denied = runtime.require_token(request)
         if denied is not None:
             return denied
+        if runtime.closing:
+            return JSONResponse({"error": "V is shutting down"}, status_code=503)
         if runtime.chat_lock.locked():
             return JSONResponse({"error": "V is already working"}, status_code=409)
         try:
@@ -198,12 +211,16 @@ def create_app(runtime: UIRuntime) -> Starlette:
                             await queue.put({"type": "speech", "state": "complete"})
                     await queue.put({"type": "done", "answer": answer})
                 except asyncio.CancelledError:
+                    await queue.put(
+                        {"type": "error", "error": "V is shutting down"}
+                    )
                     raise
                 except Exception as exc:
                     await queue.put({"type": "error", "error": str(exc)})
 
             async with runtime.chat_lock:
                 task = asyncio.create_task(execute())
+                runtime.active_chat_task = task
                 yield _ndjson({"type": "started"})
                 try:
                     while True:
@@ -216,6 +233,8 @@ def create_app(runtime: UIRuntime) -> Starlette:
                         task.cancel()
                     with suppress(asyncio.CancelledError):
                         await task
+                    if runtime.active_chat_task is task:
+                        runtime.active_chat_task = None
 
         return StreamingResponse(
             stream(),
@@ -254,6 +273,7 @@ def create_app(runtime: UIRuntime) -> Starlette:
             return denied
         if runtime.shutdown_callback is None:
             return JSONResponse({"error": "shutdown controller unavailable"}, status_code=503)
+        await runtime.cancel_active_chat()
         asyncio.get_running_loop().call_later(0.15, runtime.shutdown_callback)
         return JSONResponse({"status": "shutting_down"})
 

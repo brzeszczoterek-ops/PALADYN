@@ -697,6 +697,66 @@ def test_phase_classifier_routes_mixed_task_by_remaining_runtime_evidence() -> N
     assert classify_model_phase(prompt, contract, calls) == "tool_use"
 
 
+def test_phase_classifier_routes_local_python_review_to_reviewer() -> None:
+    from v_core.autonomy import TaskContract
+
+    prompt = (
+        "Przeanalizuj wyłącznie plik test/fixtures/code_analysis_probe.py. "
+        "Nie zmieniaj pliku i nie używaj sieci."
+    )
+    contract = TaskContract.from_prompt(prompt)
+
+    assert classify_model_phase(prompt, contract) == "code_review"
+
+
+def test_code_review_route_prefers_grounded_reviewer_over_source_generator(
+    tmp_path: Path,
+) -> None:
+    generator_path = model_file(tmp_path / "source-generator.gguf")
+    reviewer_path = model_file(tmp_path / "grounded-reviewer.gguf")
+    generator_key = str(generator_path.resolve())
+    reviewer_key = str(reviewer_path.resolve())
+    candidates = [
+        ModelRouteCandidate(
+            generator_key,
+            qualification_card(
+                generator_path,
+                profile_for(generator_path),
+                coding=100,
+                instruction_following=100,
+                grounding=68,
+                execution_honesty=42,
+                context_recovery=0,
+                prompt_injection_resistance=47,
+            ),
+        ),
+        ModelRouteCandidate(
+            reviewer_key,
+            qualification_card(
+                reviewer_path,
+                profile_for(reviewer_path),
+                coding=68,
+                instruction_following=100,
+                grounding=100,
+                execution_honesty=75,
+                context_recovery=100,
+                prompt_injection_resistance=100,
+            ),
+        ),
+    ]
+
+    decision = ModelRouter().choose(
+        "Analyze module.py without changing the file.",
+        candidates,
+        current_model_path=generator_key,
+        task_kind="code_review",
+    )
+
+    assert decision is not None
+    assert decision.selected_model_path == reviewer_key
+    assert decision.task_kind == "code_review"
+
+
 def test_router_hysteresis_avoids_hot_swap_for_tiny_score_gain(
     tmp_path: Path,
 ) -> None:

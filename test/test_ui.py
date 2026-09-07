@@ -341,6 +341,22 @@ def test_ui_shutdown_uses_server_callback() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "shutting_down"}
+    assert runtime.closing is True
+
+
+def test_ui_runtime_cancels_active_chat_before_shutdown() -> None:
+    runtime = _runtime()
+
+    async def scenario() -> None:
+        runtime.active_chat_task = asyncio.create_task(asyncio.sleep(60))
+        active = runtime.active_chat_task
+
+        await runtime.cancel_active_chat()
+
+        assert runtime.closing is True
+        assert active.cancelled()
+
+    asyncio.run(scenario())
 
 
 def test_ui_runtime_close_stops_core_and_managed_model() -> None:

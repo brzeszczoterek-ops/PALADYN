@@ -525,6 +525,23 @@ def test_task_contract_detects_generic_online_work_without_explicit_url() -> Non
     ]
 
 
+def test_local_code_analysis_explicitly_disables_network() -> None:
+    prompt = (
+        "Przeanalizuj wyłącznie plik test/fixtures/code_analysis_probe.py. "
+        "Nie zmieniaj pliku i nie używaj sieci. Podaj dwa błędy wykonania."
+    )
+
+    contract = TaskContract.from_prompt(prompt)
+
+    assert TaskContract.requests_read_only(prompt)
+    assert TaskContract.disables_web(prompt)
+    assert contract.requires_file_read
+    assert not contract.requires_file_mutation
+    assert not contract.requires_browser_navigation
+    assert not contract.requires_browser_snapshot
+    assert not contract.requires_web_discovery
+
+
 def test_task_contract_routes_polish_tor_research_to_report_artifact() -> None:
     contract = TaskContract.from_prompt(
         "Zgromadź wszystkie wiadomości jakie dasz radę na temat cebulki, "

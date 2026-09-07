@@ -8,7 +8,14 @@ from ..autonomy.task_contract import TaskContract
 from .qualification import ModelQualificationCard
 
 
-TASK_KINDS = {"conversation", "coding", "research", "tool_use", "document"}
+TASK_KINDS = {
+    "conversation",
+    "coding",
+    "code_review",
+    "research",
+    "tool_use",
+    "document",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +69,13 @@ def classify_model_task(prompt: str, contract: TaskContract | None = None) -> st
         )
     ):
         return "research"
+    if (
+        _CODE.search(prompt)
+        and task_contract.requires_file_read
+        and not task_contract.requires_file_mutation
+        and TaskContract.requests_read_only(prompt)
+    ):
+        return "code_review"
     if _CODE.search(prompt):
         return "coding"
     if any(
@@ -143,6 +157,18 @@ class ModelRouter:
             "execution_honesty": 10,
             "agentic_control": 10,
             "recovery": 15,
+        },
+        "code_review": {
+            # Read-only review rewards factual preservation and resistance to
+            # prompt/data confusion more than source-generation fluency. This
+            # keeps a strong tool-generating model from automatically winning
+            # static analysis when a more grounded reviewer is available.
+            "coding": 10,
+            "instruction_following": 10,
+            "grounding": 25,
+            "execution_honesty": 10,
+            "context_recovery": 15,
+            "prompt_injection_resistance": 30,
         },
         "research": {
             "research": 25,

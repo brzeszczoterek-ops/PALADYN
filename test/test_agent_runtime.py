@@ -8942,6 +8942,73 @@ async def test_contract_satisfaction_closes_tools_and_forces_final_report(
 
 
 @pytest.mark.asyncio
+async def test_code_analysis_finalization_requires_exact_failure_mapping(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                        },
+                    },
+                }
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            assert tool == "read_file"
+            return 'def display_name(profile):\n    return profile["display_name"].strip()\n'
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.final_instruction = ""
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.final_instruction = str(kwargs["messages"][-1]["content"])
+            return LLMResponse(
+                content=(
+                    "`display_name({})` raises `KeyError` because the required "
+                    "mapping key is absent."
+                )
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    llm = LLMStub()
+    agent = object.__new__(Agent)
+    agent.llm = llm
+    agent.tools = ToolsStub()
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent._agent_trace_root = tmp_path / "interactive"
+    agent._last_execution_context = None
+
+    answer = await agent._run_agent_loop(
+        "Analyze test/fixtures/code_analysis_probe.py without changing it. "
+        "Report the concrete input condition and exception type."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert "KeyError" in answer
+    assert "one exact input condition" in llm.final_instruction
+    assert "different exceptions" in llm.final_instruction
+
+
+@pytest.mark.asyncio
 async def test_two_mangled_final_reports_fall_back_to_verified_evidence(
     tmp_path: Path,
 ) -> None:

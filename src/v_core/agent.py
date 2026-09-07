@@ -70,6 +70,38 @@ class _ContinueAgentBatch(Exception):
 class Agent:
 
     MAX_AGENT_STEPS = 32
+    READ_ONLY_TOOL_NAMES = frozenset(
+        {
+            "read_file",
+            "file_read",
+            "list_directory",
+            "directory_tree",
+            "get_file_info",
+            "search_files",
+            "memory_recall",
+            "learning_list_artifacts",
+            "runtime_review_task",
+        }
+    )
+    READ_ONLY_WEB_TOOL_NAMES = frozenset(
+        {"web_read", "web_search", "browser_snapshot"}
+    )
+    NETWORK_TOOL_NAMES = frozenset(
+        {
+            "web_read",
+            "web_search",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_find",
+            "browser_click",
+            "browser_press_key",
+            "browser_type",
+            "full_tor_search",
+            "full_tor_fetch",
+            "full_tor_browser_inventory",
+            "full_tor_browser_close",
+        }
+    )
 
     def __init__(
         self,
@@ -1586,7 +1618,27 @@ Current relationship stage: {stage}.
             if inherited_contract is not None:
                 contract = contract.merged(inherited_contract)
             capability_hints.clear()
-            contract = contract.with_required_tools(explicitly_named_tools)
+            required_explicit_tools = tuple(explicitly_named_tools)
+            if TaskContract.requests_read_only(prompt):
+                contract = contract.without_mutations()
+                allowed_read_only = self.READ_ONLY_TOOL_NAMES
+                if not TaskContract.disables_web(prompt):
+                    allowed_read_only = (
+                        allowed_read_only | self.READ_ONLY_WEB_TOOL_NAMES
+                    )
+                required_explicit_tools = tuple(
+                    name
+                    for name in required_explicit_tools
+                    if name in allowed_read_only
+                )
+            if TaskContract.disables_web(prompt):
+                contract = contract.without_web()
+                required_explicit_tools = tuple(
+                    name
+                    for name in required_explicit_tools
+                    if name not in self.NETWORK_TOOL_NAMES
+                )
+            contract = contract.with_required_tools(required_explicit_tools)
             if trace is not None:
                 trace.set_requirements(contract.to_dict())
         tool_definitions = self._select_tool_definitions(
@@ -1677,7 +1729,7 @@ Current relationship stage: {stage}.
         consecutive_recoverable_tool_failures = 0
         tool_fallback_exhausted = False
         latest_browser_snapshot_text = ""
-        routed_phase = classify_model_phase(prompt, prompt_contract)
+        routed_phase = classify_model_phase(prompt, contract)
 
         def evidence_ledger() -> list[dict[str, Any]]:
             return sorted(
@@ -1916,6 +1968,10 @@ Current relationship stage: {stage}.
                             "source labels and quote copied excerpts verbatim. Do not "
                             "rename an observed identifier as a checksum or a test "
                             "result without evidence of that meaning. "
+                            "For code analysis, map each reported failure to one exact "
+                            "input condition and verify that the named exception follows "
+                            "from that condition. Do not join conditions with 'or' when "
+                            "they fail through different exceptions. "
                             "This is V speaking to Boss, not a neutral audit bot: lead "
                             "with your actual verdict, keep the technical facts exact, "
                             "show sharp judgment and hacker instinct, and kill polished "
@@ -6013,13 +6069,9 @@ Rules:
         capability_hints: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         if TaskContract.requests_read_only(prompt):
-            read_only_names = {
-                "read_file", "file_read", "list_directory", "directory_tree",
-                "get_file_info", "search_files", "memory_recall",
-                "learning_list_artifacts", "runtime_review_task",
-            }
+            read_only_names = set(Agent.READ_ONLY_TOOL_NAMES)
             if not TaskContract.disables_web(prompt):
-                read_only_names.update({"web_read", "web_search", "browser_snapshot"})
+                read_only_names.update(Agent.READ_ONLY_WEB_TOOL_NAMES)
             definitions = [
                 item for item in definitions
                 if item.get("function", {}).get("name") in read_only_names
@@ -6475,6 +6527,17 @@ the artifact in quarantine, and activate it only after the checks pass.
         required_names = [
             name for name in contract.required_tools if name in missing
         ]
+        if (
+            not required_names
+            and contract.requires_file_read
+            and "read_file" in missing
+            and "read_file" in available
+        ):
+            # A single literal local path is execution data, not a planning
+            # problem. Bind it before model generation even when the owner did
+            # not spell the provider name. Ambiguous paths still return None
+            # below and are clarified rather than guessed.
+            required_names = ["read_file"]
         if len(required_names) != 1:
             return None
         name = required_names[0]
@@ -7386,7 +7449,13 @@ the artifact in quarantine, and activate it only after the checks pass.
         contract: TaskContract,
     ) -> Any:
         if (
-            tool_name not in contract.required_tools
+            (
+                tool_name not in contract.required_tools
+                and not (
+                    tool_name == "read_file"
+                    and contract.requires_file_read
+                )
+            )
             or not isinstance(arguments, dict)
         ):
             return arguments

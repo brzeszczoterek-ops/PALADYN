@@ -124,6 +124,8 @@ _USE_CREATED_TOOL = re.compile(
 _DISABLE_WEB = re.compile(
     r"\b(?:(?:do\s+not|don't|never)\s+(?:use|run|execute)\s+(?:any\s+)?(?:network|web|online)\s+tools?|"
     r"nie\s+(?:uruchamiaj|używaj|uzywaj)\s+narz[eę]dzi\s+sieciowych|"
+    r"nie\s+(?:korzystaj|używaj|uzywaj|łącz|lacz|wchodź|wchodz)\w*"
+    r"(?:\s+z)?\s+(?:internetu|sieci|webu)|"
     r"(?:do\s+not|don't|never|without)\s+"
     r"(?:live\s+)?(?:browse|browsing|contact|crawl|crawling|navigate|network|"
     r"scrape|scraping|search|visit)|"
@@ -136,7 +138,8 @@ _DISABLE_WEB = re.compile(
 _READ_ONLY = re.compile(
     r"\b(?:read[- ]only|no\s+(?:writes|modifications)|"
     r"(?:do\s+not|don't)\s+(?:write|modify|change)\s+(?:any\s+)?files|"
-    r"tylko\s+odczyt|nie\s+(?:zapisuj|modyfikuj|zmieniaj)\s+plik[oó]w)\b",
+    r"tylko\s+odczyt|nie\s+(?:zapisuj|modyfikuj|zmieniaj)\s+"
+    r"(?:tego\s+)?plik(?:u|[oó]w))\b",
     re.IGNORECASE,
 )
 
@@ -152,8 +155,9 @@ def _search_outside_quoted_text(
             return match
     return None
 _READ_FILE = re.compile(
-    r"\b(?:cat|inspect|open|read|review|show|"
-    r"odczyt\w*|otworz\w*|otwórz\w*|przeczyt\w*|przejr\w*|pokaz\w*|pokaż\w*)\b",
+    r"\b(?:analy[sz]\w*|cat|inspect|open|read|review|show|"
+    r"analiz\w*|odczyt\w*|otworz\w*|otwórz\w*|przeanaliz\w*|"
+    r"przeczyt\w*|przejr\w*|pokaz\w*|pokaż\w*)\b",
     re.IGNORECASE,
 )
 _STRONG_READ_FILE = re.compile(

@@ -60,6 +60,24 @@ def test_failed_literal_read_is_not_automatically_replayed():
     assert Agent._runtime_grounded_required_tool_request(prompt, CONTRACT, DEFINITIONS, [], failures) is None
 
 
+def test_literal_read_is_bound_when_contract_requires_capability_not_provider():
+    contract = TaskContract(requires_file_read=True, requires_evidence_report=True)
+    prompt = (
+        "Analyze test/fixtures/code_analysis_probe.py without changing it. "
+        "Do not use the network."
+    )
+
+    assert Agent._runtime_grounded_required_tool_request(
+        prompt,
+        contract,
+        DEFINITIONS,
+        [],
+    ) == (
+        "read_file",
+        {"path": "test/fixtures/code_analysis_probe.py"},
+    )
+
+
 def test_incomplete_read_report_deduplicates_missing_requirement():
     answer = Agent._incomplete_task_answer(
         ["read_file", "read_file"],
