@@ -2701,6 +2701,17 @@ def test_research_report_must_list_and_describe_requested_items() -> None:
     ) == []
 
 
+def test_multiple_test_paths_do_not_request_command_execution() -> None:
+    contract = TaskContract.from_prompt(
+        "Read test/fixtures/one.py and test/fixtures/two.py. Read-only."
+    )
+    assert contract.requires_file_read
+    assert not contract.requires_command_execution
+    assert TaskContract.from_prompt(
+        "Run the tests in test/fixtures/check.py without network."
+    ).requires_command_execution
+
+
 def test_passive_smoke_test_text_does_not_require_command_execution() -> None:
     contract = TaskContract.from_prompt(
         "Utwórz plik smoke-report.md z nagłówkiem '# PALADYN smoke test', "

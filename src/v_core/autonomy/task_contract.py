@@ -196,8 +196,15 @@ def _requests_command_execution(prompt: str) -> bool:
     distinct spans.
     """
 
-    actions = tuple(_RUN_COMMAND.finditer(prompt))
-    targets = tuple(_COMMAND_TARGET.finditer(prompt))
+    # Path components are data: two paths beneath test/ do not constitute
+    # two independent verb/noun matches authorizing command execution.
+    command_text = re.sub(
+        r"(?<![\w/.-])(?:\.?/?[\w.-]+/)+[\w.-]+",
+        " ",
+        prompt,
+    )
+    actions = tuple(_RUN_COMMAND.finditer(command_text))
+    targets = tuple(_COMMAND_TARGET.finditer(command_text))
     return any(
         action.span() != target.span()
         for action in actions
@@ -542,6 +549,7 @@ class TaskContract:
     requires_distinct_detail_page: bool = False
     minimum_detail_sources: int = 0
     requires_file_read: bool = False
+    required_read_paths: tuple[str, ...] = ()
     requires_file_mutation: bool = False
     requires_command_execution: bool = False
     requires_evidence_report: bool = False
@@ -946,6 +954,7 @@ class TaskContract:
 
         source = values if isinstance(values, dict) else {}
         tuple_fields = {
+            "required_read_paths",
             "required_tools",
             "required_capabilities",
             "required_public_fields",
@@ -1006,6 +1015,9 @@ class TaskContract:
         )
         return cls(
             **flags,
+            required_read_paths=tuple(dict.fromkeys(
+                p for p in source.get("required_read_paths", []) if isinstance(p, str) and p
+            )) if isinstance(source.get("required_read_paths", []), (list, tuple)) else (),
             minimum_detail_sources=max(
                 0,
                 min(8, int(source.get("minimum_detail_sources", 0) or 0)),
@@ -1023,6 +1035,7 @@ class TaskContract:
         """Return the union of two independently detected requirements."""
 
         tuple_fields = {
+            "required_read_paths",
             "required_tools",
             "required_capabilities",
             "required_public_fields",
@@ -1058,6 +1071,7 @@ class TaskContract:
         )
         return type(self)(
             **flags,
+            required_read_paths=tuple(dict.fromkeys((*self.required_read_paths, *other.required_read_paths))),
             minimum_detail_sources=max(
                 self.minimum_detail_sources,
                 other.minimum_detail_sources,
@@ -1293,6 +1307,15 @@ class TaskContract:
             name in {"read_file", "cat"} for name in names
         ):
             missing.append("read_file")
+
+        for path in self.required_read_paths:
+            if not any(
+                call.get("tool") in {"read_file", "file_read"}
+                and isinstance(call.get("arguments"), dict)
+                and call["arguments"].get("path") == path
+                for call in succeeded
+            ):
+                missing.append("read_file:" + path)
 
         if self.requires_file_mutation and not any(
             name in {

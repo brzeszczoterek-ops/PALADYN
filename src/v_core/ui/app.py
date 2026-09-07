@@ -17,6 +17,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from v_core.speech import SpeechConfig, SpeechRuntime
+from v_core.response_preview import response_preview
 from v_core.ui.runtime_activity import runtime_activity
 
 
@@ -191,6 +192,10 @@ def create_app(runtime: UIRuntime) -> Starlette:
                 )
 
             async def execute() -> None:
+                def preview(kind: str, text: str) -> None:
+                    queue.put_nowait({"type": kind, "text": text})
+
+                preview_token = response_preview.set(preview)
                 try:
                     answer = await runtime.core.ask(prompt, on_token=emit_token)
                     # on_token may arrive through call_soon_threadsafe; give the
@@ -217,6 +222,8 @@ def create_app(runtime: UIRuntime) -> Starlette:
                     raise
                 except Exception as exc:
                     await queue.put({"type": "error", "error": str(exc)})
+                finally:
+                    response_preview.reset(preview_token)
 
             async with runtime.chat_lock:
                 task = asyncio.create_task(execute())

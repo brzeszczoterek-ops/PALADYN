@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 from collections import Counter
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from typing import Any
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlsplit, urlunsplit
 from uuid import uuid4
@@ -27,6 +27,8 @@ from .autonomy import (
     TaskContract,
 )
 from .config import Config
+from .response_preview import response_preview
+from .autonomy.local_read_scope import literal_paths, resolve_read_scope
 from .tool_catalog_review import review_catalog
 from .llm import LLM
 from .mcp_tools import MCPTools
@@ -1442,6 +1444,44 @@ Current relationship stage: {stage}.
                     },
                 )
 
+        read_candidates = literal_paths(prompt)
+        if (
+            contract.requires_file_read
+            and not contract.requires_file_mutation
+            and len(read_candidates) > 1
+            and callable(getattr(self.llm, "ask", None))
+        ):
+            try:
+                read_scope = await resolve_read_scope(self.llm, prompt, read_candidates)
+            except Exception as error:
+                read_scope = ()
+                if trace is not None:
+                    trace.record_event("local_read_scope_failed", {"error_type": type(error).__name__})
+            if not read_scope:
+                answer = "Which of the mentioned files should I read? No files have been read."
+                if trace is not None:
+                    trace.set_requirements(contract.to_dict())
+                    trace.await_owner(
+                        reason="local read targets need clarification", step_limit=self.MAX_AGENT_STEPS,
+                        successful_tool_count=0, failed_tool_count=0, missing=["read_file"],
+                        progress_summary=None, accepted_commands=["reply with the missing information", "/stop"],
+                    )
+                    self._last_execution_context = AgentTaskTrace.latest_context(trace.root)
+                await self._remember_task(
+                    prompt, answer, execution=trace.evidence() if trace is not None else None,
+                )
+                if on_token is not None:
+                    on_token(answer)
+                return answer
+            read_scope = tuple(dict.fromkeys(
+                self._normalize_runtime_tool_arguments("read_file", {"path": path})["path"]
+                for path in read_scope
+            ))
+            contract = replace(contract, required_read_paths=read_scope)
+            prompt_contract = replace(prompt_contract, required_read_paths=read_scope)
+            if trace is not None:
+                trace.record_event("local_read_scope_bound", {"paths": list(read_scope)})
+
         if contract.requires_web_discovery:
             # The worker model may translate or shorten a query so aggressively
             # that it drops the actual subject (the observed run searched for
@@ -2060,7 +2100,17 @@ Current relationship stage: {stage}.
                 native_requests = []
                 try:
                     responder = getattr(self.llm, "respond", None)
-                    if callable(responder):
+                    preview = response_preview.get()
+                    streamer = getattr(self.llm, "stream", None)
+                    if finalization_required and preview is not None and callable(streamer):
+                        preview("draft_start", "")
+                        chunks = []
+                        async for chunk in streamer(messages=messages, max_tokens=512):
+                            chunks.append(chunk)
+                            preview("draft_token", chunk)
+                        answer = "".join(chunks)
+                        preview("draft_validating", "")
+                    elif callable(responder):
                         response = await responder(
                             messages=messages,
                             tools=model_tool_definitions or None,
@@ -6523,6 +6573,20 @@ the artifact in quarantine, and activate it only after the checks pass.
                     definitions,
                 ):
                     return "browser_navigate", arguments
+
+        if contract.required_read_paths and "read_file" in available:
+            for path in contract.required_read_paths:
+                if "read_file:" + path not in missing:
+                    continue
+                if any(
+                    call.get("tool") == "read_file" and call.get("arguments", {}).get("path") == path
+                    for call in failed_calls or []
+                ):
+                    return None
+                arguments = {"path": path}
+                if not cls._tool_argument_problem("read_file", arguments, definitions):
+                    return "read_file", arguments
+            return None
 
         required_names = [
             name for name in contract.required_tools if name in missing

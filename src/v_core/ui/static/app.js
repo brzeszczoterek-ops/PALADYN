@@ -289,6 +289,10 @@ async function sendPrompt(text) {
   if (!prompt || working) return;
   message("user", prompt);
   const output = message("v", "");
+  let showingDraft = false;
+  const draftStatus = document.createElement("small");
+  draftStatus.hidden = true;
+  output.article.appendChild(draftStatus);
   output.paragraph.classList.add("cursor");
   ui.prompt.value = "";
   requestInFlight = true;
@@ -316,7 +320,23 @@ async function sendPrompt(text) {
       for (const line of lines) {
         if (!line.trim()) continue;
         const event = JSON.parse(line);
-        if (event.type === "token") {
+        if (event.type === "draft_start") {
+          showingDraft = true;
+          output.paragraph.textContent = "";
+          draftStatus.hidden = false;
+          draftStatus.textContent = "Draft — generating, not yet verified";
+        } else if (event.type === "draft_token") {
+          const followOutput = chatIsPinnedToBottom();
+          output.paragraph.textContent += event.text;
+          scrollChatToBottom(followOutput);
+        } else if (event.type === "draft_validating") {
+          draftStatus.textContent = "Draft — checking against tool results";
+        } else if (event.type === "token") {
+          if (showingDraft) {
+            output.paragraph.textContent = "";
+            showingDraft = false;
+            draftStatus.hidden = true;
+          }
           const followOutput = chatIsPinnedToBottom();
           output.paragraph.textContent += event.text;
           scrollChatToBottom(followOutput);
@@ -325,12 +345,15 @@ async function sendPrompt(text) {
         } else if (event.type === "error") {
           throw new Error(event.error || "V runtime failed");
         } else if (event.type === "done") {
+          output.paragraph.textContent = event.answer || output.paragraph.textContent;
+          draftStatus.hidden = true;
           feed("Runtime completed the response");
         }
       }
       if (done) break;
     }
   } catch (error) {
+    draftStatus.hidden = true;
     output.article.classList.add("error-message");
     output.paragraph.textContent = `Runtime error: ${error.message}`;
     feed(`Failure: ${error.message}`);

@@ -11,6 +11,36 @@ from starlette.testclient import TestClient
 from v_core.edition import load_edition_extension, resolve_edition
 from v_core.ui import UIRuntime, create_app
 from v_core.ui.runtime_activity import runtime_activity
+from v_core.response_preview import response_preview
+
+
+def test_draft_events_are_separate_from_verified_speech_and_result():
+    runtime = _runtime()
+    spoken = []
+
+    async def ask(prompt, on_token=None):
+        emit = response_preview.get()
+        emit("draft_start", "")
+        emit("draft_token", "unverified draft")
+        emit("draft_validating", "")
+        return "verified replacement"
+
+    async def speak(text):
+        spoken.append(text)
+
+    runtime.core.ask = ask
+    runtime.speech = SimpleNamespace(speak=speak)
+    response = TestClient(create_app(runtime)).post(
+        "/api/chat", headers={"X-PALADYN-Session": runtime.session_token},
+        json={"message": "review", "speak": True},
+    )
+    events = [json.loads(line) for line in response.text.splitlines()]
+    assert [e["type"] for e in events[:5]] == [
+        "started", "draft_start", "draft_token", "draft_validating", "token",
+    ]
+    assert spoken == ["verified replacement"]
+    assert events[-1]["answer"] == "verified replacement"
+    assert response_preview.get() is None
 
 
 class _Process:
