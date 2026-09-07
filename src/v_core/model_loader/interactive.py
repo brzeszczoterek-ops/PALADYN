@@ -33,6 +33,7 @@ async def bootstrap_interactive_model(
     input_fn: Input = input,
     output: Output = print,
     stdin_is_tty: bool | None = None,
+    allow_manual_hierarchy: bool = False,
     llm_factory: Callable[[], Any] = LLM,
     qualifier_factory: Callable[[Any], Any] = ModelQualifier,
 ) -> LlamaServerSession | None:
@@ -80,6 +81,7 @@ async def bootstrap_interactive_model(
             input_fn=input_fn,
             output=output,
             allow_external=(selected_mode != "required"),
+            allow_manual_hierarchy=allow_manual_hierarchy,
         )
         if action == "external":
             return None
@@ -112,6 +114,17 @@ async def bootstrap_interactive_model(
                 store=store,
                 input_fn=input_fn,
                 output=output,
+            )
+            state = store.load()
+            continue
+        if action == "hierarchy":
+            configure_manual_hierarchy_interactively(
+                state,
+                models,
+                store=store,
+                input_fn=input_fn,
+                output=output,
+                allow_manual_hierarchy=allow_manual_hierarchy,
             )
             state = store.load()
             continue
@@ -175,6 +188,7 @@ def choose_startup_action(
     input_fn: Input,
     output: Output,
     allow_external: bool,
+    allow_manual_hierarchy: bool = False,
 ) -> str:
     """Choose startup work before any multi-gigabyte model is loaded."""
 
@@ -188,6 +202,23 @@ def choose_startup_action(
             state.profiles[str(model.path)],
         )
     )
+    current_pool_cards = 0
+    stale_pool: list[str] = []
+    for path in state.routing_model_paths:
+        profile = state.profiles.get(path)
+        card = state.qualifications.get(path)
+        if profile is None:
+            stale_pool.append(f"{Path(path).name}: profile missing")
+            continue
+        if card is None:
+            stale_pool.append(f"{Path(path).name}: qualification missing")
+            continue
+        reasons = card.stale_reasons(Path(path), profile)
+        if reasons:
+            stale_pool.append(f"{Path(path).name}: {', '.join(reasons)}")
+            continue
+        current_pool_cards += 1
+
     output("\nPALADYN startup:")
     output("  1. Start V")
     output(
@@ -196,8 +227,28 @@ def choose_startup_action(
     )
     output(
         "  3. Configure automatic model routing pool "
-        f"({len(state.routing_model_paths)}/3 selected)"
+        f"({current_pool_cards}/{len(state.routing_model_paths)} current; "
+        f"{len(state.routing_model_paths)}/3 selected)"
     )
+    if allow_manual_hierarchy:
+        mode = (
+            "active"
+            if state.routing_strategy == "manual_hierarchy"
+            else "automatic scoring active"
+        )
+        output(f"  4. Configure Full manual model hierarchy ({mode})")
+    if state.routing_enabled and state.routing_model_paths and stale_pool:
+        output(
+            "  WARNING: automatic model routing is not fully available. "
+            f"{current_pool_cards}/{len(state.routing_model_paths)} selected "
+            "models have current qualification cards."
+        )
+        for item in stale_pool:
+            output(f"    - {item}")
+        output(
+            "  Requalify stale models with option 2 before relying on "
+            "automatic switching."
+        )
     if allow_external:
         output("  0. Use the server configured in .env")
     while True:
@@ -208,6 +259,8 @@ def choose_startup_action(
             return "qualify"
         if raw == "3":
             return "pool"
+        if raw == "4" and allow_manual_hierarchy:
+            return "hierarchy"
         if raw == "0" and allow_external:
             return "external"
         output("Enter a startup action number from the list.")
@@ -349,6 +402,7 @@ def configure_routing_pool_interactively(
             return False
         if raw == "0":
             state.routing_enabled = False
+            state.routing_strategy = "automatic"
             store.save(state)
             output("Automatic model routing disabled; saved cards were kept.")
             return True
@@ -366,8 +420,80 @@ def configure_routing_pool_interactively(
             continue
         state.routing_model_paths = [str(eligible[index][0].path) for index in indices]
         state.routing_enabled = True
+        state.routing_strategy = "automatic"
         store.save(state)
         output("Automatic model routing pool updated.")
+        return True
+
+
+def configure_manual_hierarchy_interactively(
+    state: LoaderState,
+    models: list[LocalModel],
+    *,
+    store: ModelLoaderStore,
+    input_fn: Input,
+    output: Output,
+    allow_manual_hierarchy: bool,
+) -> bool:
+    """Set a hard owner-defined fallback order for PALADYN-Full."""
+
+    if not allow_manual_hierarchy:
+        output("Manual model hierarchy requires PALADYN-Full.")
+        return False
+    by_path = {str(model.path): model for model in models}
+    ordered: list[LocalModel] = []
+    for path in state.routing_model_paths:
+        model = by_path.get(path)
+        profile = state.profiles.get(path)
+        card = state.qualifications.get(path)
+        if (
+            model is None
+            or profile is None
+            or card is None
+            or not card.is_current(model.path, profile)
+        ):
+            output(
+                "Every model in the routing pool must have a current "
+                "qualification before a manual hierarchy can be enabled."
+            )
+            return False
+        ordered.append(model)
+    if not ordered:
+        output("Configure the qualified routing pool with option 3 first.")
+        return False
+
+    output("\nPALADYN-Full manual model hierarchy:")
+    for index, model in enumerate(ordered, start=1):
+        output(f"  {index}. {model.path.name}")
+    output("  0. Return to automatic capability scoring")
+    while True:
+        raw = _read(
+            input_fn,
+            "Enter every model number in priority order [Enter = keep current]: ",
+        ).strip()
+        if not raw:
+            return False
+        if raw == "0":
+            state.routing_strategy = "automatic"
+            store.save(state)
+            output("Automatic capability scoring restored.")
+            return True
+        try:
+            indices = [int(item.strip()) - 1 for item in raw.split(",")]
+        except ValueError:
+            output("Enter every model number once, separated by commas.")
+            continue
+        if (
+            len(indices) != len(ordered)
+            or set(indices) != set(range(len(ordered)))
+        ):
+            output("The hierarchy must contain every pool model exactly once.")
+            continue
+        state.routing_model_paths = [str(ordered[index].path) for index in indices]
+        state.routing_enabled = True
+        state.routing_strategy = "manual_hierarchy"
+        store.save(state)
+        output("PALADYN-Full manual model hierarchy enabled.")
         return True
 
 

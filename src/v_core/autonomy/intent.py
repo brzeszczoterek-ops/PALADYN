@@ -19,10 +19,21 @@ _CAPABILITIES = frozenset(
         "learning_skill",
         "learning_tool",
         "runtime_review",
+        "tool_catalog",
     }
 )
 
 _PUBLIC_FIELDS = frozenset({"count", "address", "contact", "opening_hours"})
+_RESEARCH_FACETS = frozenset(
+    {
+        "price",
+        "purchase_source",
+        "item_list",
+        "item_descriptions",
+        "images",
+        "exhaustive_coverage",
+    }
+)
 
 
 _INTENT_RESPONSE_FORMAT: dict[str, Any] = {
@@ -55,7 +66,39 @@ _INTENT_RESPONSE_FORMAT: dict[str, Any] = {
                     "items": {"type": "string", "enum": sorted(_PUBLIC_FIELDS)},
                     "uniqueItems": True,
                 },
+                "public_field_evidence": {
+                    "type": "object",
+                    "properties": {
+                        field: {"type": "string", "maxLength": 160}
+                        for field in sorted(_PUBLIC_FIELDS)
+                    },
+                    "required": sorted(_PUBLIC_FIELDS),
+                    "additionalProperties": False,
+                },
                 "public_subject": {"type": "string", "maxLength": 160},
+                "research_facets": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": sorted(_RESEARCH_FACETS)},
+                    "uniqueItems": True,
+                },
+                "research_facet_evidence": {
+                    "type": "object",
+                    "properties": {
+                        facet: {"type": "string", "maxLength": 160}
+                        for facet in sorted(_RESEARCH_FACETS)
+                    },
+                    "required": sorted(_RESEARCH_FACETS),
+                    "additionalProperties": False,
+                },
+                "minimum_detail_sources": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 8,
+                },
+                "minimum_detail_sources_evidence": {
+                    "type": "string",
+                    "maxLength": 160,
+                },
                 "web_query": {"type": "string", "maxLength": 220},
                 "language_scope": {
                     "type": "string",
@@ -78,7 +121,12 @@ _INTENT_RESPONSE_FORMAT: dict[str, Any] = {
                 "recall_memory",
                 "memory_query",
                 "required_public_fields",
+                "public_field_evidence",
                 "public_subject",
+                "research_facets",
+                "research_facet_evidence",
+                "minimum_detail_sources",
+                "minimum_detail_sources_evidence",
                 "web_query",
                 "language_scope",
                 "response_language",
@@ -103,10 +151,20 @@ Return exactly one JSON object with this shape:
 "execute_created_artifact":false,
 "recall_memory":false,"memory_query":"",
 "required_public_fields":[],
+"public_field_evidence":{"address":"","contact":"","count":"","opening_hours":""},
 "public_subject":"",
+"research_facets":[],
+"research_facet_evidence":{"exhaustive_coverage":"","images":"",
+"item_descriptions":"","item_list":"","price":"","purchase_source":""},
+"minimum_detail_sources":0,"minimum_detail_sources_evidence":"",
 "web_query":"","language_scope":"none","response_language":""}
 
 Allowed capability labels:
+- tool_catalog: review the available tool descriptions and input schemas, list
+  their documented interfaces, or suggest interface improvements. This is
+  metadata inspection only, not executing, testing, creating or repairing tools.
+  For a request limited to reviewing tool descriptions, use ONLY tool_catalog;
+  naming memory_recall or file_read as review subjects does not request their use.
 - browser: search, browse, inspect, collect, or navigate online information
 - file_read: inspect local files or directories
 - file_write: create, edit, move, rename, or delete local files
@@ -129,9 +187,11 @@ Rules:
   static, Sunday exploded" is odd; "My uncle was shouted at on Sunday" is not.
 - action_requested is true only when the user asks PALADYN to perform work now.
 - Questions, explanations, opinions, greetings, and ordinary conversation are not actions.
-- file_read and file_write require an explicitly named local file, directory,
-  filename, or path in the current message. Writing, presenting, or discussing a
-  plan or answer in chat is not file work. Never invent a path or silently turn
+- file_write requires an explicitly named local file, directory, filename, or
+  path in the current message. file_read may also target the current project or
+  codebase when the user explicitly orders an inspection/review and expects a
+  report, even if no path is spoken. Writing, presenting, or discussing an
+  abstract plan in chat is not file work. Never invent a path or silently turn
   an abstract plan into plan.txt.
 - creative_response is true when the requested result itself is fictional or
   expressive text in chat: a story, scene, poem, roleplay, dialogue, letter, or
@@ -173,9 +233,34 @@ Rules:
 - required_public_fields contains standardized fields explicitly requested from
   public online information: count, address, contact, opening_hours. Map the
   user's meaning to these labels regardless of language. Do not add an unasked field.
+- public_field_evidence contains, for every field label, the shortest exact
+  verbatim phrase from current_user_message that requests that field. Use an
+  empty string when the field was not requested. A field without a matching
+  verbatim phrase must not appear in required_public_fields.
 - public_subject is the exact named person, place, organization, business, or
   product whose public facts are requested. Preserve its spelling from the user;
   omit generic action words and return an empty string for non-public-fact work.
+- research_facets contains only explicitly requested evidence dimensions for
+  online research. Use price when the user asks how much something costs, its
+  price, or its value. Use purchase_source when the user asks where it can be
+  bought, ordered, acquired, or obtained. Use item_list when the requested
+  result is a list, catalogue, inventory, set of types, species, products, or
+  other multiple named items. Use item_descriptions when the user asks to
+  describe, characterize, compare, explain, or give details for those items.
+  Use images when the requested result includes pictures, photos, illustrations,
+  screenshots, or other visual examples. Use exhaustive_coverage only when the
+  user explicitly asks for all, every, a complete list, exhaustive coverage, or
+  the equivalent meaning in any language. Map meaning regardless of language;
+  never add an unasked facet.
+- research_facet_evidence contains the shortest exact verbatim phrase from
+  current_user_message requesting each facet. Use an empty string when absent.
+  A facet without a matching verbatim phrase must not be emitted.
+- minimum_detail_sources is the explicit number of distinct online offers,
+  products, results, or independent sources the user asks PALADYN to inspect
+  and report. Convert number words in any language to an integer, cap it at 8,
+  and return 0 when no count is explicit. minimum_detail_sources_evidence is the
+  shortest exact verbatim phrase containing that requested count and its noun.
+  The integer is ignored unless this exact phrase occurs in current_user_message.
 - web_query is a short initial search-engine query only when browser work must
   discover sources. Preserve the user's concrete subject, but remove greetings,
   persona names, politeness, report formatting, and conditional fallback work. For
@@ -224,7 +309,12 @@ class SemanticIntent:
     recall_memory: bool = False
     memory_query: str = ""
     required_public_fields: tuple[str, ...] = ()
+    public_field_evidence: tuple[tuple[str, str], ...] = ()
     public_subject: str = ""
+    research_facets: tuple[str, ...] = ()
+    research_facet_evidence: tuple[tuple[str, str], ...] = ()
+    minimum_detail_sources: int = 0
+    minimum_detail_sources_evidence: str = ""
     web_query: str = ""
     language_scope: str = "none"
     response_language: str = ""
@@ -276,11 +366,69 @@ class SemanticIntent:
             for field in ("count", "address", "contact", "opening_hours")
             if field in requested_fields
         )
+        raw_field_evidence = payload.get("public_field_evidence", {})
+        public_field_evidence = tuple(
+            (field, " ".join(str(raw_field_evidence.get(field, "")).split())[:160])
+            for field in ("count", "address", "contact", "opening_hours")
+            if isinstance(raw_field_evidence, dict)
+            and str(raw_field_evidence.get(field, "")).strip()
+        )
         public_subject = " ".join(
             str(payload.get("public_subject", "")).split()
         ).strip()[:160]
         if not public_fields:
             public_subject = ""
+        raw_research_facets = payload.get("research_facets", [])
+        requested_research_facets = (
+            {
+                str(item).strip()
+                for item in raw_research_facets
+                if str(item).strip() in _RESEARCH_FACETS
+            }
+            if isinstance(raw_research_facets, list)
+            else set()
+        )
+        research_facets = tuple(
+            facet
+            for facet in (
+                "price",
+                "purchase_source",
+                "item_list",
+                "item_descriptions",
+                "images",
+                "exhaustive_coverage",
+            )
+            if facet in requested_research_facets
+        )
+        raw_research_evidence = payload.get("research_facet_evidence", {})
+        research_facet_evidence = tuple(
+            (
+                facet,
+                " ".join(str(raw_research_evidence.get(facet, "")).split())[:160],
+            )
+            for facet in (
+                "price",
+                "purchase_source",
+                "item_list",
+                "item_descriptions",
+                "images",
+                "exhaustive_coverage",
+            )
+            if isinstance(raw_research_evidence, dict)
+            and str(raw_research_evidence.get(facet, "")).strip()
+        )
+        try:
+            minimum_detail_sources = max(
+                0,
+                min(8, int(payload.get("minimum_detail_sources", 0) or 0)),
+            )
+        except (TypeError, ValueError):
+            minimum_detail_sources = 0
+        minimum_detail_sources_evidence = " ".join(
+            str(payload.get("minimum_detail_sources_evidence", "")).split()
+        )[:160]
+        if not minimum_detail_sources_evidence:
+            minimum_detail_sources = 0
         language_scope = str(payload.get("language_scope", "none")).strip()
         if language_scope not in {"none", "turn", "persistent", "reset"}:
             language_scope = "none"
@@ -324,7 +472,12 @@ class SemanticIntent:
             recall_memory=recall_memory,
             memory_query=memory_query,
             required_public_fields=public_fields,
+            public_field_evidence=public_field_evidence,
             public_subject=public_subject,
+            research_facets=research_facets,
+            research_facet_evidence=research_facet_evidence,
+            minimum_detail_sources=minimum_detail_sources,
+            minimum_detail_sources_evidence=minimum_detail_sources_evidence,
             web_query=web_query,
             language_scope=language_scope,
             response_language=response_language,
@@ -333,6 +486,9 @@ class SemanticIntent:
     def to_contract(self, prompt: str = "") -> TaskContract:
         capabilities = set(self.capabilities)
         tor = bool(prompt) and TaskContract.prefers_tor(prompt)
+        interactive_tor = bool(prompt) and TaskContract.requests_interactive_tor_browser(
+            prompt
+        )
         browser = "browser" in capabilities and not tor
         public_fields = self.required_public_fields
         if browser and self.requires_report and not public_fields:
@@ -349,16 +505,26 @@ class SemanticIntent:
                 f"{prompt}\n{self.web_query}" if self.web_query else prompt
             )
         )
+        distinct_detail_page = (
+            browser
+            and (
+                self.distinct_detail_page
+                or (web_discovery and self.requires_report)
+            )
+        )
         return TaskContract(
             requires_browser_navigation=browser,
             requires_browser_snapshot=browser,
             requires_web_discovery=web_discovery,
-            requires_distinct_detail_page=(
-                browser
-                and (
-                    self.distinct_detail_page
-                    or (web_discovery and self.requires_report)
+            requires_distinct_detail_page=distinct_detail_page,
+            minimum_detail_sources=(
+                max(
+                    self.minimum_detail_sources,
+                    2 if "exhaustive_coverage" in self.research_facets else 0,
+                    TaskContract.research_source_minimum(prompt),
                 )
+                if distinct_detail_page and web_discovery and self.requires_report
+                else 1 if distinct_detail_page else 0
             ),
             requires_file_read="file_read" in capabilities,
             requires_file_mutation="file_write" in capabilities,
@@ -379,13 +545,34 @@ class SemanticIntent:
             requires_runtime_review="runtime_review" in capabilities,
             required_tools=(
                 (
-                    "full_tor_fetch"
-                    if re.search(
-                        r"https?://(?:[a-z0-9-]+\.)*[a-z2-7]{56}\.onion",
-                        prompt,
-                        re.IGNORECASE,
+                    "full_tor_browser_inventory"
+                    if interactive_tor
+                    else (
+                        "full_tor_fetch"
+                        if re.search(
+                            r"https?://(?:[a-z0-9-]+\.)*[a-z2-7]{56}\.onion",
+                            prompt,
+                            re.IGNORECASE,
+                        )
+                        else "full_tor_search"
                     )
-                    else "full_tor_search"
+                ),
+            )
+            if tor
+            else (),
+            required_capabilities=(
+                (
+                    "network.tor.browser"
+                    if interactive_tor
+                    else (
+                        "network.tor.fetch"
+                        if re.search(
+                            r"https?://(?:[a-z0-9-]+\.)*[a-z2-7]{56}\.onion",
+                            prompt,
+                            re.IGNORECASE,
+                        )
+                        else "network.tor.search"
+                    )
                 ),
             )
             if tor
@@ -393,6 +580,9 @@ class SemanticIntent:
             required_public_fields=public_fields,
             required_public_subject=(
                 self.public_subject if browser and public_fields else ""
+            ),
+            required_research_facets=(
+                self.research_facets if browser and self.requires_report else ()
             ),
         )
 
@@ -460,6 +650,16 @@ class MultilingualIntentRouter:
         grounded: set[str] = set()
         if prompt_contract.requires_file_read or explicit_target:
             grounded.add("file_read")
+        elif (
+            file_capabilities == {"file_read"}
+            and intent.action_requested
+            and intent.requires_report
+        ):
+            # A read-only review of the current workspace is bounded and
+            # reversible. The semantic parser can recover that meaning in any
+            # language even when the owner naturally says "review this project"
+            # instead of dictating a filesystem path. Mutation remains path-bound.
+            grounded.add("file_read")
         if prompt_contract.requires_file_mutation or explicit_target:
             grounded.add("file_write")
         ungrounded = file_capabilities - grounded
@@ -484,6 +684,100 @@ class MultilingualIntentRouter:
             action_requested=bool(capabilities) or intent.continue_previous,
             capabilities=capabilities,
             requires_report=intent.requires_report and observable,
+        )
+
+    def _ground_public_fields(
+        self,
+        intent: SemanticIntent | None,
+        prompt: str,
+    ) -> SemanticIntent | None:
+        """Require owner-text evidence for every model-proposed public field.
+
+        The semantic reader may understand any language, but it may not enlarge
+        the task by guessing that a product search also needs addresses, phone
+        numbers, opening hours, or a location count. Exact evidence spans keep
+        multilingual interpretation available without trusting bare labels.
+        """
+
+        if intent is None:
+            return None
+        deterministic = (
+            set(TaskContract.requested_public_fields(prompt))
+            if "browser" in intent.capabilities
+            else set()
+        )
+        normalized_prompt = " ".join(prompt.casefold().split())
+        # Evidence spans remain useful diagnostics, but field labels proposed
+        # by the same fallible model are not authorization to enlarge the task.
+        # Completion requirements are owned exclusively by deterministic code.
+        # This prevents a valid phrase such as "where can I buy it" from being
+        # relabelled as address, contact and opening-hours work.
+        grounded = deterministic
+        ordered = tuple(
+            field
+            for field in ("count", "address", "contact", "opening_hours")
+            if field in grounded
+        )
+        # The classifier receives only the current owner message, never an old
+        # objective or prior subject. Price and purchase-source labels can
+        # therefore remain semantic even when a small multilingual model
+        # returns a translated or inflected evidence phrase (for example
+        # ``ceny`` for owner text ``cenę``). These labels only strengthen the
+        # evidence contract; unlike address/contact fields, they cannot redirect
+        # execution toward another person or business.
+        grounded_research_facets = set(intent.research_facets)
+        for facet, evidence in intent.research_facet_evidence:
+            normalized_evidence = " ".join(evidence.casefold().split())
+            if normalized_evidence and normalized_evidence in normalized_prompt:
+                grounded_research_facets.add(facet)
+        grounded_research_facets_ordered = tuple(
+            facet
+            for facet in (
+                "price",
+                "purchase_source",
+                "item_list",
+                "item_descriptions",
+                "images",
+                "exhaustive_coverage",
+            )
+            if facet in grounded_research_facets
+        )
+        source_count_evidence = " ".join(
+            intent.minimum_detail_sources_evidence.casefold().split()
+        )
+        grounded_minimum_detail_sources = (
+            intent.minimum_detail_sources
+            if source_count_evidence
+            and source_count_evidence in normalized_prompt
+            else 0
+        )
+        subject = intent.public_subject if ordered else ""
+        if (
+            ordered == intent.required_public_fields
+            and subject == intent.public_subject
+            and grounded_research_facets_ordered == intent.research_facets
+            and grounded_minimum_detail_sources == intent.minimum_detail_sources
+        ):
+            return intent
+        self.last_sanitization_reason = ",".join(
+            item
+            for item in (
+                self.last_sanitization_reason,
+                "ungrounded_public_fields",
+            )
+            if item
+        )
+        return replace(
+            intent,
+            required_public_fields=ordered,
+            public_subject=subject,
+            research_facets=grounded_research_facets_ordered,
+            minimum_detail_sources=grounded_minimum_detail_sources,
+            minimum_detail_sources_evidence=(
+                intent.minimum_detail_sources_evidence
+                if grounded_minimum_detail_sources
+                else ""
+            ),
         )
 
     @staticmethod
@@ -602,14 +896,17 @@ class MultilingualIntentRouter:
         ]
         response = await self.llm.ask(
             messages=messages,
-            max_tokens=256,
+            max_tokens=384,
             temperature=0.0,
             response_format=_INTENT_RESPONSE_FORMAT,
         )
         self.last_response = response
-        intent = self._ground_local_file_capabilities(
-            self._ground_runtime_review(
-                SemanticIntent.parse(response),
+        intent = self._ground_public_fields(
+            self._ground_local_file_capabilities(
+                self._ground_runtime_review(
+                    SemanticIntent.parse(response),
+                    prompt,
+                ),
                 prompt,
             ),
             prompt,
@@ -640,14 +937,17 @@ class MultilingualIntentRouter:
                     ),
                 },
             ],
-            max_tokens=256,
+            max_tokens=384,
             temperature=0.0,
             response_format=_INTENT_RESPONSE_FORMAT,
         )
         self.last_response = retry
-        retried_intent = self._ground_local_file_capabilities(
-            self._ground_runtime_review(
-                SemanticIntent.parse(retry),
+        retried_intent = self._ground_public_fields(
+            self._ground_local_file_capabilities(
+                self._ground_runtime_review(
+                    SemanticIntent.parse(retry),
+                    prompt,
+                ),
                 prompt,
             ),
             prompt,

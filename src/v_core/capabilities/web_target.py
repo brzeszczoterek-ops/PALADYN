@@ -117,20 +117,46 @@ def _extract_spoken_web_target(prompt: str) -> str | None:
     return rendered
 
 
-def extract_web_target(prompt: str) -> str | None:
-    full = _FULL_URL.search(prompt)
-    if full is not None:
-        return full.group(0).rstrip(").,;]}\"'")
+def extract_web_targets(prompt: str) -> tuple[str, ...]:
+    """Return every explicit web address without duplicating URL hosts.
 
+    The runtime used to preserve only the first address in an owner's request.
+    Comparisons therefore became lossy before the model had even seen them.
+    Full URL spans take precedence over the bare-domain matcher so a value such
+    as ``https://example.com/a`` is returned once, with its path intact.
+    """
+
+    candidates: list[tuple[int, str]] = []
+    full_spans: list[tuple[int, int]] = []
+    for match in _FULL_URL.finditer(prompt):
+        full_spans.append(match.span())
+        target = match.group(0).rstrip(").,;]}\"'")
+        if target:
+            candidates.append((match.start(), target))
+
+    for match in _BARE_DOMAIN.finditer(prompt):
+        start, end = match.span()
+        if any(start < full_end and end > full_start for full_start, full_end in full_spans):
+            continue
+        target = match.group(0).rstrip(").,;]}\"'")
+        normalized = f"https://{target}"
+        if target:
+            candidates.append((start, normalized))
+
+    found: list[str] = []
+    for _, target in sorted(candidates):
+        if target not in found:
+            found.append(target)
+
+    if found:
+        return tuple(found)
     spoken = _extract_spoken_web_target(prompt)
-    if spoken is not None:
-        return spoken
+    return (spoken,) if spoken is not None else ()
 
-    bare = _BARE_DOMAIN.search(prompt)
-    if bare is None:
-        return None
-    target = bare.group(0).rstrip(").,;]}\"'")
-    return f"https://{target}"
+
+def extract_web_target(prompt: str) -> str | None:
+    targets = extract_web_targets(prompt)
+    return targets[0] if targets else None
 
 
 def requests_web_access(prompt: str) -> bool:

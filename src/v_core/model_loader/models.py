@@ -227,7 +227,16 @@ class LoaderState:
     profiles: dict[str, ModelProfile] = field(default_factory=dict)
     routing_enabled: bool = False
     routing_model_paths: list[str] = field(default_factory=list)
+    routing_strategy: str = "automatic"
     qualifications: dict[str, ModelQualificationCard] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        strategy = str(self.routing_strategy).strip().casefold()
+        if strategy not in {"automatic", "manual_hierarchy"}:
+            raise ValueError(
+                "model routing strategy must be automatic or manual_hierarchy"
+            )
+        self.routing_strategy = strategy
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -239,6 +248,7 @@ class LoaderState:
             },
             "routing_enabled": self.routing_enabled,
             "routing_model_paths": list(self.routing_model_paths),
+            "routing_strategy": self.routing_strategy,
             "qualifications": {
                 path: card.to_dict() for path, card in self.qualifications.items()
             },
@@ -287,5 +297,6 @@ class LoaderState:
             profiles=profiles,
             routing_enabled=bool(data.get("routing_enabled", False)),
             routing_model_paths=routing_paths,
+            routing_strategy=str(data.get("routing_strategy", "automatic")),
             qualifications=qualifications,
         )

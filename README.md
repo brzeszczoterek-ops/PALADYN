@@ -113,7 +113,8 @@ Every interactive start now begins with a compact startup menu:
 1. start V normally;
 2. qualify or requalify any detected local model;
 3. configure the automatic one-to-three-model routing pool;
-4. use the external server from `.env` when that startup mode allows it.
+0. use the external server from `.env` when that startup mode allows it.
+
 
 Qualification loads only the selected GGUF, runs the bounded local harness,
 saves its capability card, releases the model, and returns to the startup menu.
@@ -219,6 +220,24 @@ is recovered only when its fields belong to the currently active builder schema;
 the normal schema validator still blocks incomplete tests or source bundles.
 This keeps the protocol executable without exposing it or a false declaration of
 work to the user.
+
+Tool completion is capability-based. A requested tool name identifies the first
+provider, but PALADYN records what capability was actually delivered. If that
+provider fails, the runtime updates its persistent health record and may retry an
+equivalent registered provider without asking the model to invent a new call.
+Failure arguments are kept only in a bounded private recovery fixture;
+credential-like fields are redacted.
+
+When a generated tool has no working equivalent provider, PALADYN opens a
+recovery ticket. V may create a replacement through
+`learning_create_repair_adapter`; PALADYN—not the LLM—binds the captured failure
+fixture, runs the replay in quarantine and the offline sandbox, activates the
+provider only after validation, and removes it from routing after two consecutive
+runtime failures. Generated code may replace only `generated.*` computation.
+Host, network, filesystem, persona, policy, emergency controls, and edition
+authority require trusted runtime providers and cannot be acquired by writing a
+convincing-looking adapter.
+
 Streaming stops when PALADYN detects a clear repeated-generation loop, while
 ordinary rhetorical repetition is preserved. Session history is bounded by both
 turn count and the active model's context budget.

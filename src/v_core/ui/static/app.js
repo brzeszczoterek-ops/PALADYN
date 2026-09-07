@@ -28,6 +28,18 @@ const ui = {
   speak: byId("speak"),
   activity: byId("activity"),
   feed: byId("runtime-feed"),
+  liveState: byId("live-state"),
+  liveDetail: byId("live-detail"),
+  livePhase: byId("live-phase"),
+  liveOutput: byId("live-output"),
+  liveSpeed: byId("live-speed"),
+  livePromptSpeed: byId("live-prompt-speed"),
+  liveElapsed: byId("live-elapsed"),
+  liveStep: byId("live-step"),
+  liveContext: byId("live-context"),
+  liveContextMeter: byId("live-context-meter"),
+  liveObjective: byId("live-objective"),
+  liveAction: byId("live-action"),
   ownerDeck: byId("owner-deck"),
   ownerTitle: byId("owner-title"),
   ownerSubtitle: byId("owner-subtitle"),
@@ -47,15 +59,69 @@ function clock() {
   return new Date().toLocaleTimeString("en-GB", {hour12: false});
 }
 
-function feed(text) {
+function feed(text, key = "", timestamp = "") {
+  if (key) {
+    const existing = Array.from(ui.feed.children).find((item) => item.dataset.key === key);
+    if (existing) return;
+  }
   const row = document.createElement("li");
   const time = document.createElement("time");
   const body = document.createElement("span");
-  time.textContent = clock();
+  row.dataset.key = key;
+  time.textContent = timestamp
+    ? new Date(timestamp).toLocaleTimeString("en-GB", {hour12: false})
+    : clock();
   body.textContent = text;
   row.append(time, body);
   ui.feed.prepend(row);
   while (ui.feed.children.length > 16) ui.feed.lastElementChild.remove();
+}
+
+function formatCount(value) {
+  return Number(value || 0).toLocaleString("en-US");
+}
+
+function formatDuration(total) {
+  const seconds = Math.max(0, Number(total || 0));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60).toString().padStart(2, "0");
+  const rest = Math.floor(seconds % 60).toString().padStart(2, "0");
+  return hours ? `${hours}:${minutes}:${rest}` : `${minutes}:${rest}`;
+}
+
+function renderRuntimeActivity(activity) {
+  if (!activity) return;
+  const state = activity.state || "idle";
+  const labels = {
+    idle: "IDLE",
+    prompt: "READING PROMPT",
+    generating: "GENERATING",
+    repairing: "REPAIRING",
+    tool_running: "TOOL RUNNING",
+    orchestrating: "ORCHESTRATING",
+    stalled: "POSSIBLY STALLED",
+  };
+  ui.liveState.className = `live-state ${state}`;
+  ui.liveState.innerHTML = `<i></i>${labels[state] || state.toUpperCase()}`;
+  ui.liveDetail.textContent = activity.detail || "Runtime state unavailable";
+  ui.livePhase.textContent = String(activity.phase || "idle").toUpperCase();
+  ui.liveOutput.textContent = `${formatCount(activity.generated_tokens)} TOK`;
+  const generationRate = activity.generation_tokens_per_second;
+  const promptRate = activity.prompt_tokens_per_second;
+  ui.liveSpeed.textContent = generationRate == null ? "— T/S" : `${Number(generationRate).toFixed(1)} T/S`;
+  ui.livePromptSpeed.textContent = promptRate == null ? "— T/S" : `${Number(promptRate).toFixed(1)} T/S`;
+  ui.liveElapsed.textContent = formatDuration(activity.task_elapsed_seconds);
+  ui.liveStep.textContent = formatCount(activity.step);
+  ui.liveContext.textContent = `${formatCount(activity.context_used)} / ${formatCount(activity.context_size)}`;
+  ui.liveContextMeter.style.width = `${Math.max(0, Math.min(100, Number(activity.context_percent || 0)))}%`;
+  ui.liveObjective.textContent = activity.objective || "Waiting for an objective.";
+  const lastAction = activity.last_tool
+    ? `${activity.last_tool} // ${activity.last_tool_status || "unknown"}`
+    : "—";
+  ui.liveAction.textContent = `LAST ACTION // ${lastAction}`;
+  (activity.events || []).forEach((event) => {
+    feed(`${event.label} // ${event.text}`, `runtime:${event.id}`, event.timestamp);
+  });
 }
 
 function chatIsPinnedToBottom() {
@@ -205,6 +271,7 @@ async function refreshStatus() {
     ui.orb.classList.toggle("recording", recording);
     ui.pttLabel.textContent = recording ? "STOP & TRANSCRIBE" : "F2 / PUSH TO TALK";
     renderOwner(state.owner);
+    renderRuntimeActivity(state.activity);
     if (!requestInFlight) setWorking(!state.ready);
     if (lastReady !== state.ready) {
       feed(state.ready ? "Runtime ready" : "Runtime entered active task");

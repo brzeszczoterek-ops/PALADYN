@@ -7,18 +7,24 @@ from typing import Any
 from html import unescape
 from urllib.parse import unquote, urlsplit
 
-from ..capabilities.web_target import extract_web_target, requests_web_access
+from ..capabilities.web_target import (
+    extract_web_target,
+    extract_web_targets,
+    requests_web_access,
+)
+from ..tool_recovery import capabilities_for_tool, normalize_capabilities
 
 
 _ONLINE_ACTION = re.compile(
-    r"\b(?:browse|check|collect|extract|find|inspect|list|look\s+for|monitor|open|"
-    r"research|scan|search|visit|crawl|scrape|"
-    r"ekstrakc\w*|monitor\w*|przejr\w*|przeszuk\w*|sprawd\w*|szuk\w*|wejd\w*|"
-    r"wyszuk\w*|wyciagn\w*|wyciągn\w*|znajd\w*)\b",
+    r"\b(?:aggregate|browse|check|collect|extract|find|gather|inspect|list|log\s+in|look\s+for|monitor|open|"
+    r"register|research|scan|search|visit|crawl|scrape|"
+    r"ekstrakc\w*|gromad\w*|monitor\w*|przejr\w*|przeszuk\w*|sprawd\w*|szuk\w*|wejd\w*|"
+    r"wej[śsćc]\w*|wyszuk\w*|wyciagn\w*|wyciągn\w*|zalog\w*|za[łl]o[żz]\w*|"
+    r"zbier\w*|znajd\w*)\b",
     re.IGNORECASE,
 )
 _ONLINE_RESOURCE = re.compile(
-    r"\b(?:browser|darknet|internet|online|page|repository|repo|site|web|website|"
+    r"\b(?:browser|darknet|forum\w*|internet|online|page|repository|repo|site|web|website|"
     r"github|facebook\w*|instagram\w*|linkedin\w*|osint|profile|social\s+media|"
     r"internet\w*|interne\w*|market\w*|profil\w*|sie[cć]\w*|stron\w*|"
     r"witryn\w*)\b",
@@ -26,9 +32,12 @@ _ONLINE_RESOURCE = re.compile(
 )
 _TOR_ACCESS_REQUEST = re.compile(
     r"(?:\b(?:w|przez)\s+(?:darknet\w*|sieci\s+tor)\b|"
+    r"\b(?:forum\w*|market\w*|stron\w*|witryn\w*)\b.{0,48}"
+    r"\b(?:na|przez|w)\s+torze\b|"
     r"\b(?:in|on|through|via)\s+(?:the\s+)?"
     r"(?:darknet|dark\s*web|tor\s+network)\b|"
-    r"\b(?:przeszuk\w*|wejd\w*)\s+(?:do\s+|w\s+)?(?:darknet\w*|sie[cć]\s+tor)\b|"
+    r"\b(?:forum|market|site|website)s?\b.{0,48}\b(?:on|through|via)\s+tor\b|"
+    r"\b(?:przeszuk\w*|wejd\w*|wej[śsćc]\w*)\s+(?:do\s+|w\s+)?(?:darknet\w*|sie[cć]\s+tor)\b|"
     r"\b(?:search|browse|visit|open|inspect)\s+(?:the\s+)?"
     r"(?:darknet|dark\s*web|tor\s+network)\b|"
     r"\b(?:using|używ\w*|uzyw\w*)\s+(?:the\s+)?tor(?:\s+browser)?\b|"
@@ -37,6 +46,12 @@ _TOR_ACCESS_REQUEST = re.compile(
 )
 _EXPLICIT_ONION_ADDRESS = re.compile(
     r"https?://(?:[a-z0-9-]+\.)*[a-z2-7]{56}\.onion(?:[^\s<>]*)?",
+    re.IGNORECASE,
+)
+_TOR_INTERACTIVE_BROWSER = re.compile(
+    r"\b(?:captcha|kapcza|kapczę|kapcze|private\s+window|private\s+browser|"
+    r"prywatn\w*\s+okn\w*|javascript|java\s*script|bez\s+ja(?:vy|wy)|"
+    r"inwentaryz\w*|inventory|interactive\s+browser|browser\s+session)\b",
     re.IGNORECASE,
 )
 _EXPLICIT_WEB_ADDRESS = re.compile(
@@ -63,6 +78,11 @@ _CREATE_SKILL = re.compile(
     r"\b(?:create|build|implement|write|generate|stworz|stwórz|utworz|utwórz|zbuduj|napisz|"
     r"wygeneruj|zaimplementuj)\w*\b(?:(?![.!?;\n]).){0,180}?\b"
     r"(?:skill\w*|umiejetn\w*|umiejętn\w*)\b",
+    re.IGNORECASE,
+)
+_ARTIFACT_DISJUNCTION = re.compile(
+    r"\b(?:or|either|alternatively|albo|lub|b[aą]d[źz]|oder|ou|oppure|"
+    r"или|либо|або)\b",
     re.IGNORECASE,
 )
 _QUOTED_TEXT = re.compile(
@@ -102,12 +122,21 @@ _USE_CREATED_TOOL = re.compile(
     re.IGNORECASE,
 )
 _DISABLE_WEB = re.compile(
-    r"\b(?:(?:do\s+not|don't|never|without)\s+"
+    r"\b(?:(?:do\s+not|don't|never)\s+(?:use|run|execute)\s+(?:any\s+)?(?:network|web|online)\s+tools?|"
+    r"nie\s+(?:uruchamiaj|używaj|uzywaj)\s+narz[eę]dzi\s+sieciowych|"
+    r"(?:do\s+not|don't|never|without)\s+"
     r"(?:live\s+)?(?:browse|browsing|contact|crawl|crawling|navigate|network|"
     r"scrape|scraping|search|visit)|"
     r"(?:bez|nigdy\s+nie|nie)\s+(?:kontakt\w*|laczeni\w*|łączeni\w*|"
     r"nawig\w*|przeglad\w*|przegląd\w*|sieci\w*|wyszuk\w*)|"
     r"offline[- ]only)\b",
+    re.IGNORECASE,
+)
+
+_READ_ONLY = re.compile(
+    r"\b(?:read[- ]only|no\s+(?:writes|modifications)|"
+    r"(?:do\s+not|don't)\s+(?:write|modify|change)\s+(?:any\s+)?files|"
+    r"tylko\s+odczyt|nie\s+(?:zapisuj|modyfikuj|zmieniaj)\s+plik[oó]w)\b",
     re.IGNORECASE,
 )
 
@@ -127,6 +156,15 @@ _READ_FILE = re.compile(
     r"odczyt\w*|otworz\w*|otwórz\w*|przeczyt\w*|przejr\w*|pokaz\w*|pokaż\w*)\b",
     re.IGNORECASE,
 )
+_STRONG_READ_FILE = re.compile(
+    r"\b(?:cat|open|read|odczyt\w*|otworz\w*|otwórz\w*|przeczyt\w*)\b",
+    re.IGNORECASE,
+)
+_PROJECT_CODE_TARGET = re.compile(
+    r"\b(?:code|codebase|project|repository|repo|source(?:\s+tree)?|"
+    r"kod\w*|projekt\w*|repozytori\w*|zrodl\w*|źródł\w*)\b",
+    re.IGNORECASE,
+)
 _MUTATE_FILE = re.compile(
     r"\b(?:append|create|delete|edit|move|rename|replace|save|write|"
     r"dodaj\w*|edytuj\w*|napisz\w*|przenies\w*|przenieś\w*|"
@@ -142,6 +180,25 @@ _COMMAND_TARGET = re.compile(
     r"komend\w*|skrypt\w*|test\w*)\b",
     re.IGNORECASE,
 )
+
+
+def _requests_command_execution(prompt: str) -> bool:
+    """Require a command action and target that are distinct lexical spans.
+
+    ``test`` can be both a verb and a noun. Matching the two patterns
+    independently made passive content such as a filename or Markdown heading
+    containing "smoke test" require an unrelated sandbox execution. Genuine
+    requests such as "run the test" and "test this script" still contain two
+    distinct spans.
+    """
+
+    actions = tuple(_RUN_COMMAND.finditer(prompt))
+    targets = tuple(_COMMAND_TARGET.finditer(prompt))
+    return any(
+        action.span() != target.span()
+        for action in actions
+        for target in targets
+    )
 _FILE_TARGET = re.compile(
     r"(?:\b(?:file|plik\w*)\b|(?:^|[\s/])[\w.-]+\."
     r"(?:cfg|conf|csv|docx?|html?|ini|json|log|md|pdf|py|sh|sol|toml|ts|txt|"
@@ -154,7 +211,7 @@ _EXPLICIT_LOCAL_PATH = re.compile(
 )
 _REPORT_RESULT = re.compile(
     r"\b(?:answer|describe|explain|extract|find|give|identify|list|report|summari[sz]e|tell|what|which|"
-    r"co|jakie|które|ktore|opisz\w*|podaj\w*|powiedz\w*|stre[śs]c\w*|wyciagn\w*|wyciągn\w*|"
+    r"co|jakie|które|ktore|opisz\w*|podaj\w*|powiedz\w*|przedstaw\w*|stre[śs]c\w*|wyciagn\w*|wyciągn\w*|"
     r"wymien\w*|wymień\w*|znajd\w*|znale[źz]\w*)\b",
     re.IGNORECASE,
 )
@@ -166,13 +223,29 @@ _PUBLIC_FACT_FIELDS = (
         re.IGNORECASE,
     )),
     ("address", re.compile(
-        r"\b(?:where|address\w*|location\w*|gdzie|adres\w*|lokaliz\w*)\b",
+        r"\b(?:address\w*|location\w*|adres\w*|lokaliz\w*)\b",
         re.IGNORECASE,
     )),
     ("contact", re.compile(
         r"\b(?:contact\w*|phone\w*|telephone\w*|kontakt\w*|telefon\w*)\b",
         re.IGNORECASE,
     )),
+)
+_PUBLIC_WHERE_FIELD = re.compile(r"\b(?:where|gdzie)\b", re.IGNORECASE)
+_PUBLIC_PRICE_CONTEXT = re.compile(
+    r"\b(?:how\s+much|ile)\b[^,.!?;\n]{0,64}\b(?:cost\w*|price\w*|cen\w*|koszt\w*)\b",
+    re.IGNORECASE,
+)
+_PUBLIC_EXPLICIT_COUNT_CONTEXT = re.compile(
+    r"\b(?:how\s+many|number\s+of|count|liczb\w*|"
+    r"ile\b[^,.!?;\n]{0,48}\b(?:jest|s[aą]|istniej\w*|znajduj\w*))\b",
+    re.IGNORECASE,
+)
+_PURCHASE_SOURCE_CONTEXT = re.compile(
+    r"\b(?:where|gdzie)\b(?=[^.!?;\n]{0,80}\b(?:"
+    r"acquir\w*|buy\w*|get\w*|obtain\w*|order\w*|purchas\w*|"
+    r"kupi\w*|naby\w*|zam[oó]wi\w*|zdob[yą]\w*)\b)",
+    re.IGNORECASE,
 )
 _ADDRESS_EVIDENCE = re.compile(
     r"(?:\b\d{2}-\d{3}\b|"
@@ -194,6 +267,26 @@ _OPENING_HOURS_EVIDENCE = re.compile(
     r"(?:[01]?\d|2[0-3])[:.]\d{2}\b)",
     re.IGNORECASE,
 )
+_PRICE_EVIDENCE = re.compile(
+    r"(?:[$€£¥]\s*\d[\d\s.,]*|"
+    r"\d[\d\s.,]*\s*(?:USD|EUR|GBP|PLN|CHF|CZK|HUF|JPY|CAD|AUD|zł|€|\$|£)\b)",
+    re.IGNORECASE,
+)
+_IMAGE_EVIDENCE = re.compile(
+    r"(?:\bimg\s+[\"']|\bimage\s+[\"']|!\[[^\]]*\]\(|"
+    r"https?://[^\s<>]+\.(?:avif|gif|jpe?g|png|webp)(?:[?#][^\s<>]*)?)",
+    re.IGNORECASE,
+)
+_RESEARCH_FACET_NAMES = frozenset(
+    {
+        "price",
+        "purchase_source",
+        "item_list",
+        "item_descriptions",
+        "images",
+        "exhaustive_coverage",
+    }
+)
 _FIRST_HEADING = re.compile(
     r"\b(?:first\s+(?:heading|header|title)|"
     r"pierwsz\w*\s+(?:naglow\w*|nagłów\w*|tytul\w*|tytuł\w*))\b",
@@ -211,8 +304,10 @@ _RAW_BROWSER_SCAFFOLD = re.compile(
 )
 _GROUNDING_ENTITY_STOPWORDS = {
     "another", "based", "boss", "first", "finally", "here", "however",
-    "english", "lastly", "next", "okay", "paladyn", "please", "response",
-    "second", "the", "therefore", "this", "third", "would",
+    "english", "finding", "findings", "lastly", "next", "okay", "open",
+    "paladyn", "please", "response", "result", "results", "second",
+    "section", "sections", "source", "sources", "still", "the", "therefore",
+    "this", "third", "verified", "would",
 }
 _HTTP_URL = re.compile(r"https?://[^\s<>\[\](){}\"']+", re.IGNORECASE)
 
@@ -232,6 +327,13 @@ def _grounding_entity_is_present(entity: str, grounding_text: str) -> bool:
     normalized = entity.casefold()
     if normalized in grounding_text:
         return True
+    # Product and protocol names are frequently pluralized in natural prose
+    # while source pages use the singular label (CAPTCHAs vs CAPTCHA). This is
+    # morphology, not a new entity claim.
+    if normalized.endswith("s") and len(normalized) >= 5:
+        singular = normalized[:-1]
+        if singular in grounding_text:
+            return True
     for suffix in ("-based", "_based"):
         if normalized.endswith(suffix):
             stem = normalized[: -len(suffix)].strip("-_")
@@ -240,6 +342,23 @@ def _grounding_entity_is_present(entity: str, grounding_text: str) -> bool:
             # semantic equivalence to unrelated product names.
             return len(stem) >= 3 and stem in grounding_text
     return False
+
+
+def _research_item_labels(text: str) -> set[str]:
+    """Extract repeated item-like labels from observed page structure."""
+
+    labels: set[str] = set()
+    patterns = (
+        r'\b(?:heading|img|image)\s+["\']([^"\']{3,160})["\']',
+        r"^\s{0,3}#{2,6}\s+(.{3,160})$",
+        r"^\s{0,3}\d{1,3}[.)]\s+(.{3,160})$",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
+            label = " ".join(match.group(1).split()).strip(" .:-")
+            if label:
+                labels.add(label.casefold())
+    return labels
 
 
 def _is_search_listing_url(url: str) -> bool:
@@ -254,7 +373,63 @@ def _is_search_listing_url(url: str) -> bool:
         return path in {"", "/search"}
     if hostname in {"search.brave.com", "search.yahoo.com"}:
         return True
-    return path == "/search"
+    if path == "/search":
+        return True
+
+    # A marketplace category is useful discovery evidence, not the concrete
+    # offer/detail evidence required by a research contract. Use structural
+    # path markers instead of a domain allowlist so unseen markets behave the
+    # same way and Shopify-like product paths are not rejected as collections.
+    segments = [
+        unquote(segment).casefold()
+        for segment in parsed.path.split("/")
+        if segment
+    ]
+    detail_markers = {
+        "ad",
+        "article",
+        "blog",
+        "doc",
+        "docs",
+        "item",
+        "items",
+        "offer",
+        "oferta",
+        "post",
+        "product",
+        "products",
+    }
+    if any(segment in detail_markers for segment in segments):
+        return False
+    listing_markers = {
+        "auction",
+        "auctions",
+        "aukcja",
+        "aukcje",
+        "catalog",
+        "catalogue",
+        "categories",
+        "category",
+        "collection",
+        "collections",
+        "kategoria",
+        "kategorie",
+        "kolekcje",
+        "listing",
+        "listings",
+        "marketplace",
+        "search",
+        "tag",
+        "tags",
+        "temat",
+        "topic",
+        "topics",
+    }
+    return any(
+        segment in listing_markers
+        or re.fullmatch(r"q-[^/]+", segment) is not None
+        for segment in segments
+    )
 
 
 def _snapshot_mentions_url(snapshot: str, url: str) -> bool:
@@ -282,6 +457,77 @@ def _snapshot_mentions_url(snapshot: str, url: str) -> bool:
     return f"{hostname}{path}" in haystack
 
 
+def _web_read_has_substantive_content(call: dict[str, Any]) -> bool:
+    """Reject a successful transport call that observed only browser chrome."""
+
+    excerpt = str(call.get("result_excerpt", "")).strip()
+    if not excerpt:
+        return False
+    content = excerpt
+    payload: dict[str, Any] | None = None
+    try:
+        decoded = json.loads(excerpt)
+    except (TypeError, json.JSONDecodeError):
+        decoded = None
+    if isinstance(decoded, dict):
+        payload = decoded
+        if decoded.get("error"):
+            return False
+        content = str(decoded.get("content", "")).strip()
+        if not content:
+            return False
+    elif excerpt.lstrip().startswith("{"):
+        # Trace excerpts can end halfway through a large JSON string. Recover
+        # enough of the leading content field to judge evidence quality.
+        match = re.search(r'"content"\s*:\s*"(.*)', excerpt, re.DOTALL)
+        if match is not None:
+            content = (
+                match.group(1)
+                .replace(r"\n", "\n")
+                .replace(r'\"', '"')
+                .replace(r"\/", "/")
+            )
+
+    arguments = call.get("arguments", {})
+    requested_url = (
+        str(arguments.get("url", "")) if isinstance(arguments, dict) else ""
+    )
+    parsed = urlsplit(requested_url)
+    is_github_blob = (
+        (parsed.hostname or "").casefold().removeprefix("www.") == "github.com"
+        and "/blob/" in parsed.path
+    )
+    content_url = str(payload.get("content_url", "")) if payload else ""
+    raw_document_observed = (
+        "raw.githubusercontent.com/" in content_url.casefold()
+        or "raw.githubusercontent.com/" in excerpt.casefold()
+    )
+    if is_github_blob and not raw_document_observed:
+        # The ordinary GitHub page front-loads its global navigation. A bounded
+        # snapshot containing only that chrome is not evidence from the file.
+        chrome_labels = (
+            "navigation menu",
+            "sign in",
+            "sign up",
+            "platform",
+            "solutions",
+            "enterprise",
+        )
+        folded = content.casefold()
+        if sum(label in folded for label in chrome_labels) >= 4:
+            return False
+
+    meaningful = re.sub(
+        r"(?:###\s+(?:Page|Snapshot)|-\s+Page\s+(?:URL|Title):[^\n]*|"
+        r"-\s+Console:[^\n]*|```ya?ml|```)",
+        " ",
+        content,
+        flags=re.IGNORECASE,
+    )
+    meaningful = _RAW_BROWSER_SCAFFOLD.sub(" ", meaningful)
+    return len(re.sub(r"\W+", "", meaningful, flags=re.UNICODE)) >= 12
+
+
 @dataclass(frozen=True, slots=True)
 class TaskContract:
     """Runtime-owned, model-independent definition of completion evidence."""
@@ -290,6 +536,7 @@ class TaskContract:
     requires_browser_snapshot: bool = False
     requires_web_discovery: bool = False
     requires_distinct_detail_page: bool = False
+    minimum_detail_sources: int = 0
     requires_file_read: bool = False
     requires_file_mutation: bool = False
     requires_command_execution: bool = False
@@ -298,17 +545,61 @@ class TaskContract:
     requires_created_tool: bool = False
     requires_created_tool_execution: bool = False
     requires_created_skill: bool = False
+    requires_created_artifact: bool = False
     allows_artifact_fallback: bool = False
     requires_runtime_review: bool = False
     required_tools: tuple[str, ...] = ()
+    required_capabilities: tuple[str, ...] = ()
     required_public_fields: tuple[str, ...] = ()
     required_public_subject: str = ""
+    required_research_facets: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # A model-side semantic classifier may independently mark both builder
+        # capabilities even when the owner's structural wording explicitly
+        # offered them as alternatives. Preserve the owner's OR contract: one
+        # validated artifact is enough and neither concrete kind is mandatory.
+        if self.requires_created_artifact:
+            object.__setattr__(self, "requires_created_tool", False)
+            object.__setattr__(self, "requires_created_tool_execution", False)
+            object.__setattr__(self, "requires_created_skill", False)
+        if (
+            "exhaustive_coverage" in self.required_research_facets
+            and self.requires_web_discovery
+            and self.requires_evidence_report
+            and self.minimum_detail_sources < 2
+        ):
+            # One page can provide a useful example, but it cannot support a
+            # claim that an online catalogue is complete. Corroboration is a
+            # structural evidence rule and does not depend on the request's
+            # language.
+            object.__setattr__(self, "minimum_detail_sources", 2)
 
     @staticmethod
     def needs_web_discovery(prompt: str) -> bool:
         """Return whether online routing must discover a URL from search results."""
 
         return extract_web_target(prompt) is None
+
+    @staticmethod
+    def requests_read_only(prompt: str) -> bool:
+        return bool(_READ_ONLY.search(prompt))
+
+    def without_mutations(self) -> "TaskContract":
+        """An explicit read-only boundary overrides inferred builder work."""
+        return replace(
+            self, requires_file_mutation=False, requires_command_execution=False,
+            requires_created_tool=False, requires_created_tool_execution=False,
+            requires_created_skill=False, requires_created_artifact=False,
+            allows_artifact_fallback=False,
+            required_tools=(), required_capabilities=(),
+        )
+
+    @staticmethod
+    def is_search_listing_url(url: str) -> bool:
+        """Expose the runtime's structural search/listing classifier."""
+
+        return _is_search_listing_url(url)
 
     @staticmethod
     def disables_web(prompt: str) -> bool:
@@ -345,13 +636,26 @@ class TaskContract:
             requires_browser_snapshot=False,
             requires_web_discovery=False,
             requires_distinct_detail_page=False,
+            minimum_detail_sources=0,
             required_tools=tuple(
                 name
                 for name in self.required_tools
-                if name not in {"full_tor_search", "full_tor_fetch"}
+                if name
+                not in {
+                    "full_tor_search",
+                    "full_tor_fetch",
+                    "full_tor_browser_inventory",
+                    "full_tor_browser_close",
+                }
+            ),
+            required_capabilities=tuple(
+                capability
+                for capability in self.required_capabilities
+                if not capability.startswith("network.tor.")
             ),
             required_public_fields=(),
             required_public_subject="",
+            required_research_facets=(),
         )
 
     @staticmethod
@@ -360,6 +664,16 @@ class TaskContract:
 
         return bool(_TOR_ACCESS_REQUEST.search(prompt)) and not (
             TaskContract.disables_web(prompt)
+        )
+
+    @staticmethod
+    def requests_interactive_tor_browser(prompt: str) -> bool:
+        """Return whether Tor work needs a persistent owner-assisted session."""
+
+        return bool(
+            TaskContract.prefers_tor(prompt)
+            and _EXPLICIT_ONION_ADDRESS.search(prompt)
+            and _TOR_INTERACTIVE_BROWSER.search(prompt)
         )
 
     @staticmethod
@@ -379,7 +693,7 @@ class TaskContract:
         )
         local_file_work = bool(_FILE_TARGET.search(without_urls))
         local_command_work = bool(
-            _RUN_COMMAND.search(prompt) and _COMMAND_TARGET.search(prompt)
+            _requests_command_execution(prompt)
         )
         return bool(_ONLINE_ACTION.search(prompt)) and not (
             local_file_work or local_command_work
@@ -389,11 +703,29 @@ class TaskContract:
     def requested_public_fields(prompt: str) -> tuple[str, ...]:
         """Return concrete public-data fields expressed in any routed request."""
 
-        return tuple(
+        fields = [
             name
             for name, pattern in _PUBLIC_FACT_FIELDS
             if pattern.search(prompt) is not None
-        )
+        ]
+        if (
+            "count" in fields
+            and _PUBLIC_PRICE_CONTEXT.search(prompt) is not None
+            and _PUBLIC_EXPLICIT_COUNT_CONTEXT.search(prompt) is None
+        ):
+            fields.remove("count")
+        # A bare ``where`` can request a physical location, but in a purchase
+        # clause it asks for a seller/source instead of a postal address. Treat
+        # that distinction before public-fact recovery starts; otherwise an
+        # ordinary product-research task is diverted into address lookups.
+        if (
+            "address" not in fields
+            and bool(fields)
+            and _PUBLIC_WHERE_FIELD.search(prompt) is not None
+            and _PURCHASE_SOURCE_CONTEXT.search(prompt) is None
+        ):
+            fields.append("address")
+        return tuple(fields)
 
     @staticmethod
     def implies_public_web_lookup(prompt: str) -> bool:
@@ -410,25 +742,77 @@ class TaskContract:
             TaskContract.requested_public_fields(prompt)
         ) >= 2
 
+    @staticmethod
+    def research_source_minimum(prompt: str) -> int:
+        """Require corroboration for a structurally broad research request."""
+
+        words = re.findall(r"[^\W_]+(?:[-'][^\W_]+)*", prompt, re.UNICODE)
+        return 2 if len(words) >= 32 else 1
+
     @classmethod
     def from_prompt(cls, prompt: str) -> "TaskContract":
+        explicit_web_targets = extract_web_targets(prompt)
         web_disabled = bool(_DISABLE_WEB.search(prompt))
         tor_requested = not web_disabled and bool(_TOR_ACCESS_REQUEST.search(prompt)) and (
             bool(_ONLINE_ACTION.search(prompt))
             or bool(_EXPLICIT_ONION_ADDRESS.search(prompt))
         )
+        interactive_tor = tor_requested and cls.requests_interactive_tor_browser(prompt)
         online = not tor_requested and not web_disabled and (
             requests_web_access(prompt)
             or bool(_ONLINE_ACTION.search(prompt) and _ONLINE_RESOURCE.search(prompt))
         )
         file_prompt = re.sub(r"https?://[^\s<>]+", "", prompt, flags=re.IGNORECASE)
         explicit_file_target = cls.has_explicit_local_file_target(file_prompt)
-        file_read = bool(_READ_FILE.search(file_prompt) and explicit_file_target)
+        file_targets = list(_FILE_TARGET.finditer(file_prompt))
+        read_actions = list(_READ_FILE.finditer(file_prompt))
+        mutation_actions = list(_MUTATE_FILE.finditer(file_prompt))
+        # Bind a read verb to the file it actually describes. A broad prompt
+        # such as "inspect the forum and save it to a file" used to combine the
+        # unrelated words "inspect" and "file" and require reading an output
+        # artifact before it existed. Natural action-before-target phrasing is
+        # accepted, while a strong explicit read verb may also follow a target.
+        file_read = bool(
+            explicit_file_target
+            and (
+                any(
+                    (read_candidates := [
+                        action
+                        for action in read_actions
+                        if 0 <= target.start() - action.end() <= 96
+                    ])
+                    and (
+                        not (
+                            mutation_candidates := [
+                                action
+                                for action in mutation_actions
+                                if 0 <= target.start() - action.end() <= 96
+                            ]
+                        )
+                        or max(action.end() for action in read_candidates)
+                        > max(action.end() for action in mutation_candidates)
+                    )
+                    for target in file_targets
+                )
+                or any(
+                    0 <= action.start() - target.end() <= 64
+                    for action in _STRONG_READ_FILE.finditer(file_prompt)
+                    for target in file_targets
+                )
+            )
+        )
+        project_code_review = bool(
+            not online
+            and _READ_FILE.search(file_prompt)
+            and _PROJECT_CODE_TARGET.search(file_prompt)
+            and _REPORT_RESULT.search(file_prompt)
+        )
+        file_read = file_read or project_code_review
         file_mutation = bool(
             _MUTATE_FILE.search(file_prompt) and explicit_file_target
         )
         command_execution = bool(
-            not online and _RUN_COMMAND.search(prompt) and _COMMAND_TARGET.search(prompt)
+            not online and _requests_command_execution(prompt)
         )
         tool_creation_match = _search_outside_quoted_text(_CREATE_TOOL, prompt)
         skill_creation_match = _search_outside_quoted_text(_CREATE_SKILL, prompt)
@@ -458,7 +842,22 @@ class TaskContract:
                     re.IGNORECASE,
                 )
             )
-        creates_tool = bool(tool_creation_match) and not conditional_artifact
+        artifact_disjunction = False
+        if (
+            tool_creation_match is not None
+            and skill_creation_match is not None
+            and not conditional_artifact
+        ):
+            artifact_span = prompt[
+                min(tool_creation_match.start(), skill_creation_match.start()) :
+                max(tool_creation_match.end(), skill_creation_match.end())
+            ]
+            artifact_disjunction = bool(_ARTIFACT_DISJUNCTION.search(artifact_span))
+        creates_tool = (
+            bool(tool_creation_match)
+            and not conditional_artifact
+            and not artifact_disjunction
+        )
         runtime_review = bool(_RUNTIME_REVIEW.search(prompt))
         web_discovery = online and cls.needs_web_discovery(prompt)
         evidence_report = runtime_review or (
@@ -470,6 +869,11 @@ class TaskContract:
             if online and evidence_report
             else ()
         )
+        distinct_detail_page = online and (
+            bool(_DETAIL_PAGE.search(prompt))
+            or (web_discovery and evidence_report)
+            or len(explicit_web_targets) > 1
+        )
         return cls(
             requires_browser_navigation=online,
             requires_browser_snapshot=online,
@@ -480,9 +884,11 @@ class TaskContract:
             requires_web_discovery=web_discovery,
             # A research report based only on a search-results listing is not
             # research. Discovery must open and observe at least one real source.
-            requires_distinct_detail_page=online and (
-                bool(_DETAIL_PAGE.search(prompt))
-                or (web_discovery and evidence_report)
+            requires_distinct_detail_page=distinct_detail_page,
+            minimum_detail_sources=(
+                cls.research_source_minimum(prompt)
+                if distinct_detail_page and web_discovery and evidence_report
+                else 1 if distinct_detail_page else 0
             ),
             requires_file_read=file_read,
             requires_file_mutation=file_mutation,
@@ -494,15 +900,35 @@ class TaskContract:
                 creates_tool and bool(_USE_CREATED_TOOL.search(prompt))
             ),
             requires_created_skill=(
-                bool(skill_creation_match) and not conditional_artifact
+                bool(skill_creation_match)
+                and not conditional_artifact
+                and not artifact_disjunction
             ),
+            requires_created_artifact=artifact_disjunction,
             allows_artifact_fallback=conditional_artifact,
             requires_runtime_review=runtime_review,
             required_tools=(
                 (
-                    "full_tor_fetch"
-                    if _EXPLICIT_ONION_ADDRESS.search(prompt)
-                    else "full_tor_search"
+                    "full_tor_browser_inventory"
+                    if interactive_tor
+                    else (
+                        "full_tor_fetch"
+                        if _EXPLICIT_ONION_ADDRESS.search(prompt)
+                        else "full_tor_search"
+                    )
+                ),
+            )
+            if tor_requested
+            else (),
+            required_capabilities=(
+                (
+                    "network.tor.browser"
+                    if interactive_tor
+                    else (
+                        "network.tor.fetch"
+                        if _EXPLICIT_ONION_ADDRESS.search(prompt)
+                        else "network.tor.search"
+                    )
                 ),
             )
             if tor_requested
@@ -515,8 +941,17 @@ class TaskContract:
         """Rebuild a contract from runtime-owned checkpoint data."""
 
         source = values if isinstance(values, dict) else {}
-        tuple_fields = {"required_tools", "required_public_fields"}
-        special_fields = {*tuple_fields, "required_public_subject"}
+        tuple_fields = {
+            "required_tools",
+            "required_capabilities",
+            "required_public_fields",
+            "required_research_facets",
+        }
+        special_fields = {
+            *tuple_fields,
+            "minimum_detail_sources",
+            "required_public_subject",
+        }
         flags = {
             name: bool(source.get(name, False))
             for name in cls.__dataclass_fields__
@@ -534,6 +969,12 @@ class TaskContract:
             if isinstance(raw_tools, (list, tuple))
             else ()
         )
+        raw_capabilities = source.get("required_capabilities", [])
+        required_capabilities = (
+            normalize_capabilities(raw_capabilities)
+            if isinstance(raw_capabilities, (list, tuple))
+            else ()
+        )
         raw_public_fields = source.get("required_public_fields", [])
         required_public_fields = (
             tuple(
@@ -547,20 +988,47 @@ class TaskContract:
             if isinstance(raw_public_fields, (list, tuple))
             else ()
         )
+        raw_research_facets = source.get("required_research_facets", [])
+        required_research_facets = (
+            tuple(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in raw_research_facets
+                    if str(item).strip() in _RESEARCH_FACET_NAMES
+                )
+            )
+            if isinstance(raw_research_facets, (list, tuple))
+            else ()
+        )
         return cls(
             **flags,
+            minimum_detail_sources=max(
+                0,
+                min(8, int(source.get("minimum_detail_sources", 0) or 0)),
+            ),
             required_tools=required_tools,
+            required_capabilities=required_capabilities,
             required_public_fields=required_public_fields,
             required_public_subject=str(
                 source.get("required_public_subject", "")
             ).strip()[:160],
+            required_research_facets=required_research_facets,
         )
 
     def merged(self, other: "TaskContract") -> "TaskContract":
         """Return the union of two independently detected requirements."""
 
-        tuple_fields = {"required_tools", "required_public_fields"}
-        special_fields = {*tuple_fields, "required_public_subject"}
+        tuple_fields = {
+            "required_tools",
+            "required_capabilities",
+            "required_public_fields",
+            "required_research_facets",
+        }
+        special_fields = {
+            *tuple_fields,
+            "minimum_detail_sources",
+            "required_public_subject",
+        }
         flags = {
             name: bool(getattr(self, name) or getattr(other, name))
             for name in self.__dataclass_fields__
@@ -569,18 +1037,34 @@ class TaskContract:
         required_tools = tuple(
             dict.fromkeys((*self.required_tools, *other.required_tools))
         )
+        required_capabilities = tuple(
+            dict.fromkeys(
+                (*self.required_capabilities, *other.required_capabilities)
+            )
+        )
         required_public_fields = tuple(
             dict.fromkeys(
                 (*self.required_public_fields, *other.required_public_fields)
             )
         )
+        required_research_facets = tuple(
+            dict.fromkeys(
+                (*self.required_research_facets, *other.required_research_facets)
+            )
+        )
         return type(self)(
             **flags,
+            minimum_detail_sources=max(
+                self.minimum_detail_sources,
+                other.minimum_detail_sources,
+            ),
             required_tools=required_tools,
+            required_capabilities=required_capabilities,
             required_public_fields=required_public_fields,
             required_public_subject=(
                 self.required_public_subject or other.required_public_subject
             ),
+            required_research_facets=required_research_facets,
         )
 
     def with_required_tools(self, names: list[str] | tuple[str, ...]) -> "TaskContract":
@@ -591,7 +1075,9 @@ class TaskContract:
                 if name
                 not in {
                     "required_tools",
+                    "required_capabilities",
                     "required_public_fields",
+                    "required_research_facets",
                     "required_public_subject",
                 }
             },
@@ -600,8 +1086,12 @@ class TaskContract:
                     (*self.required_tools, *(item for item in names if item))
                 )
             ),
+            required_capabilities=tuple(
+                self.required_capabilities
+            ),
             required_public_fields=self.required_public_fields,
             required_public_subject=self.required_public_subject,
+            required_research_facets=self.required_research_facets,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -620,14 +1110,18 @@ class TaskContract:
             for name in names
         )
 
-        if self.requires_browser_navigation and not any(
-            name in {"browser_navigate", "web_search", "web_read"}
-            for name in names
-        ):
-            missing.append("browser_navigate")
+        if self.requires_browser_navigation:
+            navigation_tools = (
+                {"browser_navigate", "web_search", "web_read"}
+                if self.requires_web_discovery
+                else {"browser_navigate", "web_read"}
+            )
+            if not any(name in navigation_tools for name in names):
+                missing.append("browser_navigate")
         if self.requires_browser_snapshot and not any(
-            name in {"browser_snapshot", "web_search", "web_read"}
-            for name in names
+            call.get("tool") == "browser_snapshot"
+            or call.get("tool") == "web_read"
+            for call in succeeded
         ):
             missing.append("browser_snapshot")
 
@@ -639,6 +1133,8 @@ class TaskContract:
                 arguments = call.get("arguments", {})
                 url = str(arguments.get("url", "")) if isinstance(arguments, dict) else ""
                 if not url:
+                    continue
+                if not _web_read_has_substantive_content(call):
                     continue
                 if not self.requires_web_discovery:
                     verified_web_read = True
@@ -661,6 +1157,7 @@ class TaskContract:
                 detail_navigation = None
             navigations: list[tuple[int, str]] = []
             snapshots: list[tuple[int, str]] = []
+            discovery_observations: list[tuple[int, str]] = []
             for index, call in enumerate(succeeded):
                 name = str(call.get("tool", ""))
                 if name == "browser_navigate":
@@ -668,8 +1165,15 @@ class TaskContract:
                     url = str(arguments.get("url", "")) if isinstance(arguments, dict) else ""
                     if url and all(previous_url != url for _, previous_url in navigations):
                         navigations.append((index, url))
-                elif name in {"browser_snapshot", "web_search"}:
+                elif name == "browser_snapshot":
                     snapshots.append((index, str(call.get("result_excerpt", ""))))
+                    discovery_observations.append(
+                        (index, str(call.get("result_excerpt", "")))
+                    )
+                elif name == "web_search":
+                    discovery_observations.append(
+                        (index, str(call.get("result_excerpt", "")))
+                    )
             if detail_navigation is not None:
                 pass
             elif self.requires_web_discovery:
@@ -689,7 +1193,7 @@ class TaskContract:
                 )
                 discovery_snapshots = [
                     (index, text)
-                    for index, text in snapshots
+                    for index, text in discovery_observations
                     if index < first_detail_attempt
                 ]
                 detail_navigation = next(
@@ -718,6 +1222,68 @@ class TaskContract:
                 index > detail_navigation[0] for index, _ in snapshots
             ):
                 missing.append("browser_snapshot:detail_page")
+
+            if self.minimum_detail_sources > 1 and not any(
+                item.startswith("browser_navigate:")
+                or item == "browser_snapshot:detail_page"
+                for item in missing
+            ):
+                verified_sources: set[str] = set()
+                for navigation_index, url in navigations:
+                    if _is_search_listing_url(url):
+                        continue
+                    discovered = any(
+                        index < navigation_index
+                        and call.get("tool") == "web_search"
+                        and _snapshot_mentions_url(
+                            str(call.get("result_excerpt", "")),
+                            url,
+                        )
+                        for index, call in enumerate(succeeded)
+                    )
+                    next_navigation = next(
+                        (
+                            index
+                            for index, _ in navigations
+                            if index > navigation_index
+                        ),
+                        len(succeeded),
+                    )
+                    observed = any(
+                        navigation_index < index < next_navigation
+                        for index, _ in snapshots
+                    )
+                    if discovered and observed:
+                        verified_sources.add(url.rstrip("/"))
+                for read_index, call in enumerate(succeeded):
+                    if call.get("tool") != "web_read":
+                        continue
+                    arguments = call.get("arguments", {})
+                    url = (
+                        str(arguments.get("url", ""))
+                        if isinstance(arguments, dict)
+                        else ""
+                    )
+                    if (
+                        url
+                        and not _is_search_listing_url(url)
+                        and _web_read_has_substantive_content(call)
+                        and any(
+                            index < read_index
+                            and prior.get("tool") == "web_search"
+                            and _snapshot_mentions_url(
+                                str(prior.get("result_excerpt", "")),
+                                url,
+                            )
+                            for index, prior in enumerate(succeeded)
+                        )
+                    ):
+                        verified_sources.add(url.rstrip("/"))
+                if len(verified_sources) < self.minimum_detail_sources:
+                    missing.append(
+                        "browser_evidence:detail_sources="
+                        f"{len(verified_sources)}/{self.minimum_detail_sources}"
+                    )
 
         if self.requires_file_read and not any(
             name in {"read_file", "cat"} for name in names
@@ -765,18 +1331,61 @@ class TaskContract:
                 missing.append("generated_tool_execution")
         if self.requires_created_skill and "learning_create_skill" not in names:
             missing.append("learning_create_skill")
+        if self.requires_created_artifact and not any(
+            name in {*tool_builders, "learning_create_skill"}
+            for name in names
+        ):
+            missing.append("learning_create_tool_or_skill")
         if self.requires_runtime_review and "runtime_review_task" not in names:
             missing.append("runtime_review_task")
         for required_tool in self.required_tools:
-            if required_tool not in names:
+            required_tool_capabilities = set(capabilities_for_tool(required_tool))
+            observed_capabilities = {
+                str(capability)
+                for call in succeeded
+                for capability in (
+                    *capabilities_for_tool(str(call.get("tool", ""))),
+                    *tuple(call.get("capabilities", []) or []),
+                )
+            }
+            if (
+                required_tool not in names
+                and not required_tool_capabilities.intersection(observed_capabilities)
+            ):
                 missing.append(required_tool)
+        observed_capabilities = {
+            str(capability)
+            for call in succeeded
+            for capability in (
+                *capabilities_for_tool(str(call.get("tool", ""))),
+                *tuple(call.get("capabilities", []) or []),
+            )
+        }
+        tool_contract_capabilities = {
+            capability
+            for required_tool in self.required_tools
+            for capability in capabilities_for_tool(required_tool)
+        }
+        for capability in self.required_capabilities:
+            if (
+                capability not in observed_capabilities
+                and capability not in tool_contract_capabilities
+            ):
+                missing.append(f"capability:{capability}")
 
         public_sources: list[str] = []
+        research_sources: list[str] = []
+        research_page_urls: list[str] = []
         for call in succeeded:
             tool = call.get("tool")
             excerpt = str(call.get("result_excerpt", ""))
             if tool == "web_read":
-                public_sources.append(excerpt)
+                if _web_read_has_substantive_content(call):
+                    public_sources.append(excerpt)
+                    research_sources.append(excerpt)
+                    arguments = call.get("arguments", {})
+                    if isinstance(arguments, dict) and arguments.get("url"):
+                        research_page_urls.append(str(arguments["url"]))
                 continue
             if tool != "browser_snapshot":
                 continue
@@ -791,7 +1400,13 @@ class TaskContract:
             # Only an opened non-search page may satisfy public fact fields.
             if page_url is not None and not _is_search_listing_url(page_url.group(1)):
                 public_sources.append(excerpt)
+            if page_url is not None and not page_url.group(1).casefold().startswith(
+                ("https://duckduckgo.com/", "https://www.google.com/search")
+            ):
+                research_sources.append(excerpt)
+                research_page_urls.append(page_url.group(1))
         public_evidence = "\n".join(public_sources)
+        research_evidence = "\n".join(research_sources)
         if self.required_public_subject:
             subject_tokens = {
                 token.casefold()
@@ -831,6 +1446,63 @@ class TaskContract:
             )
         ):
             missing.append("public_fact:count")
+        if (
+            "price" in self.required_research_facets
+            and not _PRICE_EVIDENCE.search(research_evidence)
+        ):
+            missing.append("browser_evidence:research_price")
+        commerce_source_found = any(
+            _is_search_listing_url(url)
+            or any(
+                segment in {
+                    "ad",
+                    "auction",
+                    "buy",
+                    "item",
+                    "itm",
+                    "listing",
+                    "offer",
+                    "oferta",
+                    "product",
+                    "shop",
+                    "store",
+                }
+                for segment in (
+                    unquote(part).casefold()
+                    for part in urlsplit(url).path.split("/")
+                    if part
+                )
+            )
+            for url in research_page_urls
+        )
+        if (
+            "purchase_source" in self.required_research_facets
+            and not commerce_source_found
+        ):
+            missing.append("browser_evidence:research_purchase_source")
+        item_labels = _research_item_labels(research_evidence)
+        if (
+            "item_list" in self.required_research_facets
+            and len(item_labels) < 2
+        ):
+            missing.append("browser_evidence:research_item_list")
+        description_blocks = len(
+            re.findall(
+                r"(?:\bparagraph\s*:|^\s{0,3}(?:[-*]|\d+[.)])\s+.{24,}$)",
+                research_evidence,
+                re.IGNORECASE | re.MULTILINE,
+            )
+        )
+        if (
+            "item_descriptions" in self.required_research_facets
+            and (len(item_labels) < 2 or description_blocks < 2)
+        ):
+            missing.append("browser_evidence:research_item_descriptions")
+        if (
+            "images" in self.required_research_facets
+            and not _IMAGE_EVIDENCE.search(research_evidence)
+        ):
+            missing.append("browser_evidence:research_images")
         return missing
 
     def answer_issues(
@@ -859,6 +1531,7 @@ class TaskContract:
                 "runtime_review_task",
                 "full_tor_search",
                 "full_tor_fetch",
+                "full_tor_browser_inventory",
             }
             and call.get("result_excerpt")
         ]
@@ -869,10 +1542,22 @@ class TaskContract:
             return ["answer:browser_scaffolding_is_not_a_finding"]
 
         if self.requires_browser_navigation or any(
-            name in {"full_tor_search", "full_tor_fetch"}
+            name
+            in {
+                "full_tor_search",
+                "full_tor_fetch",
+                "full_tor_browser_inventory",
+            }
             for name in self.required_tools
         ):
-            grounding_text = (request + "\n" + "\n".join(observations)).casefold()
+            observed_tool_names = " ".join(
+                str(call.get("tool", ""))
+                for call in calls
+                if call.get("status", "succeeded") == "succeeded"
+            )
+            grounding_text = (
+                request + "\n" + "\n".join(observations) + "\n" + observed_tool_names
+            ).casefold()
             observed_url_keys = {
                 key
                 for key in (
@@ -895,18 +1580,49 @@ class TaskContract:
                     + "|".join(ungrounded_urls[:6])
                 ]
             claimed_entities: set[str] = set()
-            for highlighted in re.findall(
+            grounded_highlight_spans: list[tuple[int, int]] = []
+            for highlighted in re.finditer(
                 r"\*\*([^*\n]{2,120})\*\*|`([^`\n]{2,120})`",
                 answer,
             ):
-                phrase = next((item for item in highlighted if item), "")
-                claimed_entities.update(
-                    token
-                    for token in re.findall(r"[A-Za-z][A-Za-z0-9.+_-]{2,}", phrase)
-                    if token.casefold() not in _GROUNDING_ENTITY_STOPWORDS
+                phrase = next(
+                    (item for item in highlighted.groups() if item),
+                    "",
                 )
+                phrase_tokens = [
+                    token
+                    for token in re.findall(
+                        r"[A-Za-z][A-Za-z0-9.+_-]{2,}", phrase
+                    )
+                    if token.casefold() not in _GROUNDING_ENTITY_STOPWORDS
+                ]
+                structural_label = bool(
+                    re.fullmatch(
+                        r"\s*(?:step\s+\d+|conclusion|summary|result|source|"
+                        r"finding|findings|next\s+steps?)\s*:?[\s]*",
+                        phrase,
+                        flags=re.IGNORECASE,
+                    )
+                )
+                # Markdown emphasis often wraps a whole feature label such as
+                # "Chrome Extension version". If one distinctive token grounds
+                # that label, its generic descriptive words are not separate
+                # product claims.
+                phrase_is_grounded = structural_label or any(
+                    _grounding_entity_is_present(token, grounding_text)
+                    for token in phrase_tokens
+                )
+                if phrase_is_grounded:
+                    grounded_highlight_spans.append(highlighted.span())
+                else:
+                    claimed_entities.update(phrase_tokens)
             for match in re.finditer(r"\b[A-Z][A-Za-z0-9.+_-]{2,}\b", answer):
                 token = match.group(0)
+                if any(
+                    start <= match.start() < end
+                    for start, end in grounded_highlight_spans
+                ):
+                    continue
                 prefix = answer[: match.start()].rstrip()
                 if not prefix or prefix[-1:] in {".", "!", "?", "\n"}:
                     continue
@@ -917,6 +1633,11 @@ class TaskContract:
                 ):
                     # A direct form of address is relationship prose, not an
                     # online product/entity claim that needs source grounding.
+                    continue
+                line_prefix = answer[: match.start()].rsplit("\n", 1)[-1]
+                if re.match(r"\s{0,3}#{1,6}\s", line_prefix):
+                    # Markdown headings are discourse structure. Words such as
+                    # "Step" and "Capture" are not online entity claims.
                     continue
                 if token.casefold() not in _GROUNDING_ENTITY_STOPWORDS:
                     claimed_entities.add(token)
@@ -946,6 +1667,28 @@ class TaskContract:
             )
             if not first_line or not heading_tokens.issubset(answer_heading_tokens):
                 return ["answer:first_heading_missing"]
+
+        report_entries = [
+            " ".join(match.group(1).split())
+            for match in re.finditer(
+                r"^\s{0,3}(?:[-*]|\d{1,3}[.)])\s+(.+)$",
+                answer,
+                re.MULTILINE,
+            )
+        ]
+        if (
+            "item_list" in self.required_research_facets
+            and len(report_entries) < 2
+        ):
+            return ["answer:research_item_list_missing"]
+        if "item_descriptions" in self.required_research_facets:
+            described_entries = [
+                entry
+                for entry in report_entries
+                if len(re.findall(r"[^\W_]+", entry, re.UNICODE)) >= 5
+            ]
+            if len(described_entries) < 2:
+                return ["answer:research_item_descriptions_missing"]
 
         answer_tokens = {
             token
@@ -1086,6 +1829,23 @@ class TaskContract:
                     if test_names
                     else " Validation passed in the offline sandbox."
                 )
+                if (
+                    validation.get("validation_strength")
+                    == "behavioral_input_sensitivity"
+                ):
+                    runs = int(payload.get("successful_runs", 0) or 0)
+                    runtime_note = (
+                        " It has not yet run on a real task input."
+                        if runs == 0
+                        else f" Recorded task executions: {runs}."
+                    )
+                    return (
+                        "PALADYN built, sandbox-tested, and activated the experimental "
+                        f"tool `{payload['name']}`. Determinism and input sensitivity "
+                        "passed, but no independent semantic oracle has proven its "
+                        "domain correctness yet."
+                        + runtime_note
+                    )
                 return (
                     f"Done. PALADYN built the generated tool, validated, and activated "
                     f"`{payload['name']}` from the generated source."

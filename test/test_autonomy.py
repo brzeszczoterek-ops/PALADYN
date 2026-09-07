@@ -32,7 +32,7 @@ from v_core.autonomy import (
     review_task_checkpoint,
 )
 from v_core.autonomy.policy import AuthorizationDenied, AuthorizationGuard
-from v_core.capabilities.web_target import extract_web_target
+from v_core.capabilities.web_target import extract_web_target, extract_web_targets
 from v_core.config import load_config
 
 
@@ -115,6 +115,45 @@ def test_created_tool_validation_report_names_tool_not_contract() -> None:
     assert answer is not None
     assert "built the generated tool" in answer
     assert "built the contract" not in answer
+
+
+def test_behaviorally_tested_tool_is_not_reported_as_semantically_proven() -> None:
+    contract = TaskContract(requires_created_tool=True)
+    answer = contract.deterministic_answer(
+        [
+            {
+                "tool": "learning_create_tool",
+                "status": "succeeded",
+                "result_excerpt": json.dumps(
+                    {
+                        "name": "candidate_solver",
+                        "status": "active",
+                        "successful_runs": 0,
+                        "validation": {
+                            "passed": True,
+                            "validation_strength": (
+                                "behavioral_input_sensitivity"
+                            ),
+                            "tests": [
+                                {
+                                    "name": (
+                                        "runtime-derived input sensitivity probe"
+                                    ),
+                                    "passed": True,
+                                }
+                            ],
+                        },
+                    }
+                ),
+            }
+        ]
+    )
+
+    assert answer is not None
+    assert "experimental tool `candidate_solver`" in answer
+    assert "no independent semantic oracle" in answer
+    assert "not yet run on a real task input" in answer
+    assert "validated" not in answer
 
 
 def test_task_contract_accepts_deterministic_snapshot_tool_builder() -> None:
@@ -486,6 +525,42 @@ def test_task_contract_detects_generic_online_work_without_explicit_url() -> Non
     ]
 
 
+def test_task_contract_routes_polish_tor_research_to_report_artifact() -> None:
+    contract = TaskContract.from_prompt(
+        "Zgromadź wszystkie wiadomości jakie dasz radę na temat cebulki, "
+        "forum na torze. Zapisz je do pliku, bez zgadywania, tylko naprawdę "
+        "przejrzyj co tam się dzieje i znajdź wszystkie możliwe informacje."
+    )
+
+    assert contract.required_tools == ("full_tor_search",)
+    assert contract.required_capabilities == ("network.tor.search",)
+    assert contract.requires_evidence_report is True
+    assert contract.requires_file_mutation is True
+    assert contract.requires_file_read is False
+
+
+def test_task_contract_routes_english_tor_research_to_report_artifact() -> None:
+    contract = TaskContract.from_prompt(
+        "Gather all available information about this forum on Tor and save "
+        "the verified report to a file."
+    )
+
+    assert contract.required_tools == ("full_tor_search",)
+    assert contract.requires_evidence_report is True
+    assert contract.requires_file_mutation is True
+    assert contract.requires_file_read is False
+
+
+def test_output_report_file_is_not_misread_as_an_input_file() -> None:
+    contract = TaskContract.from_prompt(
+        "Inspect the forum, verify the findings, and save them to report.md."
+    )
+
+    assert contract.requires_browser_navigation is True
+    assert contract.requires_file_mutation is True
+    assert contract.requires_file_read is False
+
+
 def test_public_business_facts_recover_when_semantic_router_calls_it_chat() -> None:
     prompt = (
         "Cześć mi. Słuchaj, sprawdź mi ile w Warszawie jest cukierni "
@@ -506,6 +581,40 @@ def test_public_fact_lookup_recovery_does_not_capture_creative_request() -> None
     prompt = "Napisz opowiadanie o cukierni Cud Malina w Warszawie."
 
     assert TaskContract.implies_public_web_lookup(prompt) is False
+
+
+def test_purchase_source_question_does_not_require_postal_address() -> None:
+    prompt = (
+        "Znajdź w internecie przedwojenne nocniki, opisz ich rodzaje, "
+        "gdzie można je nabyć i jakie są ceny."
+    )
+
+    contract = TaskContract.from_prompt(prompt)
+
+    assert contract.requires_web_discovery is True
+    assert contract.required_public_fields == ()
+
+
+def test_price_question_does_not_require_a_location_count() -> None:
+    prompt = (
+        "Znajdź w internecie przedwojenne nocniki, sprawdź ile kosztują "
+        "i gdzie można je kupić."
+    )
+
+    contract = TaskContract.from_prompt(prompt)
+
+    assert contract.required_public_fields == ()
+
+
+def test_explicit_shop_address_remains_a_required_public_fact() -> None:
+    prompt = (
+        "Znajdź w internecie sklepy z antykami, gdzie można nabyć "
+        "przedwojenne nocniki, i podaj ich adresy."
+    )
+
+    contract = TaskContract.from_prompt(prompt)
+
+    assert contract.required_public_fields == ("address",)
 
 
 def test_public_business_contract_stays_open_on_namesake_product_page() -> None:
@@ -654,6 +763,47 @@ def test_task_contract_skips_discovery_when_owner_supplies_url() -> None:
     assert contract.requires_web_discovery is False
 
 
+def test_all_owner_supplied_web_targets_are_preserved() -> None:
+    prompt = (
+        "Compare www.invicti.com/product with "
+        "https://www.acunetix.com/product and inspect both."
+    )
+
+    assert extract_web_targets(prompt) == (
+        "https://www.invicti.com/product",
+        "https://www.acunetix.com/product",
+    )
+    assert extract_web_target(prompt) == "https://www.invicti.com/product"
+
+
+def test_search_result_alone_does_not_count_as_page_observation() -> None:
+    contract = TaskContract.from_prompt(
+        "Inspect https://www.invicti.com/product and report what is there."
+    )
+    search_only = [
+        {
+            "tool": "web_search",
+            "arguments": {"query": "Invicti product"},
+            "status": "succeeded",
+            "result_excerpt": "https://www.invicti.com/product",
+        }
+    ]
+
+    assert contract.unmet(search_only) == [
+        "browser_navigate",
+        "browser_snapshot",
+    ]
+
+
+def test_multiple_owner_urls_require_distinct_observed_pages() -> None:
+    contract = TaskContract.from_prompt(
+        "Compare https://www.invicti.com/product and "
+        "https://www.acunetix.com/product."
+    )
+
+    assert contract.requires_distinct_detail_page is True
+
+
 def test_spoken_url_is_reconstructed_without_search_discovery() -> None:
     prompt = (
         "Otwórz HTTPS, dwukropek, łamane, łamane, this, minus, domain, "
@@ -711,6 +861,71 @@ def test_discovery_report_rejects_second_search_as_detail_page() -> None:
     assert contract.unmet(listing_only) == [
         "browser_navigate:distinct_detail_page"
     ]
+
+
+def test_discovery_report_rejects_marketplace_category_as_detail_page() -> None:
+    contract = TaskContract.from_prompt(
+        "Search online markets for antique chamber pots and report prices."
+    )
+    category = (
+        "https://www.olx.pl/antyki-i-kolekcje/kolekcje/"
+        "q-ii-wojna-swiatowa/"
+    )
+    calls = [
+        {
+            "tool": "web_search",
+            "arguments": {"query": "antique chamber pots"},
+            "status": "succeeded",
+            "result_excerpt": f"Market category: {category}",
+        },
+        {
+            "tool": "browser_navigate",
+            "arguments": {"url": category},
+            "status": "succeeded",
+            "result_excerpt": f"- Page URL: {category}",
+        },
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": "Filters, categories, and a cookie banner.",
+        },
+    ]
+
+    assert contract.unmet(calls) == [
+        "browser_navigate:distinct_detail_page"
+    ]
+
+
+def test_product_under_collection_path_is_a_valid_detail_page() -> None:
+    contract = TaskContract.from_prompt(
+        "Search online for an antique chamber pot and report the result."
+    )
+    product = (
+        "https://example.test/collections/antiques/products/"
+        "victorian-chamber-pot"
+    )
+    calls = [
+        {
+            "tool": "web_search",
+            "arguments": {"query": "antique chamber pot"},
+            "status": "succeeded",
+            "result_excerpt": f"Victorian chamber pot: {product}",
+        },
+        {
+            "tool": "browser_navigate",
+            "arguments": {"url": product},
+            "status": "succeeded",
+        },
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": "Victorian chamber pot, porcelain, price 120 EUR.",
+        },
+    ]
+
+    assert contract.unmet(calls) == []
 
 
 def test_discovery_report_accepts_observed_external_source() -> None:
@@ -783,6 +998,71 @@ def test_discovery_report_accepts_high_level_search_and_read_tools() -> None:
         calls,
         request="Find the Cud Malina bakery online.",
     ) == []
+
+
+def test_discovery_report_rejects_github_chrome_without_document_content() -> None:
+    contract = TaskContract.from_prompt(
+        "Find a tool online, inspect its documentation, and report the result."
+    )
+    url = "https://github.com/example/project/blob/main/README.md"
+    calls = [
+        {
+            "tool": "web_search",
+            "arguments": {"query": "example tool"},
+            "status": "succeeded",
+            "result_excerpt": f"Result: {url}",
+        },
+        {
+            "tool": "web_read",
+            "arguments": {"url": url},
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "url": url,
+                    "title": "project/README.md at main",
+                    "content": (
+                        "### Page\n- Page URL: "
+                        f"{url}\n### Snapshot\nNavigation Menu Platform Solutions "
+                        "Enterprise Sign in Sign up"
+                    ),
+                }
+            ),
+        },
+    ]
+
+    assert contract.unmet(calls) == ["browser_navigate:distinct_detail_page"]
+
+
+def test_grounded_report_allows_structural_labels_and_observed_tool_names() -> None:
+    contract = TaskContract.from_prompt(
+        "Find a CAPTCHA tool online and report the result."
+    )
+    url = "https://example.test/dread-captcha-solver"
+    calls = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": f"Dread CAPTCHA Solver: {url}",
+        },
+        {
+            "tool": "web_read",
+            "arguments": {"url": url},
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "url": url,
+                    "content": "Dread CAPTCHA Solver documentation and usage.",
+                }
+            ),
+        },
+    ]
+    answer = (
+        "**Step 1:** `web_search` found Dread CAPTCHA Solver.\n"
+        "**Step 2:** `web_read` opened its documentation.\n"
+        "**Conclusion:** Dread CAPTCHA Solver is the verified result."
+    )
+
+    assert contract.answer_issues(answer, calls, request="Find a CAPTCHA tool.") == []
 
 
 def test_discovery_report_rejects_high_level_read_of_unobserved_url() -> None:
@@ -919,6 +1199,45 @@ def test_conditional_artifact_fallback_is_allowed_but_not_required() -> None:
     assert contract.requires_created_skill is False
     assert contract.allows_artifact_fallback is True
     assert "learning_create_tool" not in contract.unmet([])
+
+
+def test_tool_or_skill_wording_requires_exactly_one_artifact_kind() -> None:
+    contract = TaskContract.from_prompt(
+        "Musisz znaleźć albo stworzyć skill, bądź też narzędzie, które "
+        "rozwiązuje ten problem."
+    )
+
+    assert contract.requires_created_artifact is True
+    assert contract.requires_created_tool is False
+    assert contract.requires_created_skill is False
+    assert contract.unmet([]) == ["learning_create_tool_or_skill"]
+    assert contract.unmet(
+        [{"tool": "learning_create_skill", "status": "succeeded"}]
+    ) == []
+    assert contract.unmet(
+        [{"tool": "learning_create_tool", "status": "succeeded"}]
+    ) == []
+
+
+def test_tool_and_skill_wording_still_requires_both_artifacts() -> None:
+    contract = TaskContract.from_prompt(
+        "Stwórz narzędzie oraz stwórz skill, który będzie go używał."
+    )
+
+    assert contract.requires_created_artifact is False
+    assert contract.requires_created_tool is True
+    assert contract.requires_created_skill is True
+
+
+def test_tor_login_infinitive_keeps_network_and_artifact_routes() -> None:
+    contract = TaskContract.from_prompt(
+        "Wejść w Darknet i zalogować się na forum. Musisz znaleźć albo "
+        "stworzyć skill bądź narzędzie."
+    )
+
+    assert contract.required_tools == ("full_tor_search",)
+    assert contract.required_capabilities == ("network.tor.search",)
+    assert contract.requires_created_artifact is True
 
 
 def test_conditional_artifact_fallback_can_finish_after_unsuccessful_search() -> None:
@@ -1721,7 +2040,7 @@ async def test_multilingual_intent_router_classifies_hungarian_action() -> None:
     assert intent.requires_report is True
     assert intent.web_query == "internetes kutatási eredmények"
     assert llm.kwargs["temperature"] == 0.0
-    assert llm.kwargs["max_tokens"] == 256
+    assert llm.kwargs["max_tokens"] == 384
     assert llm.kwargs["response_format"]["type"] == "json_schema"
 
 
@@ -1874,6 +2193,52 @@ async def test_router_keeps_multilingual_file_work_with_explicit_path() -> None:
 
 
 @pytest.mark.asyncio
+async def test_router_keeps_read_only_current_project_review_without_path() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "message_clear": True,
+                    "message_odd": False,
+                    "action_requested": True,
+                    "continue_previous": False,
+                    "references_previous": True,
+                    "capabilities": ["file_read"],
+                    "requires_report": True,
+                    "distinct_detail_page": False,
+                    "artifact_fallback": False,
+                    "required_public_fields": [],
+                    "public_subject": "",
+                    "web_query": "",
+                    "language_scope": "none",
+                    "response_language": "",
+                }
+            )
+
+    router = MultilingualIntentRouter(LLMStub())
+    intent = await router.classify(
+        "Przejrzyj kod PALADYNA i przedstaw plan zmian przed edycją."
+    )
+
+    assert intent is not None
+    assert intent.action_requested is True
+    assert intent.capabilities == ("file_read",)
+    assert intent.requires_report is True
+    assert router.last_sanitization_reason == ""
+
+
+def test_project_code_review_builds_deterministic_read_contract() -> None:
+    contract = TaskContract.from_prompt(
+        "Przejrzyj kod PALADYNA i przedstaw dokładnie proponowane zmiany. "
+        "Nie modyfikuj plików przed zatwierdzeniem."
+    )
+
+    assert contract.requires_file_read is True
+    assert contract.requires_file_mutation is False
+    assert contract.requires_evidence_report is True
+
+
+@pytest.mark.asyncio
 async def test_router_keeps_explicit_runtime_log_review() -> None:
     class LLMStub:
         async def ask(self, **kwargs) -> str:
@@ -1928,6 +2293,12 @@ async def test_router_normalizes_language_independent_action_contradiction() -> 
                         "contact",
                         "opening_hours",
                     ],
+                    "public_field_evidence": {
+                        "address": "címét",
+                        "contact": "telefonszámát",
+                        "count": "",
+                        "opening_hours": "nyitvatartását",
+                    },
                     "public_subject": "Csodamalina",
                     "web_query": "Csodamalina cukrászda Varsó",
                 }
@@ -1942,21 +2313,481 @@ async def test_router_normalizes_language_independent_action_contradiction() -> 
 
     assert intent is not None
     assert intent.action_requested is True
-    assert intent.required_public_fields == (
-        "address",
-        "contact",
-        "opening_hours",
-    )
+    assert intent.required_public_fields == ("contact",)
     assert intent.public_subject == "Csodamalina"
     contract = intent.to_contract()
     assert contract.requires_browser_navigation is True
-    assert contract.required_public_fields == (
-        "address",
-        "contact",
-        "opening_hours",
-    )
+    assert contract.required_public_fields == ("contact",)
     assert contract.required_public_subject == "Csodamalina"
     assert llm.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_router_discards_unasked_public_fields_from_product_research() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "message_clear": True,
+                    "message_odd": False,
+                    "action_requested": True,
+                    "continue_previous": False,
+                    "references_previous": False,
+                    "creative_response": False,
+                    "capabilities": ["browser"],
+                    "requires_report": True,
+                    "distinct_detail_page": True,
+                    "artifact_fallback": False,
+                    "execute_created_artifact": False,
+                    "recall_memory": False,
+                    "memory_query": "",
+                    "required_public_fields": [
+                        "count",
+                        "address",
+                        "contact",
+                        "opening_hours",
+                    ],
+                    "public_field_evidence": {
+                        "address": "",
+                        "contact": "",
+                        "count": "",
+                        "opening_hours": "",
+                    },
+                    "public_subject": "Przedwojenne",
+                    "web_query": "przedwojenne nocniki austriackie francuskie",
+                    "language_scope": "none",
+                    "response_language": "",
+                }
+            )
+
+    prompt = (
+        "Znajdź raport o przedwojennych nocnikach austriackich i francuskich, "
+        "ich rodzajach, cenach oraz miejscu, gdzie można je kupić."
+    )
+    router = MultilingualIntentRouter(LLMStub())
+
+    intent = await router.classify(prompt)
+
+    assert intent is not None
+    assert intent.required_public_fields == ()
+    assert intent.public_subject == ""
+    assert "ungrounded_public_fields" in router.last_sanitization_reason
+    assert intent.to_contract(prompt).required_public_fields == ()
+
+
+@pytest.mark.asyncio
+async def test_router_grounds_multilingual_research_facets_in_owner_text() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "message_clear": True,
+                    "message_odd": False,
+                    "action_requested": True,
+                    "continue_previous": False,
+                    "references_previous": False,
+                    "creative_response": False,
+                    "capabilities": ["browser"],
+                    "requires_report": True,
+                    "distinct_detail_page": True,
+                    "artifact_fallback": False,
+                    "execute_created_artifact": False,
+                    "recall_memory": False,
+                    "memory_query": "",
+                    "required_public_fields": [],
+                    "public_field_evidence": {
+                        "address": "",
+                        "contact": "",
+                        "count": "",
+                        "opening_hours": "",
+                    },
+                    "public_subject": "",
+                    "research_facets": ["price", "purchase_source"],
+                    "research_facet_evidence": {
+                        "price": "quali sono i prezzi",
+                        "purchase_source": "dove posso comprarli",
+                    },
+                    "web_query": "vasi da notte francesi anteguerra",
+                    "language_scope": "none",
+                    "response_language": "",
+                }
+            )
+
+    prompt = (
+        "Cerca vasi da notte francesi anteguerra: quali sono i prezzi e "
+        "dove posso comprarli?"
+    )
+    intent = await MultilingualIntentRouter(LLMStub()).classify(prompt)
+
+    assert intent is not None
+    assert intent.research_facets == ("price", "purchase_source")
+    assert intent.to_contract(prompt).required_research_facets == (
+        "price",
+        "purchase_source",
+    )
+
+
+@pytest.mark.asyncio
+async def test_router_keeps_research_facets_with_inflected_or_translated_evidence() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "action_requested": True,
+                    "capabilities": ["browser"],
+                    "requires_report": True,
+                    "distinct_detail_page": True,
+                    "research_facets": ["price", "purchase_source"],
+                    "research_facet_evidence": {
+                        "price": "ceny",
+                        "purchase_source": "direct link do każdej oferty",
+                    },
+                    "web_query": "kolekcjonerskie filiżanki przed 1970",
+                }
+            )
+
+    prompt = (
+        "Znajdź oferty kolekcjonerskich filiżanek sprzed 1970 roku. "
+        "Podaj cenę i bezpośredni link do każdej oferty."
+    )
+    intent = await MultilingualIntentRouter(LLMStub()).classify(prompt)
+
+    assert intent is not None
+    assert intent.research_facets == ("price", "purchase_source")
+
+
+@pytest.mark.asyncio
+async def test_router_grounds_explicit_multilingual_result_count() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "message_clear": True,
+                    "message_odd": False,
+                    "action_requested": True,
+                    "continue_previous": False,
+                    "references_previous": False,
+                    "creative_response": False,
+                    "capabilities": ["browser"],
+                    "requires_report": True,
+                    "distinct_detail_page": True,
+                    "artifact_fallback": False,
+                    "execute_created_artifact": False,
+                    "recall_memory": False,
+                    "memory_query": "",
+                    "required_public_fields": [],
+                    "public_field_evidence": {
+                        "address": "",
+                        "contact": "",
+                        "count": "",
+                        "opening_hours": "",
+                    },
+                    "public_subject": "",
+                    "research_facets": ["price", "purchase_source"],
+                    "research_facet_evidence": {
+                        "price": "indica il prezzo",
+                        "purchase_source": "link diretto",
+                    },
+                    "minimum_detail_sources": 2,
+                    "minimum_detail_sources_evidence": "due offerte",
+                    "web_query": "tazze vintage prima del 1970",
+                    "language_scope": "none",
+                    "response_language": "",
+                }
+            )
+
+    prompt = (
+        "Trova due offerte di tazze vintage prodotte prima del 1970, "
+        "indica il prezzo e il link diretto."
+    )
+    intent = await MultilingualIntentRouter(LLMStub()).classify(prompt)
+
+    assert intent is not None
+    assert intent.minimum_detail_sources == 2
+    assert intent.to_contract(prompt).minimum_detail_sources == 2
+
+
+@pytest.mark.asyncio
+async def test_router_discards_result_count_without_exact_owner_evidence() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "action_requested": True,
+                    "capabilities": ["browser"],
+                    "requires_report": True,
+                    "distinct_detail_page": True,
+                    "minimum_detail_sources": 8,
+                    "minimum_detail_sources_evidence": "eight offers",
+                    "web_query": "antique cup offer",
+                }
+            )
+
+    intent = await MultilingualIntentRouter(LLMStub()).classify(
+        "Find an antique cup offer and report it."
+    )
+
+    assert intent is not None
+    assert intent.minimum_detail_sources == 0
+    assert intent.to_contract(
+        "Find an antique cup offer and report it."
+    ).minimum_detail_sources == 1
+
+
+@pytest.mark.asyncio
+async def test_router_preserves_exhaustive_list_descriptions_and_images() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "message_clear": True,
+                    "message_odd": False,
+                    "action_requested": True,
+                    "continue_previous": False,
+                    "references_previous": False,
+                    "creative_response": False,
+                    "capabilities": ["browser"],
+                    "requires_report": True,
+                    "distinct_detail_page": True,
+                    "artifact_fallback": False,
+                    "execute_created_artifact": False,
+                    "recall_memory": False,
+                    "memory_query": "",
+                    "required_public_fields": [],
+                    "public_field_evidence": {
+                        "address": "",
+                        "contact": "",
+                        "count": "",
+                        "opening_hours": "",
+                    },
+                    "public_subject": "",
+                    "research_facets": [
+                        "item_list",
+                        "item_descriptions",
+                        "images",
+                    ],
+                    "research_facet_evidence": {
+                        "exhaustive_coverage": "wszystkie gatunki",
+                        "images": "znajdź mi również zdjęcia",
+                        "item_descriptions": "opisz",
+                        "item_list": "wszystkie gatunki",
+                        "price": "",
+                        "purchase_source": "",
+                    },
+                    "minimum_detail_sources": 0,
+                    "minimum_detail_sources_evidence": "",
+                    "web_query": "gatunki grzybów psychoaktywnych w Polsce",
+                    "language_scope": "none",
+                    "response_language": "",
+                }
+            )
+
+    prompt = (
+        "Wyszukaj i opisz wszystkie gatunki grzybów psychoaktywnych "
+        "występujące w Polsce. Jeśli się da, znajdź mi również zdjęcia."
+    )
+    intent = await MultilingualIntentRouter(LLMStub()).classify(prompt)
+
+    assert intent is not None
+    assert intent.research_facets == (
+        "item_list",
+        "item_descriptions",
+        "images",
+        "exhaustive_coverage",
+    )
+    contract = intent.to_contract(prompt)
+    assert contract.required_research_facets == intent.research_facets
+    assert contract.minimum_detail_sources == 2
+
+
+def test_exhaustive_visual_research_requires_two_observed_sources() -> None:
+    first = "https://source.test/species-one"
+    second = "https://source.test/species-two"
+    search = {
+        "tool": "web_search",
+        "status": "succeeded",
+        "result_excerpt": json.dumps(
+            {"results": [{"url": first}, {"url": second}]}
+        ),
+    }
+
+    def observed(url: str, suffix: str) -> list[dict]:
+        return [
+            {
+                "tool": "browser_navigate",
+                "status": "succeeded",
+                "arguments": {"url": url},
+                "result_excerpt": f"- Page URL: {url}",
+            },
+            {
+                "tool": "browser_snapshot",
+                "status": "succeeded",
+                "result_excerpt": (
+                    f"- Page URL: {url}\n"
+                    f'- img "Species {suffix} alpha"\n'
+                    f'- img "Species {suffix} beta"\n'
+                    f'- heading "Species {suffix} alpha" [level=2]\n'
+                    "- paragraph: A concrete observed description with several words.\n"
+                    f'- heading "Species {suffix} beta" [level=2]\n'
+                    "- paragraph: Another concrete observed description with several words."
+                ),
+            },
+        ]
+
+    contract = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+        requires_web_discovery=True,
+        requires_distinct_detail_page=True,
+        requires_evidence_report=True,
+        required_research_facets=(
+            "item_list",
+            "item_descriptions",
+            "images",
+            "exhaustive_coverage",
+        ),
+    )
+
+    assert contract.unmet([search, *observed(first, "one")]) == [
+        "browser_evidence:detail_sources=1/2"
+    ]
+    assert contract.unmet(
+        [search, *observed(first, "one"), *observed(second, "two")]
+    ) == []
+
+
+def test_research_report_must_list_and_describe_requested_items() -> None:
+    contract = TaskContract(
+        requires_evidence_report=True,
+        required_research_facets=("item_list", "item_descriptions"),
+    )
+    calls = [
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "result_excerpt": (
+                '- heading "Species alpha" [level=2]\n'
+                "- paragraph: Alpha has a detailed observed description.\n"
+                '- heading "Species beta" [level=2]\n'
+                "- paragraph: Beta has another detailed observed description."
+            ),
+        }
+    ]
+
+    assert contract.answer_issues("The source discusses two species.", calls) == [
+        "answer:research_item_list_missing"
+    ]
+    assert contract.answer_issues(
+        "- Species alpha — Alpha has a detailed observed description.\n"
+        "- Species beta — Beta has another detailed observed description.",
+        calls,
+    ) == []
+
+
+def test_passive_smoke_test_text_does_not_require_command_execution() -> None:
+    contract = TaskContract.from_prompt(
+        "Utwórz plik smoke-report.md z nagłówkiem '# PALADYN smoke test', "
+        "a potem go odczytaj."
+    )
+
+    assert contract.requires_file_mutation is True
+    assert contract.requires_file_read is True
+    assert contract.requires_command_execution is False
+
+
+def test_explicit_test_execution_still_requires_command_execution() -> None:
+    contract = TaskContract.from_prompt("Run the smoke test with pytest.")
+
+    assert contract.requires_command_execution is True
+
+
+def test_research_facets_require_price_and_commerce_evidence() -> None:
+    contract = TaskContract(
+        required_research_facets=("price", "purchase_source"),
+    )
+    historical = [
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "result_excerpt": (
+                "- Page URL: https://museum.test/article/chamber-pots\n"
+                "- Page Title: Chamber-pot history\n"
+                "A historical overview with no current offer."
+            ),
+        }
+    ]
+
+    assert contract.unmet(historical) == [
+        "browser_evidence:research_price",
+        "browser_evidence:research_purchase_source",
+    ]
+
+    market = historical + [
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "result_excerpt": (
+                "- Page URL: https://market.test/listing/chamber-pots\n"
+                "- Page Title: Antique chamber pots\n"
+                "French porcelain chamber pot — 125 EUR"
+            ),
+        }
+    ]
+
+    assert contract.unmet(market) == []
+
+
+@pytest.mark.asyncio
+async def test_router_cannot_authorize_wrong_fields_with_real_prompt_quotes() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return json.dumps(
+                {
+                    "message_clear": True,
+                    "message_odd": False,
+                    "action_requested": True,
+                    "continue_previous": False,
+                    "references_previous": False,
+                    "creative_response": False,
+                    "capabilities": ["browser"],
+                    "requires_report": True,
+                    "distinct_detail_page": False,
+                    "artifact_fallback": False,
+                    "execute_created_artifact": False,
+                    "recall_memory": False,
+                    "memory_query": "",
+                    "required_public_fields": [
+                        "count",
+                        "address",
+                        "contact",
+                        "opening_hours",
+                    ],
+                    "public_field_evidence": {
+                        "address": "gdzie można je kupić",
+                        "contact": "gdzie można je kupić",
+                        "count": "ile kosztują",
+                        "opening_hours": "gdzie można je kupić",
+                    },
+                    "public_subject": "nocników",
+                    "web_query": "przedwojenne nocniki austriackie francuskie",
+                    "language_scope": "none",
+                    "response_language": "",
+                }
+            )
+
+    prompt = (
+        "Wyszukaj nocniki produkowane przed II wojną światową. Chcę się "
+        "dowiedzieć, ile kosztują, gdzie można je kupić i jakie są zasady "
+        "ich kolekcjonowania."
+    )
+    router = MultilingualIntentRouter(LLMStub())
+
+    intent = await router.classify(prompt)
+
+    assert intent is not None
+    assert intent.required_public_fields == ()
+    assert intent.public_subject == ""
+    assert intent.to_contract(prompt).required_public_fields == ()
 
 
 @pytest.mark.asyncio
@@ -2219,6 +3050,60 @@ def test_task_contract_accepts_source_backed_based_adjective() -> None:
         calls,
         request="Find an alternative to FireCrawler online.",
     ) == []
+
+
+def test_task_contract_accepts_grounded_feature_labels_and_plural_protocol() -> None:
+    contract = TaskContract.from_prompt(
+        "Find a tool online that can solve CAPTCHA automatically and report it."
+    )
+    calls = [
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": (
+                "- Page URL: https://www.capsolver.com/\n"
+                "Capsolver CAPTCHA Solver supports API integrations, Chrome, "
+                "Selenium, Playwright, Puppeteer, pricing and use cases."
+            ),
+        }
+    ]
+    answer = (
+        "Capsolver can solve CAPTCHAs through its **API** and "
+        "**Chrome Extension version**. Its **Pricing description** includes "
+        "example use cases for Selenium, Playwright, and Puppeteer."
+    )
+
+    assert contract.answer_issues(
+        answer,
+        calls,
+        request="Find a tool online that can solve CAPTCHA automatically.",
+    ) == []
+
+
+def test_task_contract_ignores_markdown_step_headings_as_entity_claims() -> None:
+    contract = TaskContract.from_prompt(
+        "Inspect https://example.test and report the result."
+    )
+    calls = [
+        {
+            "tool": "browser_snapshot",
+            "arguments": {},
+            "status": "succeeded",
+            "result_excerpt": (
+                "- Page URL: https://example.test\n"
+                "The API documentation is available."
+            ),
+        }
+    ]
+
+    issues = contract.answer_issues(
+        "### Step 1: Capture the API section\nThe API documentation is available.",
+        calls,
+        request="Inspect https://example.test and report the result.",
+    )
+
+    assert not any("Step" in issue or "Capture" in issue for issue in issues)
 
 
 def test_task_contract_rejects_mistyped_online_source_url() -> None:

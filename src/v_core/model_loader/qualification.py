@@ -111,17 +111,30 @@ class ModelQualificationCard:
     def score(self, capability: str) -> int:
         return int(self.capabilities.get(capability, 0))
 
-    def is_current(self, model_path: Path, profile: Any) -> bool:
+    def stale_reasons(self, model_path: Path, profile: Any) -> tuple[str, ...]:
+        """Explain why this card cannot currently participate in routing."""
+
         try:
             resolved = Path(model_path).expanduser().resolve(strict=True)
-            return (
-                Path(self.model_path).expanduser().resolve() == resolved
-                and self.model_fingerprint == model_file_fingerprint(resolved)
-                and self.profile_fingerprint == model_profile_fingerprint(profile)
-                and self.harness_version == QUALIFICATION_HARNESS_VERSION
-            )
         except OSError:
-            return False
+            return ("model_missing",)
+
+        reasons: list[str] = []
+        if Path(self.model_path).expanduser().resolve() != resolved:
+            reasons.append("model_path_changed")
+        if self.model_fingerprint != model_file_fingerprint(resolved):
+            reasons.append("model_file_changed")
+        if self.profile_fingerprint != model_profile_fingerprint(profile):
+            reasons.append("profile_changed")
+        if self.harness_version != QUALIFICATION_HARNESS_VERSION:
+            reasons.append(
+                "qualification_harness_changed:"
+                f"{self.harness_version}->{QUALIFICATION_HARNESS_VERSION}"
+            )
+        return tuple(reasons)
+
+    def is_current(self, model_path: Path, profile: Any) -> bool:
+        return not self.stale_reasons(model_path, profile)
 
     def to_dict(self) -> dict[str, Any]:
         return {

@@ -93,7 +93,12 @@ class LLM:
         return AsyncOpenAI(
             base_url=self.config.base_url,
             api_key=self._api_key or os.getenv("V_CORE_API_KEY", "local"),
-            timeout=float(os.getenv("V_CORE_TIMEOUT", "120")),
+            timeout=float(os.getenv("V_CORE_TIMEOUT", "300")),
+            # The OpenAI client retries transport timeouts by default. Against
+            # one local llama.cpp slot that silently restarts the same long
+            # generation multiple times and makes PALADYN look frozen. Agent
+            # recovery is explicit and journalled, so transport retry stays off.
+            max_retries=max(0, int(os.getenv("V_CORE_HTTP_RETRIES", "0"))),
         )
 
     async def reconfigure(self, config: LLMConfig | None = None) -> None:
@@ -147,7 +152,7 @@ class LLM:
             # fail quickly. Apply a per-request override so the artifact path
             # does not inherit the short conversational HTTP timeout.
             request["timeout"] = max(
-                float(os.getenv("V_CORE_TIMEOUT", "120")),
+                float(os.getenv("V_CORE_TIMEOUT", "300")),
                 float(os.getenv("V_CORE_ARTIFACT_TIMEOUT", "1200")),
             )
         native_requested = bool(tools) and self._native_tools_supported is not False

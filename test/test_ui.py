@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from starlette.testclient import TestClient
 
 from v_core.edition import load_edition_extension, resolve_edition
 from v_core.ui import UIRuntime, create_app
+from v_core.ui.runtime_activity import runtime_activity
 
 
 class _Process:
@@ -94,6 +98,214 @@ def test_ui_uses_independent_scroll_regions_and_fixed_composer() -> None:
     assert javascript.status_code == 200
     assert "function chatIsPinnedToBottom()" in javascript.text
     assert "scrollChatToBottom(followOutput);" in javascript.text
+    assert 'id="live-state"' in index.text
+    assert 'id="live-context-meter"' in index.text
+    assert "function renderRuntimeActivity(activity)" in javascript.text
+
+
+def test_runtime_activity_combines_live_model_and_task_ledger(tmp_path: Path) -> None:
+    autonomy = tmp_path / "autonomy"
+    checkpoints = autonomy / "interactive" / "checkpoints"
+    journals = autonomy / "interactive" / "journal"
+    checkpoints.mkdir(parents=True)
+    journals.mkdir(parents=True)
+    task_id = "interactive-live"
+    now = datetime.now(timezone.utc).isoformat()
+    (checkpoints / f"{task_id}.json").write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "status": "running",
+                "objective": "Build a verified local tool",
+                "updated_at": now,
+                "tool_calls": [
+                    {
+                        "sequence": 1,
+                        "tool": "learning_create_tool",
+                        "status": "failed",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (journals / f"{task_id}.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": now,
+                        "event": "task_started",
+                        "data": {},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": now,
+                        "event": "model_phase_routed",
+                        "data": {"from_phase": "tool_use", "to_phase": "coding"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": now,
+                        "event": "tool_failed",
+                        "data": {"sequence": 1, "tool": "learning_create_tool"},
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    log = tmp_path / "llama.log"
+    log.write_text(
+        "slot print_timing: id 0 | n_decoded = 181, tg = 4.5 t/s, "
+        "tg_3s = 4.2 t/s\n",
+        encoding="utf-8",
+    )
+    session = SimpleNamespace(
+        profile=SimpleNamespace(port=5001, context_size=12_032),
+        log_path=log,
+    )
+
+    def fake_http_json(port: int, path: str):
+        assert (port, path) == (5001, "/slots")
+        return [
+            {
+                "n_ctx": 12_032,
+                "is_processing": True,
+                "n_prompt_tokens": 6_278,
+                "n_prompt_tokens_processed": 6_278,
+                "next_token": [{"n_decoded": 181, "n_remain": 2_819}],
+            }
+        ]
+
+    activity = runtime_activity(
+        autonomy,
+        session,
+        ready=False,
+        http_json=fake_http_json,
+    )
+
+    assert activity["state"] == "repairing"
+    assert activity["phase"] == "coding"
+    assert activity["generated_tokens"] == 181
+    assert activity["generation_tokens_per_second"] == 4.2
+    assert activity["context_used"] == 6_459
+    assert activity["last_tool"] == "learning_create_tool"
+    assert any(event["label"] == "FAIL" for event in activity["events"])
+
+
+def test_runtime_activity_does_not_leak_previous_ui_session_task(
+    tmp_path: Path,
+) -> None:
+    autonomy = tmp_path / "autonomy"
+    checkpoints = autonomy / "interactive" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    stale = checkpoints / "interactive-stale.json"
+    stale.write_text(
+        json.dumps(
+            {
+                "task_id": "interactive-stale",
+                "status": "running",
+                "objective": "Old task",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    activity = runtime_activity(
+        autonomy,
+        None,
+        ready=True,
+        session_started_at=stale.stat().st_mtime + 1,
+    )
+
+    assert activity["state"] == "idle"
+    assert activity["phase"] == "idle"
+    assert activity["task_id"] == ""
+    assert activity["objective"] == ""
+    assert activity["events"] == []
+
+
+def test_runtime_activity_derives_live_rate_between_slot_samples(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "llama.log"
+    log.write_text("model generating without periodic timing yet\n", encoding="utf-8")
+    session = SimpleNamespace(
+        profile=SimpleNamespace(port=5001, context_size=12_032),
+        process=SimpleNamespace(pid=42),
+        log_path=log,
+    )
+    generated = iter((100, 112))
+
+    def fake_http_json(_: int, __: str):
+        return [
+            {
+                "id_task": 7,
+                "n_ctx": 12_032,
+                "is_processing": True,
+                "n_prompt_tokens": 2_000,
+                "n_prompt_tokens_processed": 2_000,
+                "next_token": [{"n_decoded": next(generated), "n_remain": 2_000}],
+            }
+        ]
+
+    sample: dict = {}
+    first = runtime_activity(
+        None,
+        session,
+        ready=False,
+        sample_state=sample,
+        sample_now=10.0,
+        http_json=fake_http_json,
+    )
+    second = runtime_activity(
+        None,
+        session,
+        ready=False,
+        sample_state=sample,
+        sample_now=12.0,
+        http_json=fake_http_json,
+    )
+
+    assert first["generation_tokens_per_second"] is None
+    assert second["generation_tokens_per_second"] == 6.0
+
+
+def test_runtime_activity_keeps_completed_response_timing(tmp_path: Path) -> None:
+    log = tmp_path / "llama.log"
+    log.write_text(
+        "slot print_timing: prompt eval time = 100.00 ms / 200 tokens "
+        "(0.50 ms per token, 2000.00 tokens per second)\n"
+        "slot print_timing: eval time = 1000.00 ms / 80 tokens "
+        "(12.50 ms per token, 80.00 tokens per second)\n",
+        encoding="utf-8",
+    )
+    session = SimpleNamespace(
+        profile=SimpleNamespace(port=5001, context_size=12_032),
+        log_path=log,
+    )
+
+    activity = runtime_activity(
+        None,
+        session,
+        ready=True,
+        http_json=lambda _port, _path: [
+            {
+                "n_ctx": 12_032,
+                "is_processing": False,
+                "next_token": [],
+            }
+        ],
+    )
+
+    assert activity["generated_tokens"] == 80
+    assert activity["generation_tokens_per_second"] == 80.0
+    assert activity["prompt_tokens"] == 200
+    assert activity["prompt_tokens_per_second"] == 2000.0
 
 
 def test_ui_streams_v_response_as_ndjson() -> None:

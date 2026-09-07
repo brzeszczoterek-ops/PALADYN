@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import quote_plus, unquote, urlsplit
 from uuid import uuid4
 
-from .autonomy import AuthorizationEnvelope, AuthorizationGuard, review_task
+from .autonomy import AuthorizationEnvelope, AuthorizationGuard, TaskContract, review_task
 from .config import Config
 from .edition import (
     PUBLIC_EDITION,
@@ -48,6 +48,12 @@ from .sandbox import (
     SandboxUnavailable,
 )
 from .tools.filesystem import Filesystem
+from .tool_recovery import (
+    ToolCallOutcome,
+    ToolRecoveryRegistry,
+    capabilities_for_tool,
+    execute_with_recovery,
+)
 
 
 class MCPToolExecutionError(RuntimeError):
@@ -60,6 +66,13 @@ class MCPTools:
         self,
         config: Config,
     ):
+        self.workspace = Path(config.workspace).expanduser().resolve()
+        configured_project_root = getattr(config, "project_read_root", None)
+        self.project_read_root = (
+            Path(configured_project_root).expanduser().resolve()
+            if configured_project_root
+            else None
+        )
         self.learning_profile = getattr(config, "learning_profile", "client")
         configured_edition = getattr(config, "edition", PUBLIC_EDITION)
         self.edition = (
@@ -98,6 +111,10 @@ class MCPTools:
             getattr(config, "autonomy_root", config.workspace / ".paladyn_autonomy")
         )
         self.interactive_trace_root = autonomy_root / "interactive"
+        learning_root = Path(
+            getattr(config, "learning_root", config.workspace / ".paladyn_learning")
+        )
+        self.recovery = ToolRecoveryRegistry(learning_root / "recovery")
 
         #
         # Wrappers
@@ -129,9 +146,6 @@ class MCPTools:
             )
             self.sandbox_error = ""
             self.edition_extension.bind_runtime(self.authorization, backend)
-            learning_root = Path(
-                getattr(config, "learning_root", config.workspace / ".paladyn_learning")
-            )
             self.learning = LearningRuntime(
                 learning_root,
                 self.authorization,
@@ -144,6 +158,33 @@ class MCPTools:
             self.edition_extension.bind_runtime(self.authorization, None)
             self.learning = None
             self.learning_error = str(exc)
+        self._register_recovery_providers()
+
+    def _register_recovery_providers(self) -> None:
+        # Register only tools the current edition can actually execute. The
+        # global capability vocabulary includes Full names for contract parsing,
+        # but a public runtime must never turn that vocabulary into a provider.
+        available = self._known_tool_names() | {"cat", "ls", "tree"}
+        for name in sorted(available):
+            self.recovery.register_provider(
+                name,
+                capabilities_for_tool(name),
+                priority=100,
+                kind="native",
+            )
+        if self.learning is None:
+            self.recovery.retain_providers(available)
+            return
+        generated_names: set[str] = set()
+        for manifest in self.learning.active_tool_manifests():
+            generated_names.add(manifest.name)
+            self.recovery.register_provider(
+                manifest.name,
+                manifest.provides_capabilities,
+                priority=(200 if manifest.repair_ticket_id else 100),
+                kind="generated_repair" if manifest.repair_ticket_id else "generated",
+            )
+        self.recovery.retain_providers(available | generated_names)
 
     async def ensure_browser_session(self) -> None:
 
@@ -237,7 +278,20 @@ class MCPTools:
         invented or truncated fixtures.
         """
 
-        self._observed_browser_snapshot = str(snapshot_text)[:20_000]
+        observed = str(snapshot_text)[:20_000]
+        self._observed_browser_snapshot = observed
+        # A link exposed by the browser is grounded evidence just as much as a
+        # URL returned by ``web_search``. Register it so a later ``web_read``
+        # can follow an item/detail link without being rejected as invented.
+        for candidate in re.findall(
+            r"https?://[^\s<>\[\](){}\"']+",
+            observed,
+            re.IGNORECASE,
+        ):
+            discovered = candidate.rstrip("`\"'),.;:]}\\")
+            normalized = self._normalized_web_url(discovered)
+            if normalized:
+                self._web_discovered_urls[normalized] = discovered
 
     #
     # Filesystem shortcuts
@@ -497,6 +551,33 @@ class MCPTools:
             }
         )
 
+    @staticmethod
+    def _document_content_url(url: str) -> str:
+        """Prefer a document's raw representation over repository-site chrome.
+
+        Search engines commonly return GitHub ``/blob/`` links. Opening those
+        links through the accessibility browser can spend the entire bounded
+        observation on GitHub navigation before reaching the file.  The raw
+        representation is the same discovered document, not a model-invented
+        destination, and exposes the evidence the user actually asked us to
+        inspect.
+        """
+
+        parsed = urlsplit(url)
+        if (parsed.hostname or "").casefold().removeprefix("www.") != "github.com":
+            return url
+        match = re.fullmatch(
+            r"/([^/]+)/([^/]+)/blob/([^/]+)/(.+)",
+            parsed.path,
+        )
+        if match is None:
+            return url
+        owner, repository, revision, document_path = match.groups()
+        return (
+            "https://raw.githubusercontent.com/"
+            f"{owner}/{repository}/{revision}/{document_path}"
+        )
+
     async def web_read(self, url: str) -> str:
         """Open a verified result and return its actual accessibility snapshot."""
 
@@ -519,7 +600,10 @@ class MCPTools:
                     }
                 )
 
-        navigation = await self.browser_call("browser_navigate", {"url": url})
+        content_url = self._document_content_url(url)
+        navigation = await self.browser_call(
+            "browser_navigate", {"url": content_url}
+        )
         snapshot = await self.browser_call("browser_snapshot", {})
         actual_url = re.search(r"^- Page URL:\s*(\S+)", snapshot, re.MULTILINE)
         page_title = re.search(r"^- Page Title:\s*(.+)$", snapshot, re.MULTILINE)
@@ -532,10 +616,14 @@ class MCPTools:
             {
                 "requested_url": model_requested_url,
                 "corrected_url": url if url != model_requested_url else "",
-                "url": actual_url.group(1) if actual_url else url,
+                "url": actual_url.group(1) if actual_url else content_url,
                 "title": page_title.group(1).strip() if page_title else "",
-                "navigation": navigation[:1_000],
+                "content_url": content_url if content_url != url else "",
+                # Keep content ahead of adapter diagnostics. Agent traces retain
+                # a bounded prefix, so evidence must not be displaced by a long
+                # navigation response.
                 "content": snapshot,
+                "navigation": navigation[:1_000],
             }
         )
 
@@ -656,6 +744,11 @@ class MCPTools:
                 "scope": {"type": "string", "enum": ["task", "persistent"]},
                 "lesson_ids": {"type": "array", "items": {"type": "string"}},
                 "timeout_seconds": {"type": "number", "minimum": 0.05, "maximum": 120},
+                "provides_capabilities": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "repair_ticket_id": {"type": "string"},
             },
             "required": [
                 "name",
@@ -809,7 +902,10 @@ class MCPTools:
                 "Python tool from source defining run(arguments). The normal agent "
                 "path supplies source only: PALADYN derives the name, description, "
                 "concrete fixture, strict schemas, validation contract, and lifecycle "
-                "from immutable task context and runtime-observed data. An optional "
+                "from immutable task context and runtime-observed data. Without an "
+                "owner-specified semantic oracle, source must consume bounded input "
+                "and pass deterministic input-sensitivity probes; constant reports "
+                "and pending plans are rejected. An optional "
                 "explicit test remains available to expert callers. "
                 + (
                     "OWNER LAB: generated code may use arbitrary Python imports, "
@@ -926,6 +1022,51 @@ class MCPTools:
                 {
                     "type": "object",
                     "properties": {},
+                    "additionalProperties": False,
+                },
+            ),
+            "learning_list_recovery_tickets": (
+                "Inspect runtime-created tool recovery tickets and provider health. "
+                "Sensitive fixture fields are redacted and cannot be replayed.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "state": {
+                            "type": "string",
+                            "enum": ["open", "active", "resolved", "rolled_back"],
+                        }
+                    },
+                    "additionalProperties": False,
+                },
+            ),
+            "learning_create_repair_adapter": (
+                "Create, quarantine, replay-test, and activate an offline replacement "
+                "for a failed generated tool. The replay fixture is owned by PALADYN. "
+                "This cannot replace host, network, filesystem, policy, or edition "
+                "capabilities.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "ticket_id": {"type": "string"},
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "source": {"type": "string"},
+                        "expected": {"type": "object", "additionalProperties": True},
+                        "version": {"type": "string"},
+                        "scope": {"type": "string", "enum": ["task", "persistent"]},
+                        "timeout_seconds": {
+                            "type": "number",
+                            "minimum": 0.05,
+                            "maximum": 120,
+                        },
+                    },
+                    "required": [
+                        "ticket_id",
+                        "name",
+                        "description",
+                        "source",
+                        "expected",
+                    ],
                     "additionalProperties": False,
                 },
             ),
@@ -1079,6 +1220,8 @@ class MCPTools:
             "learning_activate_artifact",
             "learning_retire_artifact",
             "learning_list_artifacts",
+            "learning_list_recovery_tickets",
+            "learning_create_repair_adapter",
             "runtime_review_task",
         ]
         names.extend(self.edition_extension.tool_names())
@@ -1158,6 +1301,185 @@ class MCPTools:
     #
 
     async def call(
+        self,
+        tool: str,
+        arguments: dict[str, Any] | str = "",
+    ):
+        outcome = await self.call_with_recovery(tool, arguments)
+        if outcome.error and outcome.exception is not None:
+            raise outcome.exception
+        return outcome.result
+
+    def normalize_arguments(
+        self,
+        tool: str,
+        arguments: dict[str, Any] | str,
+    ) -> dict[str, Any] | str:
+        """Resolve every filesystem tool path inside PALADYN's workspace.
+
+        Local models often invent host-specific absolute paths even though the
+        filesystem MCP server is intentionally scoped to one runtime workspace.
+        Letting those guesses reach the provider creates an Access denied loop.
+        PALADYN owns the storage boundary, so relative paths are rooted there
+        and foreign absolute paths are reduced to their final artifact name.
+        """
+
+        if not isinstance(arguments, dict) or not hasattr(self, "workspace"):
+            return arguments
+        path_fields = {
+            "cat": ("path",),
+            "create_directory": ("path",),
+            "directory_tree": ("path",),
+            "edit": ("path",),
+            "edit_file": ("path",),
+            "get_file_info": ("path",),
+            "info": ("path",),
+            "list_directory": ("path",),
+            "ls": ("path",),
+            "mkdir": ("path",),
+            "move": ("source", "destination"),
+            "move_file": ("source", "destination"),
+            "read_file": ("path",),
+            "search": ("path",),
+            "search_files": ("path",),
+            "tree": ("path",),
+            "write": ("path",),
+            "write_file": ("path",),
+        }.get(tool.strip(), ())
+        if not path_fields:
+            return arguments
+
+        normalized = dict(arguments)
+        read_only_tools = {
+            "cat", "directory_tree", "get_file_info", "info",
+            "list_directory", "ls", "read_file", "search",
+            "search_files", "tree",
+        }
+        root = self.workspace
+        project_root = getattr(self, "project_read_root", None)
+        if tool.strip() in read_only_tools and project_root is not None:
+            contract = TaskContract.from_prompt(getattr(self, "interaction_prompt", ""))
+            if contract.requires_file_read and not contract.requires_file_mutation:
+                root = project_root
+        for field in path_fields:
+            value = normalized.get(field)
+            if not isinstance(value, str) or not value.strip():
+                normalized[field] = str(root)
+                continue
+            requested = Path(value.strip()).expanduser()
+            if requested.is_absolute():
+                resolved = requested.resolve()
+                try:
+                    resolved.relative_to(root)
+                except ValueError:
+                    # An absolute path outside the configured workspace is a
+                    # model guess, not authority to escape the runtime root.
+                    artifact_name = requested.name or "artifact"
+                    resolved = (root / artifact_name).resolve()
+            else:
+                resolved = (root / requested).resolve()
+                try:
+                    resolved.relative_to(root)
+                except ValueError:
+                    artifact_name = requested.name or "artifact"
+                    resolved = (root / artifact_name).resolve()
+            if root != self.workspace and not resolved.exists() and requested.name:
+                ignored = {".git", ".venv", ".pytest_cache", "node_modules"}
+                matches = [
+                    candidate.resolve()
+                    for candidate in root.rglob(requested.name)
+                    if not ignored.intersection(candidate.relative_to(root).parts)
+                ]
+                if matches:
+                    matches.sort(key=lambda candidate: len(candidate.relative_to(root).parts))
+                    shallowest_depth = len(matches[0].relative_to(root).parts)
+                    shallowest = [
+                        candidate
+                        for candidate in matches
+                        if len(candidate.relative_to(root).parts) == shallowest_depth
+                    ]
+                    if len(shallowest) == 1:
+                        resolved = shallowest[0]
+            normalized[field] = str(resolved)
+        return normalized
+
+    async def call_with_recovery(
+        self,
+        tool: str,
+        arguments: dict[str, Any] | str = "",
+    ) -> ToolCallOutcome:
+        requested_tool = tool.strip()
+        arguments = self.normalize_arguments(requested_tool, arguments)
+        provider_tool = requested_tool
+        if (
+            requested_tool in {"cat", "read_file"}
+            and isinstance(arguments, dict)
+            and isinstance(arguments.get("path"), str)
+            and Path(arguments["path"]).is_dir()
+        ):
+            # Small local models frequently identify the correct filesystem
+            # object but confuse a directory with a file. Preserve the
+            # grounded path and select the provider operation from its actual
+            # type instead of spending another model turn on an EISDIR error.
+            provider_tool = "list_directory"
+        # Lightweight unit/integration doubles may construct MCPTools without
+        # running __init__. Preserve the historical direct-call contract there.
+        if not hasattr(self, "recovery"):
+            raw_result = await self._call_direct(provider_tool, arguments)
+            error = self._recovery_failure(str(raw_result), provider_tool)
+            return ToolCallOutcome(
+                result=raw_result,
+                requested_tool=requested_tool,
+                provider_tool=provider_tool,
+                capabilities=capabilities_for_tool(requested_tool),
+                error=error,
+            )
+        self._register_recovery_providers()
+        return await execute_with_recovery(
+            self.recovery,
+            requested_tool=provider_tool,
+            arguments=arguments,
+            call_provider=self._call_direct,
+            detect_failure=self._recovery_failure,
+            task_id=self.interaction_id,
+        )
+
+    @staticmethod
+    def _recovery_failure(result: str, tool: str) -> str:
+        text = str(result).strip()
+        lowered = text.casefold()
+        prefixes = (
+            "tool execution failed:",
+            "unknown tool:",
+            "unknown toolerror:",
+            "learning runtime unavailable:",
+            "sandbox unavailable:",
+        )
+        if lowered.startswith(prefixes):
+            return text[:2_000]
+        if " requires structured arguments" in lowered:
+            return text[:2_000]
+        try:
+            payload = json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            return ""
+        if isinstance(payload, dict):
+            if payload.get("ok") is False:
+                return str(payload.get("error") or "tool returned ok=false")[:2_000]
+            if payload.get("error") and not payload.get("findings"):
+                return str(payload["error"])[:2_000]
+        return ""
+
+    def tool_capabilities(self, tool: str) -> tuple[str, ...]:
+        return self.recovery.capabilities(tool)
+
+    def recovery_state(self) -> dict[str, Any]:
+        return {
+            "providers": self.recovery.provider_state(),
+            "tickets": self.recovery.list_tickets(),
+        }
+
+    async def _call_direct(
         self,
         tool: str,
         arguments: dict[str, Any] | str = "",
@@ -1432,6 +1754,52 @@ class MCPTools:
                 if self.learning is None:
                     return f"Learning runtime unavailable: {self.learning_error}"
                 return self._json({"artifacts": self.learning.list_artifacts()})
+
+            case "learning_list_recovery_tickets":
+                state = value("state").strip() or None
+                return self._json(
+                    {
+                        "tickets": self.recovery.list_tickets(state=state),
+                        "providers": self.recovery.provider_state(),
+                    }
+                )
+
+            case "learning_create_repair_adapter":
+                if self.learning is None:
+                    return f"Learning runtime unavailable: {self.learning_error}"
+                if structured is None or not isinstance(structured.get("expected"), dict):
+                    return (
+                        "learning_create_repair_adapter requires a ticket, source, "
+                        "and expected replay output."
+                    )
+                ticket = self.recovery.ticket(value("ticket_id"))
+                raw_version = value("version", "1.0.0")
+                version = (
+                    raw_version
+                    if re.fullmatch(r"\d+\.\d+\.\d+", raw_version)
+                    else "1.0.0"
+                )
+                record = await self.learning.create_repair_tool(
+                    ticket=ticket,
+                    name=value("name"),
+                    description=value("description"),
+                    source=value("source"),
+                    expected=dict(structured["expected"]),
+                    version=version,
+                    scope=ArtifactScope(value("scope", "task")),
+                    timeout_seconds=float(structured.get("timeout_seconds", 10.0)),
+                )
+                self.recovery.register_provider(
+                    record.name,
+                    (ticket.capability,),
+                    priority=200,
+                    kind="generated_repair",
+                )
+                activated = self.recovery.activate_repair(ticket.ticket_id, record.name)
+                self._tool_definitions_cache = None
+                return self._json(
+                    {"artifact": record.to_dict(), "recovery": activated.to_dict()}
+                )
 
             case "runtime_review_task":
                 try:

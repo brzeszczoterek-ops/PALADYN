@@ -10,7 +10,12 @@ from typing import Any, Callable, Iterable
 
 from .models import ModelProfile
 from .qualification import ModelQualificationCard
-from .router import ModelRouteCandidate, ModelRouteDecision, ModelRouter
+from .router import (
+    ModelRouteCandidate,
+    ModelRouteDecision,
+    ModelRouter,
+    classify_model_phase,
+)
 from .runtime import (
     LlamaServerSession,
     LlamaServerStartError,
@@ -27,6 +32,10 @@ class ModelSwitchResult:
     active_model_path: str
     switched: bool
     failures: tuple[str, ...] = ()
+    requested_task_kind: str = ""
+    configured_candidates: int = 0
+    eligible_candidates: int = 0
+    routing_strategy: str = "automatic"
 
 
 class RoutedModelRuntime:
@@ -39,14 +48,17 @@ class RoutedModelRuntime:
         llm: Any,
         *,
         status: Callable[[str], None] = print,
+        allow_manual_hierarchy: bool = False,
     ) -> None:
         self.session = session
         self.runtime_root = Path(runtime_root).expanduser().resolve()
         self.store = ModelLoaderStore(self.runtime_root)
         self.llm = llm
         self.status = status
+        self.allow_manual_hierarchy = bool(allow_manual_hierarchy)
         self.router = ModelRouter()
         self._journal_path = self.runtime_root / "routing.jsonl"
+        self._last_unavailable_notice = ""
 
     @property
     def active_model_path(self) -> str:
@@ -65,16 +77,65 @@ class RoutedModelRuntime:
         if not state.routing_enabled or not state.routing_model_paths:
             return ModelSwitchResult(None, previous, previous, False)
 
-        candidates = self._current_candidates(state)
+        requested_task_kind = task_kind or classify_model_phase(prompt)
+        routing_strategy = (
+            state.routing_strategy
+            if self.allow_manual_hierarchy
+            and state.routing_strategy == "manual_hierarchy"
+            else "automatic"
+        )
+        candidates, rejected = self._current_candidates_with_rejections(state)
+        configured_count = len(state.routing_model_paths[:3])
+        eligible_count = len(candidates)
+        if not candidates:
+            detail = ", ".join(
+                f"{Path(path).name} ({'|'.join(reasons)})"
+                for path, reasons in rejected.items()
+            )
+            reason = (
+                "automatic model routing unavailable: none of the "
+                f"{configured_count} configured model(s) has a current "
+                "qualification card"
+                + (f"; {detail}" if detail else "")
+                + ". Requalify the selected models before relying on routing."
+            )
+            result = ModelSwitchResult(
+                None,
+                previous,
+                previous,
+                False,
+                (reason,),
+                requested_task_kind=requested_task_kind,
+                configured_candidates=configured_count,
+                eligible_candidates=eligible_count,
+                routing_strategy=routing_strategy,
+            )
+            if reason != self._last_unavailable_notice:
+                self.status(f"PALADYN WARNING: {reason}")
+                self._last_unavailable_notice = reason
+            self._record(prompt, result, trigger=trigger)
+            return result
+
+        self._last_unavailable_notice = ""
         decision = self.router.choose(
             prompt,
             candidates,
             current_model_path=previous,
-            task_kind=task_kind,
+            task_kind=requested_task_kind,
+            strategy=routing_strategy,
             excluded_model_paths=excluded_model_paths,
         )
         if decision is None or decision.selected_model_path == previous:
-            result = ModelSwitchResult(decision, previous, previous, False)
+            result = ModelSwitchResult(
+                decision,
+                previous,
+                previous,
+                False,
+                requested_task_kind=requested_task_kind,
+                configured_candidates=configured_count,
+                eligible_candidates=eligible_count,
+                routing_strategy=routing_strategy,
+            )
             self._record(prompt, result, trigger=trigger)
             return result
 
@@ -87,6 +148,10 @@ class RoutedModelRuntime:
                 previous,
                 False,
                 (failure,),
+                requested_task_kind=requested_task_kind,
+                configured_candidates=configured_count,
+                eligible_candidates=eligible_count,
+                routing_strategy=routing_strategy,
             )
             self._record(prompt, result, trigger=trigger)
             return result
@@ -134,6 +199,10 @@ class RoutedModelRuntime:
                 path,
                 path != previous,
                 tuple(failures),
+                requested_task_kind=requested_task_kind,
+                configured_candidates=configured_count,
+                eligible_candidates=eligible_count,
+                routing_strategy=routing_strategy,
             )
             if path != previous:
                 self.status(
@@ -165,6 +234,7 @@ class RoutedModelRuntime:
         self,
         prompt: str,
         task_kind: str,
+        excluded_model_paths: Iterable[str] = (),
     ) -> ModelSwitchResult:
         """Retry a failed response with the next qualified local specialist.
 
@@ -174,10 +244,13 @@ class RoutedModelRuntime:
         """
 
         rejected = self.active_model_path
+        excluded = tuple(
+            dict.fromkeys((*tuple(excluded_model_paths), rejected))
+        )
         return await self.ensure_for(
             prompt,
             task_kind=task_kind,
-            excluded_model_paths=(rejected,),
+            excluded_model_paths=excluded,
             trigger="response_rejection",
         )
 
@@ -185,17 +258,31 @@ class RoutedModelRuntime:
         await self.session.stop()
 
     def _current_candidates(self, state: Any) -> list[ModelRouteCandidate]:
+        candidates, _ = self._current_candidates_with_rejections(state)
+        return candidates
+
+    def _current_candidates_with_rejections(
+        self,
+        state: Any,
+    ) -> tuple[list[ModelRouteCandidate], dict[str, tuple[str, ...]]]:
         candidates: list[ModelRouteCandidate] = []
+        rejected: dict[str, tuple[str, ...]] = {}
         for path in state.routing_model_paths[:3]:
             profile: ModelProfile | None = state.profiles.get(path)
             card: ModelQualificationCard | None = state.qualifications.get(path)
-            if profile is None or card is None:
+            if profile is None:
+                rejected[path] = ("profile_missing",)
+                continue
+            if card is None:
+                rejected[path] = ("qualification_missing",)
                 continue
             model_path = Path(path).expanduser()
-            if not card.is_current(model_path, profile):
+            reasons = card.stale_reasons(model_path, profile)
+            if reasons:
+                rejected[path] = reasons
                 continue
             candidates.append(ModelRouteCandidate(path, card))
-        return candidates
+        return candidates, rejected
 
     def _record(
         self,
@@ -209,7 +296,19 @@ class RoutedModelRuntime:
             "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "trigger": trigger,
-            "task_kind": result.decision.task_kind if result.decision else "unrouted",
+            "task_kind": (
+                result.decision.task_kind
+                if result.decision
+                else result.requested_task_kind or "unrouted"
+            ),
+            "routing_status": (
+                "unavailable"
+                if result.decision is None and result.failures
+                else "ready"
+            ),
+            "configured_candidates": result.configured_candidates,
+            "eligible_candidates": result.eligible_candidates,
+            "routing_strategy": result.routing_strategy,
             "previous_model_path": result.previous_model_path,
             "active_model_path": result.active_model_path,
             "switched": result.switched,

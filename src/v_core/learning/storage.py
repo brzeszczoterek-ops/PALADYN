@@ -394,10 +394,14 @@ class LearningStore:
         if record.kind is not ArtifactKind.TOOL:
             raise LearningStorageError("artifact is not a tool")
         payload = self._load_json(self._relative(record.manifest_path))
-        manifest = ToolManifest.from_dict(payload["manifest"])
+        raw_manifest = payload["manifest"]
+        manifest = ToolManifest.from_dict(raw_manifest)
         source_path = self._relative(record.source_path)
         source = source_path.read_text(encoding="utf-8")
-        if _digest(manifest.to_dict(), source) != record.digest:
+        # Verify the immutable bytes as stored. New optional manifest fields may
+        # receive runtime defaults when an older bundle is loaded; hashing the
+        # normalized dataclass would incorrectly invalidate that historic bundle.
+        if _digest(raw_manifest, source) != record.digest:
             raise JournalIntegrityError("tool bundle digest mismatch")
         return manifest, source_path
 
@@ -405,8 +409,9 @@ class LearningStore:
         if record.kind is not ArtifactKind.SKILL:
             raise LearningStorageError("artifact is not a skill")
         payload = self._load_json(self._relative(record.manifest_path))
-        manifest = SkillManifest.from_dict(payload["manifest"])
-        if _digest(manifest.to_dict()) != record.digest:
+        raw_manifest = payload["manifest"]
+        manifest = SkillManifest.from_dict(raw_manifest)
+        if _digest(raw_manifest) != record.digest:
             raise JournalIntegrityError("skill bundle digest mismatch")
         return manifest
 

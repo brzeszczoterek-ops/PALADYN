@@ -617,6 +617,10 @@ class SpeechRuntime:
         )
         text = re.sub(r"\[([^]]+)]\((?:[^()]|\([^)]*\))+\)", r"\1", text)
         text = re.sub(r"`([^`]+)`", r"\1", text)
+        # Strip paired emphasis, not arithmetic or underscores inside names.
+        text = re.sub(r"(\*{1,3})(\S(?:.*?\S)?)\1", r"\2", text)
+        text = re.sub(r"(?<!\w)(_{1,3})(\S(?:.*?\S)?)\1(?!\w)", r"\2", text)
+        text = re.sub(r"~~(\S(?:.*?\S)?)~~", r"\1", text)
         text = re.sub(r"^[#>*+-]+\s*", "", text, flags=re.MULTILINE)
         text = re.sub(r"\s+", " ", text)
         return text.strip()

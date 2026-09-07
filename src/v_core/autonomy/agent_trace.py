@@ -69,7 +69,7 @@ class AgentTaskTrace:
         self._journal.append(self.task_id, event, data)
         self._save()
 
-    def set_requirements(self, requirements: dict[str, bool]) -> None:
+    def set_requirements(self, requirements: dict[str, Any]) -> None:
         self.requirements = dict(requirements)
         self.record_event("task_contract_created", {"requirements": self.requirements})
 
@@ -99,6 +99,10 @@ class AgentTaskTrace:
         *,
         error: str | None = None,
         evidence_excerpt: str | None = None,
+        provider_tool: str = "",
+        capabilities: list[str] | tuple[str, ...] = (),
+        provider_attempts: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+        recovery_ticket: dict[str, Any] | None = None,
     ) -> None:
         call = self.tool_calls[sequence - 1]
         call["status"] = "failed" if error else "succeeded"
@@ -106,9 +110,17 @@ class AgentTaskTrace:
         call["result_sha256"] = _digest(result)
         call["result_excerpt"] = (
             result if evidence_excerpt is None else evidence_excerpt
-        )[:2_000]
+        )[:6_000]
         if error:
             call["error"] = error
+        if provider_tool:
+            call["provider_tool"] = str(provider_tool)[:128]
+        if capabilities:
+            call["capabilities"] = [str(item)[:96] for item in capabilities[:16]]
+        if provider_attempts:
+            call["provider_attempts"] = _json_safe(list(provider_attempts)[:16])
+        if recovery_ticket is not None:
+            call["recovery_ticket"] = _json_safe(recovery_ticket)
         self.updated_at = utc_now()
         self._journal.append(
             self.task_id,
@@ -153,6 +165,7 @@ class AgentTaskTrace:
         failed_tool_count: int,
         missing: list[str],
         progress_summary: dict[str, Any] | None = None,
+        accepted_commands: list[str] | None = None,
     ) -> None:
         if self.status != "running":
             return
@@ -167,7 +180,7 @@ class AgentTaskTrace:
             "missing": [str(item)[:256] for item in missing[:32]],
             "progress_summary": _json_safe(progress_summary or {}),
             "requested_at": self.updated_at,
-            "accepted_commands": ["/continue", "/stop"],
+            "accepted_commands": accepted_commands or ["/continue", "/stop"],
         }
         self._journal.append(
             self.task_id,
@@ -378,6 +391,10 @@ class AgentTaskTrace:
                 {
                     "sequence": call.get("sequence"),
                     "tool": call.get("tool"),
+                    "provider_tool": call.get("provider_tool", call.get("tool")),
+                    "capabilities": call.get("capabilities", []),
+                    "provider_attempts": call.get("provider_attempts", []),
+                    "recovery_ticket": call.get("recovery_ticket"),
                     "status": call.get("status"),
                     "arguments_sha256": _digest(arguments),
                     "arguments_excerpt": arguments[:2_000],
@@ -565,11 +582,14 @@ class AgentTaskTrace:
             "requires_created_tool",
             "requires_created_tool_execution",
             "requires_created_skill",
+            "requires_created_artifact",
             "allows_artifact_fallback",
         )
         if any(bool(requirements.get(name)) for name in concrete_flags):
             return True
         if requirements.get("required_tools"):
+            return True
+        if requirements.get("required_capabilities"):
             return True
         if requirements.get("requires_runtime_review"):
             # Import locally to keep the persistence module lightweight and to

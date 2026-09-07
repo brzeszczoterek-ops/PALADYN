@@ -135,6 +135,82 @@ def runtime(tmp_path: Path, *, persistent: bool = False) -> LearningRuntime:
     )
 
 
+def test_filesystem_arguments_are_owned_by_runtime_workspace(tmp_path: Path) -> None:
+    tools = MCPTools.__new__(MCPTools)
+    tools.workspace = (tmp_path / "workspace").resolve()
+
+    first_guess = tools.normalize_arguments(
+        "create_directory",
+        {"path": "/home/boss/cebula_info"},
+    )
+    second_guess = tools.normalize_arguments(
+        "create_directory",
+        {"path": "/home/Vi/Desktop/PALADYN-Workspace/cebula_info"},
+    )
+    relative_report = tools.normalize_arguments(
+        "write_file",
+        {"path": "reports/cebula.md", "content": "verified"},
+    )
+    traversal = tools.normalize_arguments(
+        "write_file",
+        {"path": "../../outside.md", "content": "blocked"},
+    )
+
+    assert first_guess["path"] == str(tools.workspace / "cebula_info")
+    assert second_guess["path"] == str(tools.workspace / "cebula_info")
+    assert relative_report["path"] == str(
+        tools.workspace / "reports" / "cebula.md"
+    )
+    assert traversal["path"] == str(tools.workspace / "outside.md")
+
+
+def test_read_only_project_review_uses_project_root_without_exposing_writes(
+    tmp_path: Path,
+) -> None:
+    tools = MCPTools.__new__(MCPTools)
+    tools.workspace = (tmp_path / "workspace").resolve()
+    tools.project_read_root = (tmp_path / "project").resolve()
+    tools.interaction_prompt = (
+        "Przejrzyj kod PALADYNA i przedstaw raport. Nie modyfikuj plikow."
+    )
+
+    listing = tools.normalize_arguments("list_directory", {})
+    source = tools.normalize_arguments("read_file", {"path": "src/v_core/main.py"})
+    write = tools.normalize_arguments(
+        "write_file", {"path": "src/v_core/main.py", "content": "no"}
+    )
+
+    assert listing["path"] == str(tools.project_read_root)
+    assert source["path"] == str(tools.project_read_root / "src/v_core/main.py")
+    assert write["path"] == str(tools.workspace / "src/v_core/main.py")
+
+    (tools.project_read_root / "src" / "v_core").mkdir(parents=True)
+    (tools.project_read_root / "build" / "lib" / "v_core").mkdir(parents=True)
+    shortened = tools.normalize_arguments("list_directory", {"path": "v_core"})
+    assert shortened["path"] == str(tools.project_read_root / "src" / "v_core")
+
+
+@pytest.mark.asyncio
+async def test_read_file_on_directory_uses_directory_listing(tmp_path: Path) -> None:
+    tools = MCPTools.__new__(MCPTools)
+    tools.workspace = tmp_path.resolve()
+    tools.project_read_root = None
+    tools.interaction_prompt = ""
+    calls: list[tuple[str, dict]] = []
+
+    async def direct(tool: str, arguments: dict) -> str:
+        calls.append((tool, arguments))
+        return "[FILE] main.py"
+
+    tools._call_direct = direct
+    result = await tools.call_with_recovery("read_file", {"path": str(tmp_path)})
+
+    assert calls == [("list_directory", {"path": str(tmp_path.resolve())})]
+    assert result.requested_tool == "read_file"
+    assert result.provider_tool == "list_directory"
+    assert result.error == ""
+
+
 def runtime_for_workspace(
     learning_root: Path,
     workspace: Path,
@@ -638,6 +714,55 @@ async def test_generated_tool_full_lifecycle_runs_offline(tmp_path: Path) -> Non
     assert await learning.execute_tool("double_value", {"value": 7}) == {
         "result": 14
     }
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.asyncio
+async def test_legacy_smoke_only_tool_is_hidden_after_validator_upgrade(
+    tmp_path: Path,
+) -> None:
+    learning = runtime(tmp_path)
+    legacy = ToolManifest(
+        name="legacy_constant",
+        version="1.0.0",
+        description="Legacy constant artifact.",
+        input_schema={
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        output_schema={
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+            "required": ["status"],
+            "additionalProperties": False,
+        },
+        tests=(
+            ToolTestCase(
+                name="runtime-derived deterministic tool smoke test",
+                arguments={},
+                expected={"status": "active"},
+            ),
+        ),
+    )
+    staged = learning.store.stage_tool(
+        legacy,
+        "def run(arguments):\n    return {'status': 'active'}",
+        scope_key=learning.task_scope_key,
+    )
+    validated = learning.store.transition(
+        staged,
+        ArtifactStatus.VALIDATED,
+        validation={"passed": True},
+    )
+    learning.store.activate(validated)
+
+    assert learning.active_tool_names() == []
+    assert learning.active_tool_definitions() == []
+    assert learning.active_tool_manifests() == []
+    with pytest.raises(GeneratedToolError, match="not active"):
+        await learning.execute_tool("legacy_constant", {})
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
@@ -1309,13 +1434,57 @@ async def test_source_only_builder_marks_runtime_derived_tool_smoke_test(
     manifest, _ = learning.store.load_tool(created)
 
     assert created.status is ArtifactStatus.ACTIVE
-    assert manifest.tests[0].name == (
-        "runtime-derived deterministic tool smoke test"
+    assert created.validation["validation_strength"] == (
+        "behavioral_input_sensitivity"
     )
+    assert [case.name for case in manifest.tests] == [
+        "runtime-derived deterministic tool smoke test",
+        "runtime-derived input sensitivity probe",
+    ]
     assert manifest.tests[0].expected == {"result": 6}
+    assert manifest.tests[1].arguments == {"value": 4}
+    assert manifest.tests[1].expected == {"result": 8}
     assert await learning.execute_tool("smoke_double", {"value": 5}) == {
         "result": 10
     }
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.asyncio
+async def test_source_only_builder_probes_all_nested_object_fields(
+    tmp_path: Path,
+) -> None:
+    learning = runtime(tmp_path)
+    source = (
+        "def run(arguments):\n"
+        "    items = arguments['items']\n"
+        "    return {\n"
+        "        'item_count': len(items),\n"
+        "        'total_value': sum(\n"
+        "            item['quantity'] * item['unit_price'] for item in items\n"
+        "        ),\n"
+        "    }\n"
+    )
+
+    created = await learning.create_tool_from_source(
+        source,
+        objective=(
+            "Create a tool named summarize_inventory. "
+            'items = [{"name":"a","quantity":2,"unit_price":3},'
+            '{"name":"b","quantity":1,"unit_price":4}]'
+        ),
+    )
+
+    assert created.status is ArtifactStatus.ACTIVE
+    assert await learning.execute_tool(
+        "summarize_inventory",
+        {
+            "items": [
+                {"name": "x", "quantity": 3, "unit_price": 5},
+                {"name": "y", "quantity": 2, "unit_price": 7},
+            ]
+        },
+    ) == {"item_count": 2, "total_value": 29}
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
@@ -1338,6 +1507,66 @@ async def test_source_only_builder_refuses_to_invent_missing_fixture(
                 "Create a tool named hardcoded_result. "
                 'value = 2 expected = {"result": 4}'
             ),
+        )
+
+    assert learning.list_artifacts() == []
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.asyncio
+async def test_source_only_builder_rejects_constant_no_input_artifact(
+    tmp_path: Path,
+) -> None:
+    learning = runtime(tmp_path)
+    source = "def run(arguments):\n    return {'status': 'looks active'}"
+
+    with pytest.raises(ArtifactValidationError, match="no input fields"):
+        await learning.create_tool_from_source(
+            source,
+            objective="Create a useful generated tool.",
+        )
+
+    assert learning.list_artifacts() == []
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.asyncio
+async def test_source_only_builder_rejects_input_ignoring_constant(
+    tmp_path: Path,
+) -> None:
+    learning = runtime(tmp_path)
+    source = (
+        "def run(arguments):\n"
+        "    arguments.get('value', 3)\n"
+        "    return {'result': 6}\n"
+    )
+
+    with pytest.raises(ArtifactValidationError, match="input-dependent behavior"):
+        await learning.create_tool_from_source(
+            source,
+            objective="Create a tool named constant_double.",
+        )
+
+    assert learning.list_artifacts() == []
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+@pytest.mark.asyncio
+async def test_source_only_builder_rejects_pending_plan_as_tool_result(
+    tmp_path: Path,
+) -> None:
+    learning = runtime(tmp_path)
+    source = (
+        "def run(arguments):\n"
+        "    task = arguments.get('task', 'inspect input')\n"
+        "    return {'steps': [{'step': 1, 'action': task, "
+        "'description': 'Do it later', 'status': 'pending'}]}\n"
+    )
+
+    with pytest.raises(ArtifactPolicyError, match="pending execution plan"):
+        await learning.create_tool_from_source(
+            source,
+            objective="Create a tool named pending_plan.",
         )
 
     assert learning.list_artifacts() == []
@@ -1408,6 +1637,29 @@ async def test_mcp_runtime_builds_snapshot_extractor_from_observed_evidence(
     assert result["records"][2]["relative_product_url"] == (
         "catalogue/soumission_998/index.html"
     )
+
+
+def test_observed_browser_links_become_grounded_web_read_targets(
+    tmp_path: Path,
+) -> None:
+    tools = MCPTools(
+        SimpleNamespace(
+            filesystem_server=["/usr/bin/false"],
+            browser_server=["/usr/bin/false"],
+            workspace=tmp_path / "workspace",
+            learning_root=tmp_path / "learning",
+            learning_profile="client",
+            evm_profile="client",
+        )
+    )
+    tools.begin_interaction("interactive-links", "inspect the linked detail")
+    detail = "https://catalogue.test/species/european-wildcat"
+
+    tools.observe_browser_snapshot(
+        f'- link "European wildcat"\n  - /url: {detail}'
+    )
+
+    assert tools._web_discovered_urls[tools._normalized_web_url(detail)] == detail
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from v_core.speech import SpeechConfig, SpeechRuntime
+from v_core.ui.runtime_activity import runtime_activity
 
 
 _STATIC_ROOT = Path(__file__).with_name("static")
@@ -30,10 +31,12 @@ class UIRuntime:
     model_session: Any | None = None
     session_token: str = field(default_factory=lambda: secrets.token_urlsafe(32))
     started_at: float = field(default_factory=time.monotonic)
+    started_wall_time: float = field(default_factory=time.time)
     shutdown_callback: Callable[[], None] | None = None
     chat_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     speech_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     speech: SpeechRuntime | None = None
+    activity_sample: dict[str, Any] = field(default_factory=dict)
 
     @property
     def edition_extension(self) -> Any:
@@ -80,6 +83,13 @@ class UIRuntime:
                 "configured": self.speech is not None,
             },
             "owner": None,
+            "activity": runtime_activity(
+                getattr(self.config, "autonomy_root", None),
+                session,
+                ready=not self.chat_lock.locked(),
+                session_started_at=self.started_wall_time,
+                sample_state=self.activity_sample,
+            ),
         }
         extension = self.edition_extension
         if extension is not None:

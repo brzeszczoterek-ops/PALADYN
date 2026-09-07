@@ -73,6 +73,12 @@ def list_models() -> None:
             f"{score}/100 | {pool} | {active}"
         )
     typer.echo(f"routing={'on' if state.routing_enabled else 'off'}")
+    strategy = (
+        state.routing_strategy
+        if load_config().edition.is_full
+        else "automatic"
+    )
+    typer.echo(f"routing_strategy={strategy}")
 
 
 @app.command("qualify")
@@ -153,6 +159,7 @@ def configure_pool(
         )
     state.routing_model_paths = paths
     state.routing_enabled = True
+    state.routing_strategy = "automatic"
     store.save(state)
     typer.echo("Automatic local routing enabled for:")
     for path in paths:
@@ -180,18 +187,32 @@ def inspect_route(prompt: str = typer.Argument(..., help="Task to classify.")) -
 
     _, _, state, _ = _context()
     candidates = []
+    stale: list[str] = []
     for path in state.routing_model_paths:
         card = state.qualifications.get(path)
         profile = state.profiles.get(path)
-        if card is not None and profile is not None and card.is_current(Path(path), profile):
-            candidates.append(ModelRouteCandidate(path, card))
+        if card is None or profile is None:
+            stale.append(f"{Path(path).name}: qualification or profile missing")
+            continue
+        reasons = card.stale_reasons(Path(path), profile)
+        if reasons:
+            stale.append(f"{Path(path).name}: {', '.join(reasons)}")
+            continue
+        candidates.append(ModelRouteCandidate(path, card))
     decision = ModelRouter().choose(
         prompt,
         candidates,
         current_model_path=state.last_model_path,
+        strategy=(
+            state.routing_strategy
+            if load_config().edition.is_full
+            else "automatic"
+        ),
     )
     if decision is None:
         typer.echo("No current qualified candidate is available.")
+        for item in stale:
+            typer.echo(f"  {item}")
         raise typer.Exit(1)
     typer.echo(
         f"{decision.task_kind}: {Path(decision.selected_model_path).name} "

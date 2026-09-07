@@ -23,9 +23,11 @@ class CapabilityDispatcher:
             or contract.requires_created_tool
             or contract.requires_created_tool_execution
             or contract.requires_created_skill
+            or contract.requires_created_artifact
             or contract.allows_artifact_fallback
             or contract.requires_runtime_review
             or contract.required_tools
+            or contract.required_capabilities
         )
 
         # A direct URL-only inspection can use the compact research path. Mixed

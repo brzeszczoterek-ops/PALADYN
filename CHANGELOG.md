@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Added
+- PALADYN-Full manual model hierarchy: owners can persist the exact priority
+  and fallback order of the qualified three-model pool; Public hides the menu
+  and ignores a transferred Full-only strategy in favor of automatic scoring
+- Universal capability-based tool recovery: runtime-owned provider health,
+  bounded failover between equivalent providers, persistent recovery tickets,
+  and capability-based task completion instead of dependence on one tool name
+- A replay-gated repair lifecycle for generated tools: V can build a replacement
+  from a real local failure fixture, while PALADYN owns quarantine, sandbox
+  validation, activation, health tracking, and automatic rollback
+- Recovery fixtures redact credential-like fields; offline generated repairs
+  cannot claim host, network, filesystem, policy, or edition capabilities
+
+### Fixed
+- Full Tor discovery now falls back from a failed configured index to
+  DuckDuckGo's official onion service, inspects bounded public directory results
+  through Tor, and records each source attempt instead of retrying one broken
+  Ahmia request until the loop guard stops the task
+
 ## 3.8 - 2026-09-01
 
 ### Added

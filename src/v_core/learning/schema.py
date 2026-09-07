@@ -32,11 +32,13 @@ def validate_schema(schema: dict[str, Any], *, depth: int = 0) -> None:
         raise SchemaError("schema nesting exceeds eight levels")
     if not isinstance(schema, dict):
         raise SchemaError("schema must be an object")
+    if any(not isinstance(key, str) for key in schema):
+        raise SchemaError("schema keys must be strings")
     unknown = set(schema) - _KEYS
     if unknown:
         raise SchemaError(f"unsupported schema keys: {sorted(unknown)}")
     kind = schema.get("type")
-    if kind not in _TYPES:
+    if not isinstance(kind, str) or kind not in _TYPES:
         raise SchemaError(f"unsupported or missing schema type: {kind!r}")
     description = schema.get("description")
     if description is not None and (
@@ -107,6 +109,8 @@ def validate_instance(
     if "enum" in schema and value not in schema["enum"]:
         raise SchemaError(f"{path} is not an allowed enum value")
     if kind == "object":
+        if any(not isinstance(key, str) for key in value):
+            raise SchemaError(f"{path} object keys must be strings")
         properties = schema.get("properties", {})
         missing = set(schema.get("required", [])) - set(value)
         if missing:

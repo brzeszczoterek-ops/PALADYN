@@ -35,6 +35,8 @@ class Config:
 
     edition: Edition
 
+    project_read_root: Path | None = None
+
 
 def load_config() -> Config:
 
@@ -115,6 +117,16 @@ def load_config() -> Config:
             "PALADYN_MODEL_LOADER must be 'off', 'prompt', or 'required'"
         )
 
+    project_read_value = os.getenv("PALADYN_PROJECT_READ_ROOT", "").strip()
+    project_read_root = (
+        Path(project_read_value).expanduser().resolve()
+        if project_read_value
+        else None
+    )
+    filesystem_roots = [str(workspace)]
+    if project_read_root is not None and project_read_root.is_dir():
+        filesystem_roots.append(str(project_read_root))
+
     return Config(
         workspace=workspace,
 
@@ -137,7 +149,7 @@ def load_config() -> Config:
         filesystem_server=[
             "npx",
             "@modelcontextprotocol/server-filesystem",
-            str(workspace),
+            *filesystem_roots,
         ],
 
         browser_server=[
@@ -146,4 +158,5 @@ def load_config() -> Config:
             "--browser=firefox",
         ],
         edition=edition,
+        project_read_root=project_read_root,
     )

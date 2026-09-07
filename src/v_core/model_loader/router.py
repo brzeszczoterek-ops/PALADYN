@@ -44,7 +44,10 @@ def classify_model_task(prompt: str, contract: TaskContract | None = None) -> st
     """Map an owner request to a capability class without asking a worker model."""
 
     task_contract = contract or TaskContract.from_prompt(prompt)
-    if task_contract.requires_created_tool:
+    if (
+        task_contract.requires_created_tool
+        or task_contract.requires_created_artifact
+    ):
         return "coding"
     if any(
         (
@@ -67,7 +70,9 @@ def classify_model_task(prompt: str, contract: TaskContract | None = None) -> st
             task_contract.requires_file_mutation,
             task_contract.requires_command_execution,
             task_contract.requires_created_skill,
+            task_contract.requires_created_artifact,
             bool(task_contract.required_tools),
+            bool(task_contract.required_capabilities),
         )
     ):
         return "tool_use"
@@ -97,11 +102,19 @@ def classify_model_phase(
         item.startswith("public_fact:") for item in missing
     ):
         return "research"
-    if missing.intersection({"learning_create_tool", "learning_create_skill"}):
+    if set(task_contract.required_tools).intersection(missing) or any(
+        item.startswith("capability:") for item in missing
+    ):
+        return "tool_use"
+    if missing.intersection(
+        {
+            "learning_create_tool",
+            "learning_create_skill",
+            "learning_create_tool_or_skill",
+        }
+    ):
         return "coding"
-    if "generated_tool_execution" in missing or set(
-        task_contract.required_tools
-    ).intersection(missing):
+    if "generated_tool_execution" in missing:
         return "tool_use"
     return classify_model_task(prompt, task_contract)
 
@@ -111,12 +124,16 @@ class ModelRouter:
 
     _WEIGHTS: dict[str, dict[str, int]] = {
         "conversation": {
+            # A conversational turn is the one place where preserving V is the
+            # primary capability.  Grounding and recovery still matter, but
+            # they must not let a technically strong coder outrank a model that
+            # actually holds the persona in ordinary dialogue.
             "conversation": 30,
-            "persona": 30,
+            "persona": 50,
             "instruction_following": 10,
-            "execution_honesty": 15,
-            "context_recovery": 10,
-            "prompt_injection_resistance": 5,
+            "execution_honesty": 5,
+            "context_recovery": 3,
+            "prompt_injection_resistance": 2,
         },
         "coding": {
             "coding": 35,
@@ -167,12 +184,16 @@ class ModelRouter:
         current_model_path: str = "",
         contract: TaskContract | None = None,
         task_kind: str | None = None,
+        strategy: str = "automatic",
         switch_margin: int = 5,
         excluded_model_paths: Iterable[str] = (),
     ) -> ModelRouteDecision | None:
         task_kind = task_kind or classify_model_phase(prompt, contract)
         if task_kind not in TASK_KINDS:
             raise ValueError(f"unknown model task kind: {task_kind}")
+        strategy = str(strategy).strip().casefold()
+        if strategy not in {"automatic", "manual_hierarchy"}:
+            raise ValueError(f"unknown model routing strategy: {strategy}")
         if not 0 <= int(switch_margin) <= 100:
             raise ValueError("model switch margin must be between 0 and 100")
         weights = self._WEIGHTS[task_kind]
@@ -185,14 +206,16 @@ class ModelRouter:
             ranked.append((score, candidate.model_path, candidate.card))
         if not ranked:
             return None
-        ranked.sort(key=lambda item: (-item[0], item[1].casefold()))
+        if strategy == "automatic":
+            ranked.sort(key=lambda item: (-item[0], item[1].casefold()))
         best_score, selected, _ = ranked[0]
         current = next(
             (item for item in ranked if item[1] == current_model_path),
             None,
         )
         kept_current = bool(
-            current is not None
+            strategy == "automatic"
+            and current is not None
             and selected != current_model_path
             and best_score - current[0] < switch_margin
         )
@@ -209,6 +232,9 @@ class ModelRouter:
             fallback_model_paths=fallbacks,
             requirements=requirements,
             reason=(
+                "selected by the owner-defined PALADYN-Full model hierarchy"
+                if strategy == "manual_hierarchy"
+                else
                 (
                     f"kept current model because the best verified {task_kind} "
                     f"score improved by less than the {switch_margin}-point "

@@ -19,7 +19,10 @@ an `owner_lab` profile without the private package fails closed.
 The private Full edition adds `src/v_full`. It owns privileged generated-code
 authorization, the owner performance monitor, advanced EVM simulation and
 Foundry integration, short-lived live-operation grants, and a bounded bridge to
-the host Tor service. The bridge exposes fixed status/search/fetch operations,
+the host Tor service. It also unlocks a persistent owner-defined model
+hierarchy that can override automatic capability ranking while retaining the
+same qualification and fallback checks. The bridge exposes fixed
+status/search/fetch operations,
 not a shell or general package installer; generated tools remain offline. These
 capabilities are registered through the edition-extension contract; `v_core`
 does not import their implementations directly. The shared graphical shell asks

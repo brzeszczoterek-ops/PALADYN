@@ -18,9 +18,13 @@ from .app import UIRuntime, create_app
 
 async def run_ui(*, port: int, open_browser: bool) -> None:
     config = load_config()
+    allow_manual_hierarchy = bool(
+        getattr(getattr(config, "edition", None), "is_full", False)
+    )
     model_session = await bootstrap_interactive_model(
         config.model_runtime_root,
         mode=config.model_loader_mode,
+        allow_manual_hierarchy=allow_manual_hierarchy,
     )
     owner_monitor_started = launch_edition_monitor(
         getattr(config, "edition", None) or resolve_edition("public"),
@@ -36,6 +40,7 @@ async def run_ui(*, port: int, open_browser: bool) -> None:
                 model_session,
                 config.model_runtime_root,
                 shared_llm,
+                allow_manual_hierarchy=allow_manual_hierarchy,
             )
             core = VCore(config, llm=shared_llm, model_runtime=model_runtime)
     except BaseException:

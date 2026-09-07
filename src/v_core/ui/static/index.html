@@ -97,7 +97,26 @@
 
     <aside class="right-rail" tabindex="0" aria-label="Runtime panels">
       <section class="panel mission-panel">
-        <div class="section-label">RUNTIME FEED</div>
+        <div class="live-heading">
+          <div class="section-label">LIVE EXECUTION</div>
+          <span id="live-state" class="live-state idle"><i></i>IDLE</span>
+        </div>
+        <strong id="live-detail" class="live-detail">No active task</strong>
+        <div class="live-metrics">
+          <div><span>PHASE</span><strong id="live-phase">IDLE</strong></div>
+          <div><span>OUTPUT</span><strong id="live-output">0 TOK</strong></div>
+          <div><span>GENERATION</span><strong id="live-speed">— T/S</strong></div>
+          <div><span>PROMPT</span><strong id="live-prompt-speed">— T/S</strong></div>
+          <div><span>ELAPSED</span><strong id="live-elapsed">00:00</strong></div>
+          <div><span>STEP</span><strong id="live-step">0</strong></div>
+        </div>
+        <div class="live-context-head">
+          <span>CONTEXT</span>
+          <strong id="live-context">0 / 0</strong>
+        </div>
+        <div class="live-context-track"><span id="live-context-meter"></span></div>
+        <p id="live-objective" class="live-objective">Waiting for an objective.</p>
+        <div id="live-action" class="live-action">LAST ACTION // —</div>
         <ol id="runtime-feed" class="runtime-feed">
           <li><time>00:00:00</time><span>UI channel established</span></li>
         </ol>

@@ -239,6 +239,8 @@ class ToolManifest:
     scope: ArtifactScope = ArtifactScope.TASK
     lesson_ids: tuple[str, ...] = ()
     timeout_seconds: float = 10.0
+    provides_capabilities: tuple[str, ...] = ()
+    repair_ticket_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", validate_name(self.name))
@@ -259,6 +261,16 @@ class ToolManifest:
             raise ValueError("a generated tool may link at most 64 lessons")
         if not 0.05 <= float(self.timeout_seconds) <= 120:
             raise ValueError("tool timeout must be between 0.05 and 120 seconds")
+        from v_core.tool_recovery import capabilities_for_tool
+
+        capabilities = capabilities_for_tool(self.name, self.provides_capabilities)
+        if len(capabilities) > 8:
+            raise ValueError("a generated tool may provide at most 8 capabilities")
+        object.__setattr__(self, "provides_capabilities", capabilities)
+        ticket_id = clean_text(self.repair_ticket_id, maximum=64)
+        if ticket_id and not re.fullmatch(r"[0-9a-f]{32}", ticket_id):
+            raise ValueError("repair_ticket_id must be a PALADYN recovery ticket ID")
+        object.__setattr__(self, "repair_ticket_id", ticket_id)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -273,6 +285,9 @@ class ToolManifest:
             ToolTestCase(**item) for item in copied.get("tests", [])
         )
         copied["lesson_ids"] = tuple(copied.get("lesson_ids", []))
+        copied["provides_capabilities"] = tuple(
+            copied.get("provides_capabilities", [])
+        )
         return cls(**copied)
 
 

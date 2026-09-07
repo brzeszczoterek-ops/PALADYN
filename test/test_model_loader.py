@@ -25,6 +25,7 @@ from v_core.model_loader import (
     choose_model,
     choose_startup_action,
     classify_model_phase,
+    configure_manual_hierarchy_interactively,
     configure_routing_pool_interactively,
     discover_models,
     find_llama_server,
@@ -276,6 +277,7 @@ def test_loader_state_persists_qualified_three_model_routing_pool(
         profiles=profiles,
         routing_enabled=True,
         routing_model_paths=list(profiles),
+        routing_strategy="manual_hierarchy",
         qualifications=cards,
     )
 
@@ -283,6 +285,7 @@ def test_loader_state_persists_qualified_three_model_routing_pool(
     restored = store.load()
 
     assert restored.to_dict() == state.to_dict()
+    assert restored.routing_strategy == "manual_hierarchy"
     with pytest.raises(ValueError, match="at most three"):
         LoaderState.from_dict(
             {
@@ -290,6 +293,8 @@ def test_loader_state_persists_qualified_three_model_routing_pool(
                 "routing_model_paths": ["a", "b", "c", "d"],
             }
         )
+    with pytest.raises(ValueError, match="routing strategy"):
+        LoaderState(routing_strategy="model-decides")
 
 
 def test_older_qualification_card_remains_readable_but_stale(
@@ -307,6 +312,9 @@ def test_older_qualification_card_remains_readable_but_stale(
     assert restored.score("grounding") == 0
     assert restored.score("execution_honesty") == 0
     assert restored.is_current(model, profile) is False
+    assert restored.stale_reasons(model, profile) == (
+        "qualification_harness_changed:5->8",
+    )
 
 
 @pytest.mark.asyncio
@@ -542,6 +550,110 @@ def test_model_router_can_exclude_a_model_that_failed_the_current_response(
     assert preferred_key not in decision.fallback_model_paths
 
 
+def test_conversation_routing_prioritizes_persona_over_coder_recovery_scores(
+    tmp_path: Path,
+) -> None:
+    persona_path = model_file(tmp_path / "persona.gguf")
+    coder_path = model_file(tmp_path / "coder.gguf")
+    persona_key = str(persona_path.resolve())
+    coder_key = str(coder_path.resolve())
+    candidates = [
+        ModelRouteCandidate(
+            persona_key,
+            qualification_card(
+                persona_path,
+                profile_for(persona_path),
+                conversation=75,
+                persona=100,
+                execution_honesty=40,
+                context_recovery=0,
+                prompt_injection_resistance=40,
+            ),
+        ),
+        ModelRouteCandidate(
+            coder_key,
+            qualification_card(
+                coder_path,
+                profile_for(coder_path),
+                conversation=75,
+                persona=60,
+                execution_honesty=100,
+                context_recovery=100,
+                prompt_injection_resistance=100,
+            ),
+        ),
+    ]
+
+    decision = ModelRouter().choose(
+        "Hi V, how are you?",
+        candidates,
+        current_model_path=coder_key,
+        task_kind="conversation",
+    )
+
+    assert decision is not None
+    assert decision.selected_model_path == persona_key
+
+
+def test_model_router_full_manual_hierarchy_overrides_capability_ranking(
+    tmp_path: Path,
+) -> None:
+    first_path = model_file(tmp_path / "owner-first.gguf")
+    specialist_path = model_file(tmp_path / "coding-specialist.gguf")
+    first_key = str(first_path.resolve())
+    specialist_key = str(specialist_path.resolve())
+    candidates = [
+        ModelRouteCandidate(
+            first_key,
+            qualification_card(
+                first_path,
+                profile_for(first_path),
+                coding=5,
+                structured_output=5,
+                tool_calling=5,
+            ),
+        ),
+        ModelRouteCandidate(
+            specialist_key,
+            qualification_card(
+                specialist_path,
+                profile_for(specialist_path),
+                coding=100,
+                structured_output=100,
+                tool_calling=100,
+            ),
+        ),
+    ]
+
+    automatic = ModelRouter().choose(
+        "Implement a Python parser.",
+        candidates,
+        task_kind="coding",
+    )
+    manual = ModelRouter().choose(
+        "Implement a Python parser.",
+        candidates,
+        task_kind="coding",
+        strategy="manual_hierarchy",
+    )
+    fallback = ModelRouter().choose(
+        "Implement a Python parser.",
+        candidates,
+        task_kind="coding",
+        strategy="manual_hierarchy",
+        excluded_model_paths=(first_key,),
+    )
+
+    assert automatic is not None
+    assert automatic.selected_model_path == specialist_key
+    assert manual is not None
+    assert manual.selected_model_path == first_key
+    assert manual.fallback_model_paths == (specialist_key,)
+    assert "owner-defined" in manual.reason
+    assert fallback is not None
+    assert fallback.selected_model_path == specialist_key
+
+
 def test_phase_classifier_routes_mixed_task_by_remaining_runtime_evidence() -> None:
     from v_core.autonomy import TaskContract
 
@@ -745,6 +857,65 @@ def test_startup_menu_exposes_qualification_pool_and_external_actions(
     assert any("Qualify or requalify" in line for line in output)
 
 
+def test_startup_menu_warns_when_enabled_routing_pool_is_stale(
+    tmp_path: Path,
+) -> None:
+    path = model_file(tmp_path / "stale.gguf")
+    model = LocalModel(path, path.stat().st_size)
+    profile = profile_for(path)
+    payload = qualification_card(path, profile).to_dict()
+    payload["harness_version"] = 7
+    state = LoaderState(
+        profiles={str(path): profile},
+        qualifications={
+            str(path): ModelQualificationCard.from_dict(payload),
+        },
+        routing_enabled=True,
+        routing_model_paths=[str(path)],
+    )
+    output: list[str] = []
+
+    action = choose_startup_action(
+        state,
+        [model],
+        input_fn=lambda _: "1",
+        output=output.append,
+        allow_external=False,
+    )
+
+    assert action == "start"
+    assert any("0/1 current; 1/3 selected" in line for line in output)
+    assert any("automatic model routing is not fully available" in line for line in output)
+    assert any("qualification_harness_changed:7->8" in line for line in output)
+
+
+def test_startup_menu_exposes_manual_hierarchy_only_to_full() -> None:
+    state = LoaderState()
+    output: list[str] = []
+
+    assert choose_startup_action(
+        state,
+        [],
+        input_fn=lambda _: "4",
+        output=output.append,
+        allow_external=False,
+        allow_manual_hierarchy=True,
+    ) == "hierarchy"
+    assert any("Full manual model hierarchy" in line for line in output)
+
+    public_answers = iter(("4", "1"))
+    public_output: list[str] = []
+    assert choose_startup_action(
+        state,
+        [],
+        input_fn=lambda _: next(public_answers),
+        output=public_output.append,
+        allow_external=False,
+        allow_manual_hierarchy=False,
+    ) == "start"
+    assert not any("manual model hierarchy" in line for line in public_output)
+
+
 def test_startup_menu_configures_pool_from_current_cards(tmp_path: Path) -> None:
     paths = [model_file(tmp_path / f"model-{index}.gguf") for index in range(3)]
     models = [LocalModel(path, path.stat().st_size) for path in paths]
@@ -774,6 +945,75 @@ def test_startup_menu_configures_pool_from_current_cards(tmp_path: Path) -> None
         str(paths[0].resolve()),
         str(paths[2].resolve()),
     ]
+    assert restored.routing_strategy == "automatic"
+
+
+def test_full_manual_hierarchy_persists_exact_owner_order(tmp_path: Path) -> None:
+    paths = [model_file(tmp_path / f"model-{index}.gguf") for index in range(3)]
+    models = [LocalModel(path, path.stat().st_size) for path in paths]
+    profiles = {str(path.resolve()): profile_for(path) for path in paths}
+    state = LoaderState(
+        profiles=profiles,
+        qualifications={
+            key: qualification_card(Path(key), profile)
+            for key, profile in profiles.items()
+        },
+        routing_enabled=True,
+        routing_model_paths=list(profiles),
+    )
+    store = ModelLoaderStore(tmp_path / "runtime")
+    store.save(state)
+
+    changed = configure_manual_hierarchy_interactively(
+        state,
+        models,
+        store=store,
+        input_fn=lambda _: "3,1,2",
+        output=lambda _: None,
+        allow_manual_hierarchy=True,
+    )
+
+    restored = store.load()
+    assert changed is True
+    assert restored.routing_strategy == "manual_hierarchy"
+    assert restored.routing_model_paths == [
+        str(paths[2].resolve()),
+        str(paths[0].resolve()),
+        str(paths[1].resolve()),
+    ]
+
+
+def test_public_runtime_cannot_enable_saved_full_manual_hierarchy(
+    tmp_path: Path,
+) -> None:
+    paths = [model_file(tmp_path / f"model-{index}.gguf") for index in range(2)]
+    models = [LocalModel(path, path.stat().st_size) for path in paths]
+    profiles = {str(path.resolve()): profile_for(path) for path in paths}
+    state = LoaderState(
+        profiles=profiles,
+        qualifications={
+            key: qualification_card(Path(key), profile)
+            for key, profile in profiles.items()
+        },
+        routing_enabled=True,
+        routing_model_paths=list(profiles),
+    )
+    store = ModelLoaderStore(tmp_path / "runtime")
+    store.save(state)
+    output: list[str] = []
+
+    changed = configure_manual_hierarchy_interactively(
+        state,
+        models,
+        store=store,
+        input_fn=lambda _: "2,1",
+        output=output.append,
+        allow_manual_hierarchy=False,
+    )
+
+    assert changed is False
+    assert store.load().routing_strategy == "automatic"
+    assert output == ["Manual model hierarchy requires PALADYN-Full."]
 
 
 @pytest.mark.asyncio
@@ -1042,6 +1282,133 @@ async def test_routed_runtime_unloads_current_model_and_starts_verified_speciali
 
 
 @pytest.mark.asyncio
+async def test_routed_runtime_records_requested_phase_when_all_cards_are_stale(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    model = model_file(tmp_path / "models" / "research.gguf")
+    profile = profile_for(model)
+    key = str(model.resolve())
+    payload = qualification_card(model, profile, research=100).to_dict()
+    payload["harness_version"] = 7
+    root = tmp_path / "runtime"
+    ModelLoaderStore(root).save(
+        LoaderState(
+            last_model_path=key,
+            profiles={key: profile},
+            routing_enabled=True,
+            routing_model_paths=[key],
+            qualifications={key: ModelQualificationCard.from_dict(payload)},
+        )
+    )
+
+    class Session:
+        def __init__(self) -> None:
+            self.profile = profile
+
+        async def stop(self) -> None:
+            return None
+
+    warnings: list[str] = []
+    runtime = RoutedModelRuntime(Session(), root, object(), status=warnings.append)
+
+    result = await runtime.ensure_for(
+        "Search the web for the current project documentation.",
+        task_kind="research",
+    )
+
+    assert result.switched is False
+    assert result.requested_task_kind == "research"
+    assert result.configured_candidates == 1
+    assert result.eligible_candidates == 0
+    assert "qualification_harness_changed:7->8" in result.failures[0]
+    assert len(warnings) == 1
+    event = json.loads((root / "routing.jsonl").read_text(encoding="utf-8"))
+    assert event["task_kind"] == "research"
+    assert event["routing_status"] == "unavailable"
+    assert event["configured_candidates"] == 1
+    assert event["eligible_candidates"] == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_honors_manual_hierarchy_only_when_full_gate_is_enabled(
+    tmp_path: Path,
+) -> None:
+    first_model = model_file(tmp_path / "models" / "owner-first.gguf")
+    specialist_model = model_file(tmp_path / "models" / "specialist.gguf")
+    first_profile = profile_for(first_model)
+    specialist_profile = profile_for(specialist_model)
+    first_key = str(first_model.resolve())
+    specialist_key = str(specialist_model.resolve())
+    root = tmp_path / "runtime"
+    ModelLoaderStore(root).save(
+        LoaderState(
+            profiles={
+                first_key: first_profile,
+                specialist_key: specialist_profile,
+            },
+            routing_enabled=True,
+            routing_model_paths=[first_key, specialist_key],
+            routing_strategy="manual_hierarchy",
+            qualifications={
+                first_key: qualification_card(
+                    first_model,
+                    first_profile,
+                    coding=5,
+                    structured_output=5,
+                    tool_calling=5,
+                ),
+                specialist_key: qualification_card(
+                    specialist_model,
+                    specialist_profile,
+                    coding=100,
+                    structured_output=100,
+                    tool_calling=100,
+                ),
+            },
+        )
+    )
+
+    class Session:
+        def __init__(self, profile: ModelProfile) -> None:
+            self.profile = profile
+
+        async def stop(self) -> None:
+            return None
+
+    full_runtime = RoutedModelRuntime(
+        Session(first_profile),
+        root,
+        object(),
+        status=lambda _: None,
+        allow_manual_hierarchy=True,
+    )
+    full_result = await full_runtime.ensure_for(
+        "Implement a Python parser.",
+        task_kind="coding",
+    )
+    assert full_result.decision is not None
+    assert full_result.decision.selected_model_path == first_key
+    assert full_result.routing_strategy == "manual_hierarchy"
+
+    public_runtime = RoutedModelRuntime(
+        Session(specialist_profile),
+        root,
+        object(),
+        status=lambda _: None,
+        allow_manual_hierarchy=False,
+    )
+    public_result = await public_runtime.ensure_for(
+        "Implement a Python parser.",
+        task_kind="coding",
+    )
+    assert public_result.decision is not None
+    assert public_result.decision.selected_model_path == specialist_key
+    assert public_result.routing_strategy == "automatic"
+
+
+@pytest.mark.asyncio
 async def test_routed_runtime_recovers_previous_model_when_specialist_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1192,6 +1559,15 @@ async def test_routed_runtime_retries_rejected_response_with_next_qualified_mode
         assert llm.reconfigurations == 1
         journal = (root / "routing.jsonl").read_text(encoding="utf-8")
         assert '"trigger": "response_rejection"' in journal
+
+        exhausted = await runtime.retry_after_rejection(
+            "Write the requested scene.",
+            "conversation",
+            excluded_model_paths=(preferred_key,),
+        )
+        assert exhausted.switched is False
+        assert exhausted.active_model_path == fallback_key
+        assert llm.reconfigurations == 1
     finally:
         await runtime.stop()
 

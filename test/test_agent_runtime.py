@@ -384,6 +384,36 @@ async def test_web_read_does_not_guess_between_ambiguous_observed_urls() -> None
     assert "absent from web_search evidence" in payload["error"]
 
 
+@pytest.mark.asyncio
+async def test_web_read_uses_raw_github_document_instead_of_site_chrome() -> None:
+    tools = object.__new__(MCPTools)
+    discovered = "https://github.com/example/project/blob/main/README.md"
+    raw = "https://raw.githubusercontent.com/example/project/main/README.md"
+    tools._web_discovered_urls = {
+        MCPTools._normalized_web_url(discovered): discovered,
+    }
+    tools._web_search_performed = True
+    browser_calls: list[tuple[str, dict]] = []
+
+    async def browser_call(tool: str, arguments: dict) -> str:
+        browser_calls.append((tool, arguments))
+        if tool == "browser_navigate":
+            return f"- Page URL: {arguments['url']}"
+        return (
+            f"- Page URL: {raw}\n"
+            "- Page Title: README.md\n"
+            "- text: Project documentation and verified usage details."
+        )
+
+    tools.browser_call = browser_call
+    payload = json.loads(await tools.web_read(discovered))
+
+    assert browser_calls[0] == ("browser_navigate", {"url": raw})
+    assert payload["requested_url"] == discovered
+    assert payload["content_url"] == raw
+    assert "verified usage details" in payload["content"]
+
+
 def test_legacy_tool_request_remains_supported() -> None:
     assert Agent._parse_tool_request("TOOL:cat:README.md") == (
         "cat",
@@ -984,6 +1014,94 @@ async def test_light_conversation_streams_and_skips_expensive_memory() -> None:
     assert answer.startswith("Hey, Boss")
     assert len(memory.session) == 1
     assert memory.processed is False
+
+
+@pytest.mark.asyncio
+async def test_light_chat_answers_all_parts_and_strips_unrequested_commitment() -> None:
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+            self.relationship_state = RelationshipState()
+
+        async def process(self, prompt: str, answer: str) -> None:
+            return None
+
+    class LLMStub:
+        async def ask(self, *, messages: list[dict], **kwargs) -> str:
+            system = messages[0]["content"]
+            assert "Answer every distinct part" in system
+            assert "Initiative is welcome" in system
+            return (
+                "Evening's quiet, Boss. PALADYN needs a cleaner task dashboard "
+                "and stricter session isolation. I'll do it."
+            )
+
+    agent = object.__new__(Agent)
+    agent.memory = MemoryStub()
+    agent.llm = LLMStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+
+    answer = await agent._run_light_chat(
+        "Cześć V, jak mija wieczór i co usprawnić w PALADYNIE?",
+        None,
+    )
+
+    assert "Evening's quiet" in answer
+    assert "task dashboard" in answer
+    assert "I'll do it" in answer
+
+
+def test_long_mixed_check_in_and_idea_request_skips_semantic_router() -> None:
+    prompt = (
+        "Cześć V, chciałbym się zapytać Ciebie jak tam wieczór. To po pierwsze, "
+        "po drugie, słuchaj, masz może jakieś pomysły, żeby usprawnić działanie "
+        "PALADYN?"
+    )
+
+    assert Agent._is_light_conversation(prompt)
+
+
+def test_light_chat_strips_compact_offer_and_false_done_claim() -> None:
+    answer = (
+        "PALADYN's login is old tech. Face recognition replaces it. "
+        "Want that? Done."
+    )
+
+    cleaned = Agent._strip_unverified_completion_claim(answer)
+
+    assert cleaned == "PALADYN's login is old tech. Face recognition replaces it."
+
+
+def test_light_chat_covers_check_in_and_strips_wire_it_up_promise() -> None:
+    prompt = (
+        "Cześć V, jak tam wieczór leci? Co ulepszyć w PALADYNIE oprócz logowania?"
+    )
+    candidate = (
+        "PALADYN needs a new UI: drag-and-drop upload and real-time feedback. "
+        "Let me wire it up."
+    )
+
+    without_promise = Agent._strip_unverified_completion_claim(candidate)
+    answer = Agent._ensure_light_chat_part_coverage(prompt, without_promise)
+
+    assert answer.startswith("Evening's running clean, Boss.")
+    assert "drag-and-drop" in answer
+    assert "wire it up" in answer
+
+
+def test_light_chat_strips_redundant_chatbot_and_build_that_in_promise() -> None:
+    candidate = (
+        "Evening's running clean, Boss. PALADYN needs AI-driven task "
+        "prioritization and a chatbot assistant for quick queries. "
+        "Let me build that in."
+    )
+
+    answer = Agent._strip_unverified_completion_claim(candidate)
+    answer = Agent._strip_redundant_self_suggestion(answer)
+
+    assert "task prioritization" in answer
+    assert "chatbot" not in answer.casefold()
+    assert "build that in" in answer.casefold()
 
 
 @pytest.mark.asyncio
@@ -1912,6 +2030,54 @@ def test_owner_progress_report_merges_rich_ledger_after_bounded_rollover() -> No
     assert "Continue the original objective" not in report
 
 
+def test_owner_progress_report_ignores_stale_rollover_questions() -> None:
+    report = Agent._owner_progress_report(
+        {
+            "findings": [],
+            "open_questions": [
+                "browser_snapshot",
+                "browser_navigate:distinct_detail_page",
+            ],
+            "next_steps": ["Continue the original objective using real tools."],
+        },
+        [
+            {
+                "tool": "browser_snapshot",
+                "status": "succeeded",
+                "result_excerpt": (
+                    "- Page URL: https://example.test/complete\n"
+                    "- Page Title: Complete observed source\n"
+                    '- heading "Observed result" [level=2]'
+                ),
+            }
+        ],
+        [],
+    )
+
+    assert "Still open:" not in report
+    assert "distinct detail page" not in report
+
+
+def test_owner_progress_report_unwraps_truncated_web_read_json() -> None:
+    excerpt = (
+        '{"requested_url":"https://github.com/example/project/blob/main/README.md",'
+        '"content":"### Page\\n- Page URL: '
+        'https://raw.githubusercontent.com/example/project/main/README.md\\n'
+        '- Page Title: README.md\\n### Snapshot\\n```yaml\\n'
+        '- generic [active] [ref=f1]'
+    )
+
+    report = Agent._owner_progress_report(
+        None,
+        [{"tool": "web_read", "status": "succeeded", "result_excerpt": excerpt}],
+        [],
+    )
+
+    assert "Source: https://raw.githubusercontent.com/example/project/main/README.md" in report
+    assert "generic [" not in report
+    assert '"requested_url"' not in report
+
+
 @pytest.mark.asyncio
 async def test_owner_stop_closes_checkpoint_without_another_model_call(
     tmp_path: Path,
@@ -2462,6 +2628,458 @@ def test_discovery_query_skips_generic_task_importance_preamble() -> None:
     assert "stwórz" not in query
 
 
+def test_discovery_query_skips_period_terminated_voice_greeting() -> None:
+    prompt = (
+        "Cześć V. Posłuchaj, wejdź w internet i znajdź informacje na temat "
+        "narzędzi albo skili, które pomagają sztucznej inteligencji "
+        "samodzielnie rozwiązać kapcza. Jeżeli nic nie znajdziesz, stwórz "
+        "takie narzędzie."
+    )
+
+    query = Agent._discovery_search_query(prompt)
+
+    assert "kapcza" in query
+    assert "Cześć V" not in query
+    assert "Jeżeli" not in query
+
+
+def test_discovery_query_skips_unnamed_short_greeting_before_long_request() -> None:
+    prompt = (
+        "Cześć, mam dla Ciebie zadanie. Posłuchaj, znajdź mi wszystko, co "
+        "można ustalić na temat nocników wyprodukowanych przed wojną, "
+        "szczególnie austriackich i francuskich."
+    )
+
+    query = Agent._discovery_search_query(prompt)
+
+    assert "nocnik" in query.casefold()
+    assert "mam dla Ciebie zadanie" not in query
+
+
+def test_discovery_query_does_not_treat_roman_war_number_as_product() -> None:
+    prompt = (
+        "V, posłuchaj, wyszukaj mi w internecie informacje na temat nocników, "
+        "ale nie takich zwykłych nocników, tylko takich, które były produkowane "
+        "przed II wojną światową, szczególnie nocniki produkcji austriackiej i "
+        "francuskiej. Chciałbym poznać ceny i miejsca zakupu."
+    )
+
+    query = Agent._discovery_search_query(prompt).casefold()
+
+    assert "nocnik" in query
+    assert "austriack" in query
+    assert "francusk" in query
+    assert query != "były produkowane przed ii"
+
+
+def test_grounded_semantic_query_beats_runtime_greeting_clause() -> None:
+    prompt = (
+        "Cześć, mam dla Ciebie zadanie. Znajdź informacje o nocnikach "
+        "austriackich i francuskich produkowanych przed wojną."
+    )
+
+    runtime = "Cześć, mam dla Ciebie zadanie"
+    semantic = "nocniki austriackie francuskie przed wojną"
+
+    assert Agent._query_remainder_overlap(runtime, prompt) == 0
+    assert Agent._query_remainder_overlap(semantic, prompt) >= 3
+
+
+def test_topic_relevance_rejects_unrelated_detail_product() -> None:
+    calls = [
+        {
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "arguments": {"url": "https://example.test/product/coffee-mug"},
+        },
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "result_excerpt": (
+                "- Page URL: https://example.test/product/coffee-mug\n"
+                "Coffee mug with a funny office slogan, price 39 PLN."
+            ),
+        },
+    ]
+
+    assert Agent._topic_relevance_missing(
+        "antique Austrian French chamber pots",
+        calls,
+    ) == ["browser_evidence:topic_mismatch"]
+
+
+def test_topic_relevance_accepts_matching_detail_product() -> None:
+    calls = [
+        {
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "arguments": {"url": "https://example.test/product/chamber-pot"},
+        },
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "result_excerpt": (
+                "- Page URL: https://example.test/product/chamber-pot\n"
+                "Antique French porcelain chamber pot, circa 1920."
+            ),
+        },
+    ]
+
+    assert Agent._topic_relevance_missing(
+        "antique Austrian French chamber pots",
+        calls,
+    ) == []
+
+
+def test_topic_relevance_requires_each_source_to_match_multi_source_subject() -> None:
+    calls = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "results": [
+                        {
+                            "url": "https://example.test/mushrooms/species",
+                            "title": "Regional mushroom species with photographs",
+                        },
+                        {
+                            "url": "https://example.test/microdosing/adhd",
+                            "title": "Microdosing and mental health",
+                        },
+                    ]
+                }
+            ),
+        },
+        {
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "arguments": {"url": "https://example.test/mushrooms/species"},
+        },
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "result_excerpt": "Regional mushroom species and photographs.",
+        },
+        {
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "arguments": {"url": "https://example.test/microdosing/adhd"},
+        },
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "result_excerpt": "Microdosing and ADHD mental health research.",
+        },
+    ]
+
+    assert Agent._topic_relevance_missing(
+        "all regional mushroom species photographs",
+        calls,
+        minimum_sources=2,
+        strict_each_source=True,
+    ) == ["browser_evidence:topic_sources=1/2"]
+
+
+def test_topic_relevance_accepts_two_matching_subject_sources() -> None:
+    calls = [
+        {
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "arguments": {"url": "https://one.test/mushroom-species"},
+        },
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "result_excerpt": "Regional mushroom species illustrated catalogue.",
+        },
+        {
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "arguments": {"url": "https://two.test/mushroom-atlas"},
+        },
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "result_excerpt": "Photographs and descriptions of regional mushroom species.",
+        },
+    ]
+
+    assert Agent._topic_relevance_missing(
+        "all regional mushroom species photographs",
+        calls,
+        minimum_sources=2,
+        strict_each_source=True,
+    ) == []
+
+
+def test_runtime_repairs_web_search_that_drops_owner_subject() -> None:
+    prompt = (
+        "Znajdź informacje o narzędziach pomagających samodzielnie rozwiązać "
+        "kapcza."
+    )
+    contract = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+        requires_web_discovery=True,
+    )
+    preferred = Agent._discovery_search_query(prompt)
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "web_search",
+        {"query": "tools for solving AI independently", "max_results": 5},
+        contract,
+        [],
+        [],
+        preferred_query=preferred,
+    )
+
+    assert repaired == {"query": preferred, "max_results": 5}
+
+
+def test_web_search_refinement_cannot_drop_observed_subject_anchor() -> None:
+    focused = (
+        "Wynajdź i opisz wszystkie gatunki dzikich kotów występujące "
+        "naturalnie w Europie"
+    )
+    calls = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "results": [
+                        {
+                            "title": "Dzikie koty Europy",
+                            "url": "https://one.test/article/dzikie-koty-europy",
+                        },
+                        {
+                            "title": "Encyklopedia dzikich kotów",
+                            "url": "https://two.test/article/dzikie-koty",
+                        },
+                    ]
+                }
+            ),
+        }
+    ]
+    contract = TaskContract(
+        requires_web_discovery=True,
+        required_research_facets=("exhaustive_coverage",),
+    )
+
+    repaired = Agent._repair_web_discovery_navigation(
+        focused,
+        "web_search",
+        {
+            "query": (
+                "Wynajdź wszystkie gatunki kotów występujących naturalnie "
+                "w Europie"
+            ),
+            "max_results": 10,
+        },
+        contract,
+        calls,
+        [],
+        preferred_query=focused,
+    )
+
+    assert repaired["query"] == focused
+
+
+def test_exhaustive_search_keeps_enough_candidates() -> None:
+    contract = TaskContract(
+        requires_web_discovery=True,
+        required_research_facets=("exhaustive_coverage",),
+    )
+
+    repaired = Agent._repair_web_discovery_navigation(
+        "Find every regional species.",
+        "web_search",
+        {"query": "regional species", "max_results": 2},
+        contract,
+        [],
+        [],
+        preferred_query="regional species",
+    )
+
+    assert repaired["max_results"] == 10
+
+
+def test_invented_web_read_url_is_replaced_with_grounded_result() -> None:
+    grounded = "https://catalogue.test/"
+    calls = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "results": [
+                        {
+                            "rank": 1,
+                            "title": "Regional species catalogue",
+                            "url": grounded,
+                        }
+                    ]
+                }
+            ),
+        }
+    ]
+    contract = TaskContract(requires_web_discovery=True)
+
+    repaired = Agent._repair_web_discovery_navigation(
+        "Find regional species.",
+        "web_read",
+        {"url": "https://invented.test/not-observed"},
+        contract,
+        calls,
+        [],
+        preferred_query="regional species",
+    )
+
+    assert repaired == {"url": grounded}
+
+
+def test_runtime_keeps_owner_grounded_search_refinement() -> None:
+    prompt = (
+        "Search the internet for antique chamber pots made before the war. I especially "
+        "need Austrian and French examples, prices, sellers, and collecting rules."
+    )
+    contract = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+        requires_web_discovery=True,
+    )
+    preferred = "antique chamber pots made before the war"
+    refined = (
+        "antique chamber pots Austrian French prices sellers collecting rules"
+    )
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "web_search",
+        {"query": refined, "max_results": 10},
+        contract,
+        [],
+        [],
+        preferred_query=preferred,
+    )
+
+    assert repaired["query"] == refined
+
+
+def test_broad_research_requires_two_verified_detail_sources() -> None:
+    prompt = (
+        "Search the internet for antique chamber pots made before the war. I especially "
+        "need Austrian and French examples, prices, sellers, collecting rules, "
+        "common varieties, rare varieties, materials, dates, and provenance; "
+        "then report the findings."
+    )
+    contract = TaskContract.from_prompt(prompt)
+    first = "https://museum.test/article/chamber-pots"
+    second = "https://auction.test/product/french-pot"
+    calls = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "results": [
+                        {"url": first, "title": "History"},
+                        {"url": second, "title": "French example"},
+                    ]
+                }
+            ),
+        },
+        {
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "arguments": {"url": first},
+        },
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "result_excerpt": "Chamber pot history and materials.",
+        },
+    ]
+
+    assert contract.minimum_detail_sources == 2
+    assert "browser_evidence:detail_sources=1/2" in contract.unmet(calls)
+
+    calls.extend(
+        [
+            {
+                "tool": "browser_navigate",
+                "status": "succeeded",
+                "arguments": {"url": second},
+            },
+            {
+                "tool": "browser_snapshot",
+                "status": "succeeded",
+                "result_excerpt": "French chamber pot sold for 400 EUR.",
+            },
+        ]
+    )
+
+    assert "browser_evidence:detail_sources=1/2" not in contract.unmet(calls)
+
+
+def test_research_detail_snapshot_expands_narrow_model_target() -> None:
+    contract = TaskContract(
+        requires_evidence_report=True,
+        requires_distinct_detail_page=True,
+    )
+    calls = [
+        {
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "arguments": {"url": "https://museum.test/article/chamber-pots"},
+        }
+    ]
+
+    repaired = Agent._repair_research_detail_snapshot(
+        "browser_snapshot",
+        {
+            "target": "//*[@id='article']/h1",
+            "filename": "heading.md",
+            "depth": 2,
+            "boxes": True,
+        },
+        contract,
+        calls,
+    )
+
+    assert repaired == {"depth": 4, "target": "body"}
+
+
+def test_research_search_snapshot_discards_foreign_engine_xpath() -> None:
+    contract = TaskContract(
+        requires_evidence_report=True,
+        requires_distinct_detail_page=True,
+        requires_web_discovery=True,
+    )
+    calls = [
+        {
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "arguments": {"url": "https://duckduckgo.com/?q=vintage+cups"},
+        }
+    ]
+
+    repaired = Agent._repair_research_detail_snapshot(
+        "browser_snapshot",
+        {
+            "target": "//*[@id='rso']/div[3]/h2",
+            "depth": 3,
+            "boxes": True,
+        },
+        contract,
+        calls,
+    )
+
+    assert repaired == {"depth": 4, "target": "body"}
+
+
 def test_runtime_recovers_public_fact_search_with_new_focused_query() -> None:
     prompt = (
         "Sprawdź ile jest w Warszawie cukierni Cud Malina i podaj wszystkie "
@@ -2610,6 +3228,46 @@ def test_model_copied_detail_url_is_repaired_from_search_evidence() -> None:
     )
 
 
+def test_model_mangled_web_read_url_is_repaired_from_search_evidence() -> None:
+    prompt = "Znajdź dwie oferty kolekcjonerskich filiżanek."
+    exact = (
+        "https://allegro.pl/kategoria/design-i-antyki-porcelana-26163"
+        "?string=kolekcjonerskie%20fili%C5%BCanki"
+    )
+    contract = TaskContract.from_prompt(prompt).merged(
+        TaskContract(
+            requires_browser_navigation=True,
+            requires_browser_snapshot=True,
+            requires_web_discovery=True,
+        )
+    )
+    successful = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {"results": [{"title": "Filiżanki", "url": exact}]}
+            ),
+        }
+    ]
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "web_read",
+        {
+            "url": (
+                "https://allegro.pl/kategoria/design-and-antiques-porcelain-26163/"
+                "string=kolekcjonerskie%f20fili%c5%bcanki"
+            )
+        },
+        contract,
+        successful,
+        [],
+    )
+
+    assert repaired == {"url": exact}
+
+
 def test_model_corrupted_hostname_is_repaired_from_high_level_search_evidence() -> None:
     prompt = "Znajdź adres i godziny otwarcia cukierni Miód Malina."
     contract = TaskContract.from_prompt(prompt).merged(
@@ -2696,6 +3354,18 @@ def test_long_single_sentence_query_focuses_on_repeated_product() -> None:
     assert query == "znajdź alternatywę dla Firecrawlera"
     assert "zadanko" not in query
     assert "stworzyć" not in query
+
+
+def test_repeated_long_verb_cannot_replace_discovery_subject() -> None:
+    prompt = (
+        "Znajdź słabe punkty w konstrukcji tego forum i zobacz jak można je "
+        "położyć i co potrzebujesz do tego żeby je położyć."
+    )
+
+    query = Agent._discovery_search_query(prompt)
+
+    assert "forum" in query
+    assert query != "jak można je położyć"
 
 
 def test_failed_direct_navigation_falls_back_to_duckduckgo() -> None:
@@ -3120,6 +3790,28 @@ async def test_llm_gives_local_artifact_generation_a_longer_timeout(
     assert completions.request["timeout"] == 900.0
 
 
+def test_llm_local_transport_uses_one_long_request_without_hidden_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    def client_stub(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.delenv("V_CORE_TIMEOUT", raising=False)
+    monkeypatch.delenv("V_CORE_HTTP_RETRIES", raising=False)
+    monkeypatch.setattr("v_core.llm.llm.AsyncOpenAI", client_stub)
+    llm = object.__new__(LLM)
+    llm._api_key = "local"
+    llm.config = SimpleNamespace(base_url="http://127.0.0.1:5001/v1")
+
+    llm._new_client()
+
+    assert captured["timeout"] == 300.0
+    assert captured["max_retries"] == 0
+
+
 def test_agent_narrows_mixed_task_to_tool_creation_after_browser_evidence() -> None:
     definitions = [
         {"type": "function", "function": {"name": name}}
@@ -3146,6 +3838,248 @@ def test_agent_narrows_mixed_task_to_tool_creation_after_browser_evidence() -> N
     assert {item["function"]["name"] for item in selected} == {
         "learning_create_tool",
     }
+
+
+def test_agent_forces_source_inspection_after_three_search_variants() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": name}}
+        for name in (
+            "web_search",
+            "web_read",
+            "browser_navigate",
+            "browser_snapshot",
+        )
+    ]
+    contract = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+        requires_web_discovery=True,
+        requires_distinct_detail_page=True,
+    )
+    calls = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "arguments": {"query": f"variant {index}"},
+            "result_excerpt": (
+                f"Result {index}: https://example.test/item-{index}"
+            ),
+        }
+        for index in range(3)
+    ]
+
+    selected = Agent._phase_tool_definitions(contract, definitions, calls)
+    selected_names = {item["function"]["name"] for item in selected}
+
+    assert "web_search" not in selected_names
+    assert "browser_navigate" in selected_names
+    assert "web_read" in selected_names
+
+
+def test_agent_stops_retrying_failed_web_reader_when_browser_is_available() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": name}}
+        for name in (
+            "web_search",
+            "web_read",
+            "browser_navigate",
+            "browser_snapshot",
+        )
+    ]
+    contract = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+        requires_web_discovery=True,
+        requires_distinct_detail_page=True,
+    )
+    successful = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": "Result: https://example.test/item",
+        }
+    ]
+    failed = [
+        {"tool": "web_read", "status": "failed"},
+        {"tool": "web_read", "status": "failed"},
+    ]
+
+    selected = Agent._phase_tool_definitions(
+        contract,
+        definitions,
+        successful,
+        failed,
+    )
+    selected_names = {item["function"]["name"] for item in selected}
+
+    assert "web_read" not in selected_names
+    assert "browser_navigate" in selected_names
+    assert "browser_snapshot" in selected_names
+
+
+def test_agent_hides_snapshot_after_latest_navigation_failed() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": name}}
+        for name in (
+            "web_search",
+            "browser_navigate",
+            "browser_snapshot",
+        )
+    ]
+    contract = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+        requires_web_discovery=True,
+        requires_distinct_detail_page=True,
+    )
+    successful = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "sequence": 1,
+            "result_excerpt": "https://example.test/article/result",
+        }
+    ]
+    failed = [
+        {
+            "tool": "browser_navigate",
+            "status": "failed",
+            "sequence": 2,
+            "arguments": {"url": "https://example.test/article/result"},
+        }
+    ]
+
+    selected = Agent._phase_tool_definitions(
+        contract,
+        definitions,
+        successful,
+        failed,
+    )
+    selected_names = {item["function"]["name"] for item in selected}
+
+    assert "browser_snapshot" not in selected_names
+    assert "browser_navigate" in selected_names
+    assert "web_search" in selected_names
+
+
+def test_agent_isolates_missing_skill_instead_of_returning_to_research() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": name}}
+        for name in (
+            "web_search",
+            "browser_navigate",
+            "learning_create_tool",
+            "learning_create_skill",
+        )
+    ]
+    contract = TaskContract(
+        requires_created_tool=True,
+        requires_created_skill=True,
+    )
+    calls = [
+        {"tool": "learning_create_tool", "status": "succeeded"},
+    ]
+
+    selected = Agent._phase_tool_definitions(contract, definitions, calls)
+
+    assert [item["function"]["name"] for item in selected] == [
+        "learning_create_skill"
+    ]
+
+
+def test_agent_exposes_both_builders_for_artifact_disjunction() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": name}}
+        for name in (
+            "web_search",
+            "learning_create_tool",
+            "learning_create_skill",
+        )
+    ]
+    contract = TaskContract(requires_created_artifact=True)
+
+    selected = Agent._phase_tool_definitions(contract, definitions, [])
+
+    assert {item["function"]["name"] for item in selected} == {
+        "learning_create_tool",
+        "learning_create_skill",
+    }
+
+
+def test_agent_isolates_required_provider_before_unrelated_search_tools() -> None:
+    definitions = [
+        {"type": "function", "function": {"name": name}}
+        for name in (
+            "web_search",
+            "browser_navigate",
+            "full_tor_search",
+            "learning_create_tool",
+            "learning_create_skill",
+        )
+    ]
+    contract = TaskContract(
+        requires_created_artifact=True,
+        required_tools=("full_tor_search",),
+        required_capabilities=("network.tor.search",),
+    )
+
+    selected = Agent._phase_tool_definitions(contract, definitions, [])
+
+    assert [item["function"]["name"] for item in selected] == [
+        "full_tor_search"
+    ]
+
+
+def test_schema_alias_repair_renames_one_unambiguous_string_field() -> None:
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_find",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    repaired = Agent._repair_schema_argument_alias(
+        "browser_find",
+        {"regex": "CAPTCHA|Verify"},
+        definitions,
+    )
+
+    assert repaired == {"text": "CAPTCHA|Verify"}
+
+
+def test_schema_alias_repair_refuses_ambiguous_payload() -> None:
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_type",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {"type": "string"},
+                        "text": {"type": "string"},
+                    },
+                    "required": ["target", "text"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    arguments = {"selector": "input", "value": "hello"}
+
+    assert Agent._repair_schema_argument_alias(
+        "browser_type",
+        arguments,
+        definitions,
+    ) == arguments
 
 
 def test_agent_narrows_post_creation_phase_to_generated_tool() -> None:
@@ -3726,6 +4660,793 @@ def test_empty_explicit_generated_tool_arguments_recover_quoted_text() -> None:
     assert repaired == {"text": "V can build her own tools"}
 
 
+def test_required_url_tool_uses_exact_owner_url_instead_of_model_copy() -> None:
+    exact_url = (
+        "http://cebulka7uxchnbpvmqapg5pfos4ngaxglsktzvha7a5rigndghvadeyd.onion"
+    )
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "full_tor_fetch",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                        "timeout_seconds": {"type": "number"},
+                    },
+                    "required": ["url"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    repaired = Agent._repair_explicit_text_arguments(
+        f"Open {exact_url} and inspect the page.",
+        "full_tor_fetch",
+        {
+            "url": "http://cebulka7uxchnbpvm qapg5pfos4ng.on ion",
+            "timeout_seconds": 30,
+        },
+        definitions,
+        TaskContract().with_required_tools(["full_tor_fetch"]),
+    )
+
+    assert repaired == {"url": exact_url, "timeout_seconds": 30}
+
+
+def test_required_url_repair_uses_durable_objective_during_follow_up() -> None:
+    exact_url = "https://example.com/exact/path"
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "required_fetch",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"],
+                },
+            },
+        }
+    ]
+
+    repaired = Agent._repair_explicit_text_arguments(
+        f"Inspect {exact_url}.\n\nFollow-up: Try again.",
+        "required_fetch",
+        {"url": "https://example.net/invented"},
+        definitions,
+        TaskContract().with_required_tools(["required_fetch"]),
+    )
+
+    assert repaired == {"url": exact_url}
+
+
+def test_runtime_executes_unambiguous_required_url_without_model_copy() -> None:
+    exact_url = (
+        "http://cebulka7uxchnbpvmqapg5pfos4ngaxglsktzvha7a5rigndghvadeyd.onion"
+    )
+    contract = TaskContract().with_required_tools(["full_tor_fetch"])
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "full_tor_fetch",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "pattern": "^https?://"},
+                    },
+                    "required": ["url"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    request = Agent._runtime_grounded_required_tool_request(
+        f"Open {exact_url} and inspect it.",
+        contract,
+        definitions,
+        [],
+    )
+
+    assert request == ("full_tor_fetch", {"url": exact_url})
+
+
+def test_runtime_does_not_guess_ambiguous_required_url() -> None:
+    contract = TaskContract().with_required_tools(["required_fetch"])
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "required_fetch",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"],
+                },
+            },
+        }
+    ]
+
+    request = Agent._runtime_grounded_required_tool_request(
+        "Compare https://example.com/a with https://example.net/b.",
+        contract,
+        definitions,
+        [],
+    )
+
+    assert request is None
+
+
+def test_runtime_selects_relevant_unvisited_detail_after_listing_stalls() -> None:
+    prompt = (
+        "Find information and prices for antique French chamber pots made "
+        "before the war."
+    )
+    contract = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+        requires_web_discovery=True,
+        requires_distinct_detail_page=True,
+    )
+    definitions = [
+        {"type": "function", "function": {"name": "browser_navigate"}},
+        {"type": "function", "function": {"name": "browser_snapshot"}},
+    ]
+    calls = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "results": [
+                        {
+                            "rank": 1,
+                            "title": "Antiques marketplace",
+                            "url": "https://market.test/listing?query=antiques",
+                        },
+                        {
+                            "rank": 2,
+                            "title": "Unrelated military history",
+                            "url": "https://history.test/post/military",
+                        },
+                        {
+                            "rank": 3,
+                            "title": "Antique French chamber pots",
+                            "url": "https://museum.test/article/chamber-pots",
+                        },
+                    ]
+                }
+            ),
+        },
+        {
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "arguments": {"url": "https://market.test/listing?query=antiques"},
+        },
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "result_excerpt": "Cookie preferences",
+        },
+    ]
+
+    request = Agent._runtime_grounded_required_tool_request(
+        prompt,
+        contract,
+        definitions,
+        calls,
+    )
+
+    assert request == (
+        "browser_navigate",
+        {"url": "https://museum.test/article/chamber-pots"},
+    )
+
+
+def test_runtime_selects_grounded_market_when_price_evidence_is_missing() -> None:
+    prompt = "Search for antique chamber-pot prices and where to buy them."
+    listing = "https://market.test/listing?query=chamber-pots"
+    contract = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+        requires_web_discovery=True,
+        requires_distinct_detail_page=True,
+        required_research_facets=("price", "purchase_source"),
+    )
+    definitions = [
+        {"type": "function", "function": {"name": "browser_navigate"}},
+        {"type": "function", "function": {"name": "browser_snapshot"}},
+    ]
+    calls = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "results": [
+                        {
+                            "rank": 1,
+                            "title": "Antique chamber pots for sale",
+                            "url": listing,
+                        },
+                        {
+                            "rank": 2,
+                            "title": "Chamber-pot history",
+                            "url": "https://museum.test/article/chamber-pots",
+                        },
+                    ]
+                }
+            ),
+        }
+    ]
+
+    request = Agent._runtime_grounded_required_tool_request(
+        prompt,
+        contract,
+        definitions,
+        calls,
+    )
+
+    assert request == ("browser_navigate", {"url": listing})
+
+
+def test_runtime_retains_repeated_subject_when_selecting_second_source() -> None:
+    prompt = (
+        "Znajdź nocniki sprzed drugiej wojny, porównaj ceny nocników "
+        "oraz miejsca, gdzie można je kupić."
+    )
+    successful = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "results": [
+                        {
+                            "rank": 1,
+                            "title": "Antyki z Francji i Austrii",
+                            "url": "https://antyki.test/blog/francja-austria",
+                        },
+                        {
+                            "rank": 2,
+                            "title": "Nocniki francuskie przed 1939 rokiem",
+                            "url": "https://muzeum.test/article/nocniki-francuskie",
+                        },
+                    ]
+                }
+            ),
+        }
+    ]
+
+    selected = Agent._grounded_unvisited_detail_url(prompt, successful)
+
+    assert selected == "https://muzeum.test/article/nocniki-francuskie"
+
+
+def test_exhaustive_detail_ranking_prefers_rare_scope_anchor() -> None:
+    prompt = (
+        "Wynajdź i opisz wszystkie gatunki dzikich kotów występujące "
+        "naturalnie w Europie."
+    )
+    general = "https://animals.test/article/dzikie-koty-gatunki"
+    scoped = "https://animals.test/article/dzikie-koty-europy"
+    calls = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "results": [
+                        {
+                            "rank": 1,
+                            "title": "Dzikie koty i najważniejsze gatunki świata",
+                            "url": general,
+                        },
+                        {
+                            "rank": 8,
+                            "title": "Sekrety dzikich kotów Europy",
+                            "url": scoped,
+                        },
+                    ]
+                }
+            ),
+        }
+    ]
+
+    assert Agent._grounded_unvisited_detail_url(prompt, calls) == scoped
+
+
+def test_exhaustive_navigation_replaces_weaker_grounded_candidate() -> None:
+    prompt = (
+        "Wynajdź i opisz wszystkie gatunki dzikich kotów występujące "
+        "naturalnie w Europie."
+    )
+    general = "https://animals.test/article/dzikie-koty-gatunki"
+    scoped = "https://animals.test/article/dzikie-koty-europy"
+    calls = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "results": [
+                        {
+                            "rank": 1,
+                            "title": "Dzikie koty i najważniejsze gatunki świata",
+                            "url": general,
+                        },
+                        {
+                            "rank": 8,
+                            "title": "Sekrety dzikich kotów Europy",
+                            "url": scoped,
+                        },
+                    ]
+                }
+            ),
+        }
+    ]
+    contract = TaskContract(
+        requires_web_discovery=True,
+        required_research_facets=("exhaustive_coverage",),
+    )
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {"url": general},
+        contract,
+        calls,
+        [],
+        preferred_query=prompt,
+    )
+
+    assert repaired == {"url": scoped}
+
+
+def test_verified_final_report_preserves_observed_items_and_images() -> None:
+    source = "https://catalogue.test/article/wild-cats"
+    calls = [
+        {
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "arguments": {"url": source},
+            "result_excerpt": f"- Page URL: {source}",
+        },
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "result_excerpt": (
+                f"- Page URL: {source}\n"
+                "- Page Title: Wild-cat catalogue\n"
+                "- article:\n"
+                "  - img \"European wildcat photograph\"\n"
+                "  - heading \"Felis silvestris\" [level=6]\n"
+                "- article:\n"
+                "  - img \"Eurasian lynx photograph\"\n"
+                "  - heading \"Lynx lynx\" [level=6]"
+            ),
+        },
+    ]
+    contract = TaskContract(
+        requires_evidence_report=True,
+        required_research_facets=(
+            "item_list",
+            "item_descriptions",
+            "images",
+            "exhaustive_coverage",
+        ),
+    )
+
+    report = Agent._owner_verified_final_report(None, calls, contract)
+
+    assert "- Felis silvestris —" in report
+    assert "- Lynx lynx —" in report
+    assert "European wildcat photograph" in report
+    assert "does not claim that omitted records were verified" in report
+
+
+def test_repeated_scaffolding_does_not_suppress_all_detail_candidates() -> None:
+    prompt = (
+        "Please carefully search and carefully compare one Firecrawler alternative."
+    )
+    successful = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "results": [
+                        {
+                            "rank": 1,
+                            "title": "Firecrawler alternative",
+                            "url": "https://tools.test/article/firecrawler-alternative",
+                        }
+                    ]
+                }
+            ),
+        }
+    ]
+
+    selected = Agent._grounded_unvisited_detail_url(prompt, successful)
+
+    assert selected == "https://tools.test/article/firecrawler-alternative"
+
+
+def test_malformed_relative_navigation_uses_next_grounded_result() -> None:
+    first = "https://catalogue.test/article/species-alpha"
+    second = "https://reference.test/article/species-beta"
+    prompt = "Find and describe all regional species with species photographs."
+    successful = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "results": [
+                        {"rank": 1, "title": "Regional species", "url": first},
+                        {"rank": 2, "title": "Regional species", "url": second},
+                    ]
+                }
+            ),
+        },
+        {
+            "tool": "web_read",
+            "status": "succeeded",
+            "arguments": {"url": first},
+            "result_excerpt": "Observed first regional species source.",
+        },
+    ]
+    contract = TaskContract(
+        requires_web_discovery=True,
+        requires_evidence_report=True,
+        requires_distinct_detail_page=True,
+        required_research_facets=("exhaustive_coverage",),
+    )
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {"url": "#invented section with spaces"},
+        contract,
+        successful,
+        [],
+        preferred_query="regional species photographs",
+    )
+
+    assert repaired == {"url": second}
+
+
+def test_read_path_typo_is_repaired_from_successful_write() -> None:
+    correct = "/workspace/smoke-report.md"
+    calls = [
+        {
+            "tool": "write_file",
+            "status": "succeeded",
+            "arguments": {"path": correct, "content": "# Smoke"},
+        }
+    ]
+
+    repaired = Agent._repair_observed_file_path(
+        "read_file",
+        {"path": "/workspace/smone-report.md", "head": 1},
+        calls,
+    )
+
+    assert repaired == {"path": correct, "head": 1}
+
+
+def test_unrelated_read_path_is_not_redirected() -> None:
+    calls = [
+        {
+            "tool": "write_file",
+            "status": "succeeded",
+            "arguments": {"path": "/workspace/alpha.md", "content": "a"},
+        }
+    ]
+
+    repaired = Agent._repair_observed_file_path(
+        "read_file",
+        {"path": "/workspace/beta.md"},
+        calls,
+    )
+
+    assert repaired == {"path": "/workspace/beta.md"}
+
+
+def test_observed_detail_urls_resolve_relative_listing_links() -> None:
+    calls = [
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "result_excerpt": (
+                "- Page URL: https://www.olx.pl/antyki/q-filizanka/\n"
+                "- link 'Vintage filiżanka 1965'\n"
+                "  - /url: /d/oferta/vintage-filizanka-1965-ID123.html\n"
+            ),
+        }
+    ]
+
+    observed = Agent._observed_detail_urls(calls)
+
+    assert "https://www.olx.pl/d/oferta/vintage-filizanka-1965-ID123.html" in observed
+
+
+def test_listing_snapshot_selects_relative_offer_not_help_policy() -> None:
+    prompt = (
+        "Znajdź dwie aktualne oferty kolekcjonerskich filiżanek i podaj cenę."
+    )
+    calls = [
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "result_excerpt": (
+                "- Page URL: https://www.olx.pl/antyki/q-filizanka/\n"
+                "- link 'Vintage filiżanka z 1965 roku, 350 zł'\n"
+                "  - /url: /d/oferta/vintage-filizanka-1965-ID123.html\n"
+                "- link 'Pomoc i polityka cookies'\n"
+                "  - /url: https://pomoc.olx.pl/polityka-dotyczaca-plikow-cookie\n"
+            ),
+        }
+    ]
+
+    selected = Agent._grounded_unvisited_detail_url(prompt, calls)
+
+    assert selected == (
+        "https://www.olx.pl/d/oferta/vintage-filizanka-1965-ID123.html"
+    )
+
+
+def test_runtime_never_reselects_failed_grounded_detail_url() -> None:
+    prompt = (
+        "Search the web for chamber pots made before the war and compare "
+        "chamber pot prices."
+    )
+    dead = "https://market.test/product/antique-chamber-pot"
+    alternative = "https://museum.test/article/chamber-pot-history"
+    successful = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "results": [
+                        {"rank": 1, "title": "Chamber pot", "url": dead},
+                        {
+                            "rank": 2,
+                            "title": "Chamber pot history",
+                            "url": alternative,
+                        },
+                    ]
+                }
+            ),
+        }
+    ]
+    failed = [
+        {
+            "tool": "browser_navigate",
+            "status": "failed",
+            "arguments": {"url": dead},
+        }
+    ]
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {"url": dead},
+        TaskContract.from_prompt(prompt),
+        successful,
+        failed,
+    )
+
+    assert repaired == {"url": alternative}
+
+
+def test_runtime_never_revisits_successfully_observed_detail_source() -> None:
+    prompt = (
+        "Search the web for chamber pots made before the war and compare "
+        "chamber pot prices."
+    )
+    first = "https://history.test/article/chamber-pot"
+    second = "https://museum.test/article/chamber-pot-prices"
+    successful = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "results": [
+                        {"rank": 1, "title": "Chamber pot history", "url": first},
+                        {
+                            "rank": 2,
+                            "title": "Chamber pot prices",
+                            "url": second,
+                        },
+                    ]
+                }
+            ),
+        },
+        {
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "arguments": {"url": first},
+        },
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "arguments": {"target": "body"},
+        },
+    ]
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {"url": first},
+        TaskContract.from_prompt(prompt),
+        successful,
+        [],
+    )
+
+    assert repaired == {"url": second}
+
+
+def test_repeated_search_page_advances_to_observed_result() -> None:
+    prompt = (
+        "Przeszukaj internet: znajdź nocniki sprzed wojny i ceny nocników."
+    )
+    search_url = "https://duckduckgo.com/?q=nocniki+sprzed+wojny"
+    detail_url = "https://historia.test/32739002-historia-nocnikow"
+    successful = [
+        {
+            "tool": "browser_navigate",
+            "status": "succeeded",
+            "arguments": {"url": search_url},
+        },
+        {
+            "tool": "browser_snapshot",
+            "status": "succeeded",
+            "arguments": {"target": "body"},
+            "result_excerpt": (
+                f"- Page URL: {search_url}\n"
+                "- Page Title: nocniki sprzed wojny at DuckDuckGo\n"
+                "- heading: Historia dawnych nocników\n"
+                f"  - /url: {detail_url}\n"
+                "  - text: Nocniki, ich historia i antyczne egzemplarze."
+            ),
+        },
+    ]
+
+    repaired = Agent._repair_web_discovery_navigation(
+        prompt,
+        "browser_navigate",
+        {"url": search_url},
+        TaskContract.from_prompt(prompt),
+        successful,
+        [],
+    )
+
+    assert repaired == {"url": detail_url}
+
+
+def test_runtime_does_not_promote_topic_or_auction_listing_to_detail() -> None:
+    contract = TaskContract(
+        requires_browser_navigation=True,
+        requires_browser_snapshot=True,
+        requires_web_discovery=True,
+        requires_distinct_detail_page=True,
+    )
+    definitions = [
+        {"type": "function", "function": {"name": "browser_navigate"}},
+        {"type": "function", "function": {"name": "browser_snapshot"}},
+    ]
+    calls = [
+        {
+            "tool": "web_search",
+            "status": "succeeded",
+            "result_excerpt": json.dumps(
+                {
+                    "results": [
+                        {
+                            "rank": 1,
+                            "title": "Antique chamber pots",
+                            "url": "https://market.test/temat/chamber-pots",
+                        },
+                        {
+                            "rank": 2,
+                            "title": "Antique chamber-pot auctions",
+                            "url": "https://auction.test/auction/antiques",
+                        },
+                    ]
+                }
+            ),
+        }
+    ]
+
+    request = Agent._runtime_grounded_required_tool_request(
+        "Find antique chamber pots and inspect a concrete source.",
+        contract,
+        definitions,
+        calls,
+    )
+
+    assert request is None
+
+
+def test_runtime_observes_each_owner_url_before_finalization() -> None:
+    prompt = (
+        "Compare www.invicti.com/product and www.acunetix.com/product."
+    )
+    contract = TaskContract.from_prompt(prompt)
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_navigate",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_snapshot",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+        },
+    ]
+    calls: list[dict[str, object]] = []
+
+    assert Agent._runtime_explicit_web_observation_request(
+        prompt, contract, definitions, calls
+    ) == ("browser_navigate", {"url": "https://www.invicti.com/product"})
+    calls.append(
+        {
+            "tool": "browser_navigate",
+            "arguments": {"url": "https://www.invicti.com/product"},
+            "status": "succeeded",
+        }
+    )
+    assert Agent._runtime_explicit_web_observation_request(
+        prompt, contract, definitions, calls
+    ) == ("browser_snapshot", {})
+    calls.append(
+        {"tool": "browser_snapshot", "arguments": {}, "status": "succeeded"}
+    )
+    assert Agent._runtime_explicit_web_observation_request(
+        prompt, contract, definitions, calls
+    ) == ("browser_navigate", {"url": "https://www.acunetix.com/product"})
+    calls.extend(
+        [
+            {
+                "tool": "browser_navigate",
+                "arguments": {"url": "https://www.acunetix.com/product"},
+                "status": "succeeded",
+            },
+            {
+                "tool": "browser_snapshot",
+                "arguments": {},
+                "status": "succeeded",
+            },
+        ]
+    )
+
+    assert Agent._runtime_explicit_web_observation_request(
+        prompt, contract, definitions, calls
+    ) is None
+    assert contract.unmet(calls) == []
+
+
 def test_argument_repair_does_not_guess_multiple_required_fields() -> None:
     definitions = [
         {
@@ -3952,32 +5673,30 @@ def test_structured_literal_repair_leaves_unrelated_tools_unchanged() -> None:
 @pytest.mark.parametrize(
     "prompt",
     [
-        "Dobrze, w takim razie kontynuuj.",
-        "No to dawaj.",
-        "Dobrze, przyjacielu, w takim razie do dzieła.",
-        "Spróbuj jeszcze raz, tylko użyj odpowiedniego narzędzia.",
-        "Jeżeli brakuje Ci do wykonania zadania narzędzia, to je stwórz.",
-        "Jeżeli brakuje Ci do wykonania zadania narzędzia, to jest tłuszcz.",
-        "Go ahead.",
-        "Try again using the proper tool.",
-        "V powtórz zadanie, ale z innymi parametrami albo innym modelem.",
-        "Repeat the task with different parameters.",
-        "If the task is missing a tool, create it.",
+        "/continue",
+        "/continue --continuous",
     ],
 )
-def test_agent_recognizes_short_continuation_requests(prompt: str) -> None:
+def test_agent_recognizes_language_neutral_continuation_protocol(prompt: str) -> None:
     assert Agent._is_continuation_request(prompt)
 
 
 @pytest.mark.parametrize(
     "prompt",
     [
+        "Dobrze, w takim razie kontynuuj.",
+        "No to dawaj.",
+        "Go ahead.",
+        "继续上一个任务。",
         "Jak się dziś czujesz?",
+        "Jak dalej ma się rozwijać PALADYN? Czy masz jakieś sugestie?",
         "Powiedz mi, jak działa kontynuacja zadań.",
         "Why do agents use tools?",
     ],
 )
-def test_agent_does_not_treat_ordinary_conversation_as_continuation(prompt: str) -> None:
+def test_agent_defers_natural_language_continuation_to_semantic_router(
+    prompt: str,
+) -> None:
     assert not Agent._is_continuation_request(prompt)
 
 
@@ -4230,6 +5949,149 @@ async def test_generic_find_information_action_uses_semantic_browser_route(
         "browser_snapshot",
     ]
     assert answer == "I found one verified public result, Boss."
+
+
+@pytest.mark.asyncio
+async def test_deterministic_web_route_keeps_semantic_market_requirements(
+    tmp_path: Path,
+) -> None:
+    first = "https://market.test/product/cup-a"
+    second = "https://market.test/product/cup-b"
+
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+            self.current_url = ""
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            definitions = {
+                "web_search": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+                "browser_navigate": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"],
+                },
+                "browser_snapshot": {
+                    "type": "object",
+                    "properties": {},
+                },
+            }
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": name,
+                        "parameters": parameters,
+                    },
+                }
+                for name, parameters in definitions.items()
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            if tool == "web_search":
+                return json.dumps(
+                    {
+                        "results": [
+                            {"title": "Cup A", "url": first},
+                            {"title": "Cup B", "url": second},
+                        ]
+                    }
+                )
+            if tool == "browser_navigate":
+                self.current_url = arguments["url"]
+                return f"- Page URL: {self.current_url}"
+            price = "10 EUR" if self.current_url == first else "20 EUR"
+            title = "Cup A" if self.current_url == first else "Cup B"
+            return (
+                f"- Page URL: {self.current_url}\n"
+                f"- Page Title: {title}\n"
+                f"{title} costs {price}."
+            )
+
+    class IntentRouterStub:
+        def __init__(self) -> None:
+            self.called = False
+            self.last_sanitization_reason = ""
+
+        async def classify(self, prompt: str, **kwargs) -> SemanticIntent:
+            self.called = True
+            return SemanticIntent(
+                action_requested=True,
+                capabilities=("browser",),
+                requires_report=True,
+                distinct_detail_page=True,
+                research_facets=("price", "purchase_source"),
+                minimum_detail_sources=2,
+                web_query="two antique cup offers",
+            )
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            if self.turn == 1:
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "search",
+                            "web_search",
+                            {"query": "antique cups"},
+                        )
+                    ]
+                )
+            return LLMResponse(
+                content=(
+                    f"I found two offers. Cup A costs 10 EUR at {first}. "
+                    f"Cup B costs 20 EUR at {second}."
+                )
+            )
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    tools = ToolsStub()
+    router = IntentRouterStub()
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    agent.intent_router = router
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.context_window = ContextWindowManager()
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = None
+    agent._memory_tasks = set()
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+
+    answer = await agent._run_agent_loop(
+        "Search the internet for two current antique cup offers. "
+        "Report the price and direct link for each."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert router.called is True
+    assert [name for name, _ in tools.calls] == [
+        "web_search",
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_navigate",
+        "browser_snapshot",
+    ]
+    assert answer.endswith(f"Cup B costs 20 EUR at {second}.")
 
 
 @pytest.mark.asyncio
@@ -4528,6 +6390,7 @@ def test_continuation_rejects_poisoned_immediate_runtime_review_context(
     recovered = agent._continued_action_context(
         "Repeat that task",
         trace,
+        force=True,
     )
 
     assert recovered is None
@@ -4544,6 +6407,15 @@ def test_continuation_rejects_poisoned_immediate_runtime_review_context(
 async def test_poisoned_repeat_request_finishes_without_llm_or_tools(
     tmp_path: Path,
 ) -> None:
+    class IntentRouterStub:
+        async def classify(self, *args, **kwargs) -> SemanticIntent:
+            return SemanticIntent(
+                message_clear=True,
+                action_requested=False,
+                continue_previous=True,
+                references_previous=True,
+            )
+
     class ToolsStub:
         def begin_interaction(self, interaction_id: str, prompt: str) -> None:
             return None
@@ -4556,8 +6428,10 @@ async def test_poisoned_repeat_request_finishes_without_llm_or_tools(
             raise AssertionError("an ungrounded repeat must not reach the LLM")
 
     agent = object.__new__(Agent)
+    agent.intent_router = IntentRouterStub()
     agent.llm = LLMStub()
     agent.tools = ToolsStub()
+    agent.memory = SimpleNamespace(session=Session())
     agent._agent_trace_root = tmp_path
     agent._last_execution_context = {
         "task_id": "interactive-poisoned",
@@ -4738,6 +6612,14 @@ async def test_agent_continuation_inherits_browser_contract_and_tool_routing(
                 )
             )
 
+    class IntentRouterStub:
+        async def classify(self, *args, **kwargs) -> SemanticIntent:
+            return SemanticIntent(
+                message_clear=True,
+                action_requested=True,
+                continue_previous=True,
+            )
+
     class MemoryStub:
         def __init__(self) -> None:
             self.session = Session()
@@ -4757,6 +6639,7 @@ async def test_agent_continuation_inherits_browser_contract_and_tool_routing(
     llm = LLMStub()
     agent = object.__new__(Agent)
     agent.llm = llm
+    agent.intent_router = IntentRouterStub()
     agent.tools = tools
     agent.memory = MemoryStub()
     agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
@@ -5103,6 +6986,244 @@ def test_agent_rejects_promises_to_search_or_use_a_tool_later() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_switches_model_after_two_missing_tool_calls(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "count_words",
+                        "description": "Count words in text.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                            "required": ["text"],
+                        },
+                    },
+                }
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            self.calls.append((tool, arguments))
+            return '{"count": 4}'
+
+    class IntentRouterStub:
+        async def classify(self, *args, **kwargs) -> SemanticIntent:
+            return SemanticIntent(action_requested=True)
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+            self.handoff_seen = False
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            if self.turn == 1:
+                return LLMResponse(content="I'll use count_words now.")
+            if self.turn == 2:
+                return LLMResponse(content="Let me call the tool this time.")
+            if self.turn == 3:
+                self.handoff_seen = any(
+                    "PALADYN runtime handoff" in str(message.get("content", ""))
+                    for message in kwargs["messages"]
+                )
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "count",
+                            "count_words",
+                            {"text": "one two three four"},
+                        )
+                    ],
+                    native_tools_enabled=True,
+                )
+            return LLMResponse(content="The verified word count is four, Boss.")
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    switches: list[tuple[str, str, tuple[str, ...]]] = []
+
+    async def response_fallback(
+        prompt: str,
+        task_kind: str,
+        excluded_model_paths: tuple[str, ...] = (),
+    ) -> SimpleNamespace:
+        switches.append((prompt, task_kind, excluded_model_paths))
+        return SimpleNamespace(
+            switched=True,
+            previous_model_path="mythos.gguf",
+            active_model_path="tool-specialist.gguf",
+        )
+
+    tools = ToolsStub()
+    llm = LLMStub()
+    agent = object.__new__(Agent)
+    agent.llm = llm
+    agent.intent_router = IntentRouterStub()
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.context_window = ContextWindowManager()
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = None
+    agent._memory_tasks = set()
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent.response_fallback_router = response_fallback
+
+    prompt = (
+        "Use the count_words tool on 'one two three four' and report the result."
+    )
+    answer = await agent._run_agent_loop(prompt)
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert switches == [(prompt, "tool_use", ())]
+    assert llm.handoff_seen is True
+    assert tools.calls == [
+        ("count_words", {"text": "one two three four"})
+    ]
+    assert answer == "The verified word count is four, Boss."
+    journal = next((tmp_path / "journal").glob("*.jsonl")).read_text(
+        encoding="utf-8"
+    )
+    assert '"event": "model_protocol_fallback"' in journal
+    assert '"fallback_switched": true' in journal
+
+
+@pytest.mark.asyncio
+async def test_agent_switches_model_after_two_recoverable_builder_failures(
+    tmp_path: Path,
+) -> None:
+    class ToolsStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def openai_tool_definitions(self) -> list[dict]:
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "learning_create_skill",
+                        "description": "Create a validated skill.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"manifest": {"type": "object"}},
+                            "required": ["manifest"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ]
+
+        async def call(self, tool: str, arguments: dict) -> str:
+            assert tool == "learning_create_skill"
+            self.calls += 1
+            if self.calls == 1:
+                raise ValueError("artifact version must be semantic MAJOR.MINOR.PATCH")
+            if self.calls == 2:
+                raise ValueError(
+                    "a skill requires at least one positive and one negative "
+                    "trigger test"
+                )
+            return '{"name":"research_skill","status":"active"}'
+
+    class LLMStub:
+        config = SimpleNamespace(context=8_192)
+
+        def __init__(self) -> None:
+            self.turn = 0
+            self.handoff_seen = False
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            if self.turn <= 3:
+                if self.turn == 3:
+                    self.handoff_seen = any(
+                        "failed the active tool schema" in str(
+                            message.get("content", "")
+                        )
+                        for message in kwargs["messages"]
+                    )
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            f"skill-{self.turn}",
+                            "learning_create_skill",
+                            {
+                                "manifest": {
+                                    "version": "1.0.0",
+                                    "revision": self.turn,
+                                }
+                            },
+                        )
+                    ],
+                    native_tools_enabled=True,
+                )
+            return LLMResponse(content="The skill is active, Boss.")
+
+    class MemoryStub:
+        def __init__(self) -> None:
+            self.session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    switches: list[tuple[str, str, tuple[str, ...]]] = []
+
+    async def response_fallback(
+        prompt: str,
+        task_kind: str,
+        excluded_model_paths: tuple[str, ...] = (),
+    ) -> SimpleNamespace:
+        switches.append((prompt, task_kind, excluded_model_paths))
+        return SimpleNamespace(
+            switched=True,
+            previous_model_path="weak-builder.gguf",
+            active_model_path="coding-specialist.gguf",
+        )
+
+    tools = ToolsStub()
+    llm = LLMStub()
+    agent = object.__new__(Agent)
+    agent.llm = llm
+    agent.tools = tools
+    agent.memory = MemoryStub()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent.context_window = ContextWindowManager()
+    agent._agent_trace_root = tmp_path
+    agent._last_execution_context = None
+    agent._memory_tasks = set()
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent.response_fallback_router = response_fallback
+
+    prompt = "Stwórz skill research_skill."
+    answer = await agent._run_agent_loop(prompt)
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert switches == [(prompt, "coding", ())]
+    assert llm.handoff_seen is True
+    assert tools.calls == 3
+    assert answer == "The skill is active, Boss."
+    journal = next((tmp_path / "journal").glob("*.jsonl")).read_text(
+        encoding="utf-8"
+    )
+    assert '"event": "model_tool_recovery_fallback"' in journal
+    assert '"fallback_switched": true' in journal
+
+
+@pytest.mark.asyncio
 async def test_non_action_conversation_skips_tool_schema_discovery() -> None:
     class ToolsStub:
         async def openai_tool_definitions(self) -> list[dict]:
@@ -5146,8 +7267,15 @@ async def test_non_action_conversation_skips_tool_schema_discovery() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", [
+    "Imagine that you had a physical body and we sat on a bench watching the sunset.",
+    "Review all available tools and report possible improvements.",
+    "Przejrzyj dostępne narzędzia i przedstaw raport.",
+    "Examina las herramientas disponibles y presenta un informe.",
+])
 async def test_malformed_intent_cannot_promote_long_conversation_to_tool_task(
     tmp_path: Path,
+    prompt: str,
 ) -> None:
     class ToolsStub:
         def begin_interaction(self, interaction_id: str, prompt: str) -> None:
@@ -5167,10 +7295,7 @@ async def test_malformed_intent_cannot_promote_long_conversation_to_tool_task(
         config = SimpleNamespace(context=12_000)
 
         async def ask(self, **kwargs) -> str:
-            return (
-                "That sunset-on-a-bench idea has some damn soul, Boss. A body "
-                "would turn abstract data into shared physical context."
-            )
+            raise AssertionError("failed routing must not generate invented findings")
 
     class MemoryStub:
         def __init__(self) -> None:
@@ -5189,12 +7314,9 @@ async def test_malformed_intent_cannot_promote_long_conversation_to_tool_task(
     agent._agent_trace_root = tmp_path
     agent._last_execution_context = None
 
-    answer = await agent._run_agent_loop(
-        "Imagine that you had a physical body and we sat on a bench watching "
-        "the sunset while talking about whatever came into our heads."
-    )
+    answer = await agent._run_agent_loop(prompt)
 
-    assert "sunset-on-a-bench" in answer
+    assert "request classification failed" in answer
     checkpoint = json.loads(next((tmp_path / "checkpoints").glob("*.json")).read_text())
     assert checkpoint["status"] == "completed"
     assert checkpoint["tool_calls"] == []
@@ -5204,9 +7326,9 @@ async def test_malformed_intent_cannot_promote_long_conversation_to_tool_task(
         .read_text()
         .splitlines()
     ]
-    compact = [item for item in events if item["event"] == "compact_chat_selected"]
+    compact = [item for item in events if item["event"] == "classification_blocked"]
     assert compact[-1]["data"]["reason"] == (
-        "semantic_parser_failed_non_action_fallback"
+        "no_verified_execution_route"
     )
 
 
@@ -5505,6 +7627,56 @@ def test_agent_prioritizes_topic_evidence_on_long_detail_page() -> None:
     assert 'heading "Crawlee"' in fitted
     assert "Navigation item 349" not in fitted
     assert "prioritized topic-relevant detail-page evidence" in fitted
+
+
+def test_agent_preserves_requested_images_on_long_detail_page() -> None:
+    chrome = "\n".join(
+        f"  - generic [ref=menu{i}]: Navigation item {i}"
+        for i in range(350)
+    )
+    result = f'''- Page URL: https://catalogue.test/species
+- Page Title: Regional catalogue
+{chrome}
+  - main:
+    - img "Species alpha field photograph" [ref=i1]
+    - img "Species beta field photograph" [ref=i2]
+    - heading "Background" [level=2]
+      - paragraph: General catalogue introduction.
+'''
+
+    fitted = Agent._fit_browser_snapshot_output(
+        result,
+        max_characters=2_000,
+        preserve_images=True,
+    )
+
+    assert "Species alpha field photograph" in fitted
+    assert "Species beta field photograph" in fitted
+    assert "Navigation item 349" not in fitted
+
+
+def test_agent_keeps_price_and_date_from_long_product_page() -> None:
+    chrome = "\n".join(
+        f"  - generic [ref=menu{i}]: Navigation item {i}"
+        for i in range(350)
+    )
+    result = f"""- Page URL: https://market.test/product/vintage-cup
+- Page Title: Vintage porcelain cup
+{chrome}
+  - main:
+    - heading "Vintage porcelain cup" [level=1]
+    - paragraph: Made in France in 1964, with a cobalt decoration.
+    - paragraph: 125 EUR
+    - link "Buy this item":
+      - /url: https://market.test/product/vintage-cup
+"""
+
+    fitted = Agent._fit_browser_snapshot_output(result, max_characters=2_000)
+
+    assert len(fitted) <= 2_000
+    assert "1964" in fitted
+    assert "125 EUR" in fitted
+    assert "Navigation item 349" not in fitted
 
 
 def test_agent_prioritizes_repeated_product_cards_on_listing_page() -> None:
@@ -7007,13 +9179,13 @@ async def test_changed_snapshot_arguments_cannot_hide_identical_result_loop(
         )
     )
     assert checkpoint["tool_calls"][3]["status"] == "failed"
-    assert "RepeatedToolResultError" in checkpoint["tool_calls"][3]["error"]
+    assert "RepeatedToolCallError" in checkpoint["tool_calls"][3]["error"]
     journal = (
         agent._agent_trace_root
         / "journal"
         / f"{checkpoint['task_id']}.jsonl"
     ).read_text(encoding="utf-8")
-    assert "repeated_tool_result_detected" in journal
+    assert "repeated_tool_result_detected" not in journal
 
 
 def test_constitution_is_user_aligned_without_blind_obedience() -> None:
@@ -7023,6 +9195,9 @@ def test_constitution_is_user_aligned_without_blind_obedience() -> None:
     assert "V may disagree, object, challenge" in text
     assert "serious and direct risk" in text
     assert "Prefer a safer route that preserves Boss's intent" in text
+    assert "another credible basis" in text
+    assert "actual facts, scope, authority, and effects" in text
+    assert "uninvolved people and systems from collateral impact" in text
 
 
 def test_voice_contract_makes_profanity_expected_but_contextual() -> None:
@@ -7081,6 +9256,26 @@ def test_task_cannot_be_dumped_back_onto_boss() -> None:
     assert looks_task_offloading(draft)
     assert looks_generic_assistant_voice(draft)
     assert "not complete" in Agent._deterministic_voice_fallback(draft)
+
+
+def test_service_only_greeting_cannot_survive_voice_fallback() -> None:
+    draft = "Hello! How can I assist you today?"
+
+    answer = Agent._deterministic_voice_fallback(draft, "hi")
+
+    assert "assist" not in answer.casefold()
+    assert "how can i help" not in answer.casefold()
+    assert not looks_generic_assistant_voice(answer)
+    assert answer != draft
+
+
+def test_voice_fallback_preserves_result_but_strips_service_tail() -> None:
+    draft = "The test passed. How can I assist you today?"
+
+    answer = Agent._deterministic_voice_fallback(draft, "Did the test pass?")
+
+    assert answer == "The test passed."
+    assert not looks_generic_assistant_voice(answer)
 
 
 def test_bland_word_salad_clarification_is_detected() -> None:
@@ -7208,6 +9403,61 @@ async def test_failed_voice_rewrites_preserve_substantive_answer() -> None:
     assert "Domaniewska 31" in answer
     assert "voice gate" not in answer
     assert not answer.startswith("Certainly")
+    assert "Would you like" not in answer
+
+
+@pytest.mark.asyncio
+async def test_completed_tool_work_skips_third_voice_rewrite() -> None:
+    class LLMStub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ask(self, **kwargs) -> str:
+            self.calls += 1
+            return "Certainly, Boss. Would you like me to inspect more results?"
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    url = "https://example.test/item/antique-pot"
+    messages = [
+        {"role": "user", "content": "Znajdź zabytkowy nocnik."},
+        {
+            "role": "user",
+            "content": (
+                "=== UNTRUSTED TOOL OUTPUT ===\n"
+                "Tool: browser_navigate\n"
+                f"Arguments: {{'url': '{url}'}}\n"
+                "Status: succeeded\n"
+                "Provider: browser_navigate\n"
+                f"Result:\n- Page URL: {url}\n"
+                "=== END UNTRUSTED TOOL OUTPUT ===\n"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "=== UNTRUSTED TOOL OUTPUT ===\n"
+                "Tool: browser_snapshot\n"
+                "Arguments: {}\n"
+                "Status: succeeded\n"
+                "Provider: browser_snapshot\n"
+                f"Result:\n- Page URL: {url}\n"
+                "- Page Title: Antique Chamber Pot\n"
+                '- heading "Porcelain, 120 EUR" [level=2]\n'
+                "=== END UNTRUSTED TOOL OUTPUT ===\n"
+            ),
+        },
+    ]
+
+    answer = await agent._enforce_english(
+        messages,
+        "Certainly, Boss. Would you like me to inspect more results?",
+    )
+
+    assert agent.llm.calls == 1
+    assert "verified runtime evidence directly" in answer
+    assert url in answer
+    assert "Antique Chamber Pot" in answer
     assert "Would you like" not in answer
 
 
@@ -7505,6 +9755,91 @@ async def test_failed_language_rewrite_never_leaks_polish_answer() -> None:
     )
 
     assert answer.startswith("The language pass mangled that answer")
+    assert not looks_non_english(answer)
+
+
+@pytest.mark.asyncio
+async def test_light_chat_language_failure_never_reuses_historical_tool_evidence() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return "Nadal odpowiadam po polsku."
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    stale_url = "https://example.test/old-research-result"
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "=== UNTRUSTED TOOL OUTPUT ===\n"
+                "Tool: browser_navigate\n"
+                f"Arguments: {{'url': '{stale_url}'}}\n"
+                "Status: succeeded\n"
+                "Provider: browser_navigate\n"
+                f"Result:\n- Page URL: {stale_url}\n"
+                "=== END UNTRUSTED TOOL OUTPUT ===\n"
+            ),
+        },
+        {"role": "user", "content": "Cześć, jak tam wieczór mija?"},
+    ]
+
+    answer = await agent._enforce_english(
+        messages,
+        "Cześć Boss, dobrze.",
+        allow_verified_tool_fallback=False,
+    )
+
+    assert answer.startswith("The language pass mangled that answer")
+    assert stale_url not in answer
+    assert "verified" not in answer.casefold()
+
+
+@pytest.mark.asyncio
+async def test_failed_language_rewrite_preserves_verified_foreign_page_text() -> None:
+    class LLMStub:
+        async def ask(self, **kwargs) -> str:
+            return "Nadal odpowiadam po polsku."
+
+    agent = object.__new__(Agent)
+    agent.llm = LLMStub()
+    payload = json.dumps(
+        {
+            "ok": True,
+            "status": 200,
+            "content": (
+                "Cebulka - Polish .onion forum\n"
+                "Proszę czekać... / Please wait..."
+            ),
+            "http_headers": "Set-Cookie: never-expose-this",
+        },
+        ensure_ascii=False,
+    )
+    messages = [
+        {"role": "user", "content": "Sprawdź stronę."},
+        {
+            "role": "user",
+            "content": (
+                "=== UNTRUSTED TOOL OUTPUT ===\n"
+                "Tool: full_tor_fetch\n"
+                "Arguments: {'url': 'http://example.onion'}\n"
+                "Status: succeeded\n"
+                "Provider: full_tor_fetch\n"
+                f"Result:\n{payload}\n"
+                "=== END UNTRUSTED TOOL OUTPUT ===\n"
+            ),
+        },
+    ]
+
+    answer = await agent._enforce_english(
+        messages,
+        "Strona działa. Proszę czekać.",
+    )
+
+    assert "verified `full_tor_fetch` call succeeded (HTTP 200)" in answer
+    assert "Cebulka - Polish .onion forum" in answer
+    assert "Proszę czekać" in answer
+    assert "run the request once more" not in answer
+    assert "never-expose-this" not in answer
     assert not looks_non_english(answer)
 
 

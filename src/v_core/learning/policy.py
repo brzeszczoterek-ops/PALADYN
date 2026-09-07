@@ -93,6 +93,18 @@ _PLACEHOLDER_FIXTURE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _EXTRACTION_DESCRIPTION = re.compile(r"\b(?:extract|parse|wyodr[ęe]bn|parsuj)", re.I)
+_PENDING_PLAN_STATUS = {
+    "not started",
+    "not_started",
+    "pending",
+    "planned",
+    "todo",
+}
+_RUNTIME_SMOKE_TEST_NAMES = {
+    "runtime-derived deterministic contract smoke test",
+    "runtime-derived deterministic tool smoke test",
+}
+_INPUT_SENSITIVITY_TEST_NAME = "runtime-derived input sensitivity probe"
 
 
 def _text_leaves(value: object) -> list[str]:
@@ -103,6 +115,20 @@ def _text_leaves(value: object) -> list[str]:
     if isinstance(value, (list, tuple)):
         return [item for child in value for item in _text_leaves(child)]
     return []
+
+
+def _contains_pending_execution_plan(value: object) -> bool:
+    """Reject a plan masquerading as the result of an executable tool."""
+
+    if isinstance(value, dict):
+        status = str(value.get("status", "")).strip().casefold()
+        plan_fields = {"action", "description", "next_step", "step"}
+        if status in _PENDING_PLAN_STATUS and plan_fields.intersection(value):
+            return True
+        return any(_contains_pending_execution_plan(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_pending_execution_plan(item) for item in value)
+    return False
 
 
 @dataclass(slots=True)
@@ -141,6 +167,15 @@ class ArtifactPolicy:
             raise ArtifactPolicyError(
                 "generated tool description is still a placeholder"
             )
+        if any(
+            not capability.startswith("generated.")
+            for capability in manifest.provides_capabilities
+        ):
+            raise ArtifactPolicyError(
+                "offline generated tools may replace only generated capabilities; "
+                "host, network, filesystem, policy, and edition authority require "
+                "a trusted provider"
+            )
         if (
             not self.privileged_generated_code
             and _EXTERNAL_RETRIEVAL_CLAIM.search(manifest.description)
@@ -157,6 +192,15 @@ class ArtifactPolicy:
             raise ArtifactPolicyError("generated tool output must be a JSON object")
         if len(manifest.tests) > 100:
             raise ArtifactPolicyError("generated tools may define at most 100 tests")
+        test_names = {case.name.casefold() for case in manifest.tests}
+        if (
+            test_names.intersection(_RUNTIME_SMOKE_TEST_NAMES)
+            and _INPUT_SENSITIVITY_TEST_NAME not in test_names
+        ):
+            raise ArtifactPolicyError(
+                "runtime-derived smoke validation is incomplete without an "
+                "input-sensitivity probe"
+            )
         for case in manifest.tests:
             fixture = json.dumps(
                 {"arguments": case.arguments, "expected": case.expected},
@@ -166,6 +210,11 @@ class ArtifactPolicy:
                 raise ArtifactPolicyError(
                     f"test {case.name!r} contains placeholder data; use one small "
                     "literal input fixture and exact expected output"
+                )
+            if _contains_pending_execution_plan(case.expected):
+                raise ArtifactPolicyError(
+                    f"test {case.name!r} expects a pending execution plan rather "
+                    "than a completed tool result"
                 )
             if _EXTRACTION_DESCRIPTION.search(manifest.description):
                 observed = json.dumps(

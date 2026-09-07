@@ -28,8 +28,17 @@ from .models import (
 )
 from .policy import ArtifactPolicy, ArtifactPolicyError
 from .schema import SchemaError, validate_instance
-from .source_builder import build_source_blueprint, schema_from_example
+from .source_builder import (
+    build_source_blueprint,
+    merge_example_schemas,
+    schema_from_example,
+    source_argument_defaults,
+)
 from .storage import LearningStore
+from v_core.tool_recovery import (
+    RecoveryTicket,
+    generated_capability_is_repairable,
+)
 
 
 class ArtifactValidationError(RuntimeError):
@@ -38,6 +47,59 @@ class ArtifactValidationError(RuntimeError):
 
 class GeneratedToolError(RuntimeError):
     pass
+
+
+_RUNTIME_SMOKE_TEST_NAMES = {
+    "runtime-derived deterministic contract smoke test",
+    "runtime-derived deterministic tool smoke test",
+}
+_INPUT_SENSITIVITY_TEST_NAME = "runtime-derived input sensitivity probe"
+
+
+def _same_shape_value_mutations(value: Any) -> list[Any]:
+    """Return bounded deterministic mutations that keep the JSON value shape."""
+
+    if isinstance(value, bool):
+        return [not value]
+    if isinstance(value, int):
+        return [value + 1]
+    if isinstance(value, float):
+        return [value + 1.0]
+    if isinstance(value, str):
+        if value:
+            return ["", value + "__paladyn_probe__"]
+        return ["paladyn_probe"]
+    if isinstance(value, list):
+        mutations: list[Any] = []
+        if value:
+            for changed in _same_shape_value_mutations(value[0]):
+                mutations.append([changed, *value[1:]])
+            if len(value) > 1:
+                mutations.append(list(reversed(value)))
+        return mutations
+    if isinstance(value, dict):
+        mutations = []
+        for key in sorted(value):
+            for changed in _same_shape_value_mutations(value[key]):
+                candidate = dict(value)
+                candidate[key] = changed
+                mutations.append(candidate)
+                if len(mutations) >= 12:
+                    return mutations
+        return mutations
+    return []
+
+
+def _argument_sensitivity_probes(
+    arguments: dict[str, Any],
+) -> list[dict[str, Any]]:
+    probes: list[dict[str, Any]] = []
+    for field in sorted(arguments):
+        for changed in _same_shape_value_mutations(arguments[field]):
+            candidate = dict(arguments)
+            candidate[field] = changed
+            probes.append(candidate)
+    return probes[:12]
 
 
 @dataclass
@@ -267,6 +329,79 @@ class LearningRuntime:
         await self.validate_artifact(record.artifact_id)
         return self.activate_artifact(record.artifact_id)
 
+    async def create_repair_tool(
+        self,
+        *,
+        ticket: RecoveryTicket,
+        name: str,
+        description: str,
+        source: str,
+        expected: dict[str, Any],
+        version: str = "1.0.0",
+        scope: ArtifactScope = ArtifactScope.TASK,
+        timeout_seconds: float = 10.0,
+    ) -> ArtifactRecord:
+        """Replay a real failure fixture before activating a replacement.
+
+        A generated repair stays inside the same offline sandbox as every other
+        generated tool. Consequently it may replace only a ``generated.*``
+        capability; transports and host authority require a trusted provider.
+        """
+
+        if ticket.state != "open":
+            raise ArtifactValidationError("recovery ticket is not open")
+        if ticket.fixture_redacted:
+            raise ArtifactValidationError(
+                "recovery fixture contains redacted secrets and cannot be replayed"
+            )
+        if not generated_capability_is_repairable(ticket.capability):
+            raise ArtifactValidationError(
+                "this capability requires a trusted provider and cannot be replaced "
+                "by offline generated code"
+            )
+        if name.strip() == ticket.failed_tool:
+            raise ArtifactValidationError(
+                "a repair provider needs a distinct tool name so PALADYN can "
+                "roll back to the previous provider"
+            )
+        if not isinstance(expected, dict):
+            raise ArtifactValidationError("repair replay expected output must be an object")
+        original_record = self._active(ArtifactKind.TOOL, ticket.failed_tool)
+        if original_record is None:
+            raise ArtifactValidationError(
+                "the failed generated provider no longer has an active validated "
+                "manifest to supply its regression contract"
+            )
+        original_manifest, _ = self.store.load_tool(original_record)
+        source_fields, _ = source_argument_defaults(source)
+        required_fields = set(original_manifest.input_schema.get("required", []))
+        ignored_fields = sorted(required_fields - source_fields)
+        if ignored_fields:
+            raise ArtifactValidationError(
+                "repair source ignores required input fields: "
+                + ", ".join(ignored_fields)
+            )
+        replay = ToolTestCase(
+            name=f"replay recovery ticket {ticket.ticket_id}",
+            arguments=dict(ticket.arguments),
+            expected=expected,
+        )
+        tests = tuple(original_manifest.tests) + (replay,)
+        manifest = ToolManifest(
+            name=name,
+            version=version,
+            description=description,
+            input_schema=original_manifest.input_schema,
+            output_schema=original_manifest.output_schema,
+            tests=tests,
+            scope=scope,
+            lesson_ids=(),
+            timeout_seconds=timeout_seconds,
+            provides_capabilities=(ticket.capability,),
+            repair_ticket_id=ticket.ticket_id,
+        )
+        return await self.create_tool(manifest, source)
+
     async def create_tool_from_source(
         self,
         source: str,
@@ -284,10 +419,11 @@ class LearningRuntime:
         Identity and fixtures are derived from the immutable interaction objective,
         runtime-observed data, and literal source defaults. If Boss supplied an
         ``expected = {...}`` oracle, normal validation checks it. Otherwise PALADYN
-        runs the candidate twice offline and accepts only a byte-equivalent JSON
-        result as a deterministic contract smoke test. The latter proves execution
-        and determinism, not domain correctness, and is named accordingly in the
-        immutable manifest.
+        runs the candidate twice offline and then performs bounded input-sensitivity
+        probes. A source-only tool without a semantic oracle must consume real input
+        and produce a different deterministic result for at least one same-shape
+        mutation. This prevents constant reports and lifecycle plans from passing as
+        functioning tools.
         """
 
         self.policy.may_validate()
@@ -300,7 +436,14 @@ class LearningRuntime:
             description_hint=description_hint,
         )
         expected = blueprint.expected
+        tests: list[ToolTestCase] = []
         if expected is None:
+            if not blueprint.arguments:
+                raise ArtifactValidationError(
+                    "generated tool has no input fields and no owner-specified "
+                    "semantic oracle; PALADYN cannot prove functional behavior "
+                    "from a constant no-input result"
+                )
             first = await self._preview_generated_source(
                 name=blueprint.name,
                 description=blueprint.description,
@@ -321,23 +464,72 @@ class LearningRuntime:
                     "contract fixture"
                 )
             expected = first
+            tests.append(
+                ToolTestCase(
+                    name="runtime-derived deterministic tool smoke test",
+                    arguments=blueprint.arguments,
+                    expected=expected,
+                )
+            )
+            sensitivity_case: ToolTestCase | None = None
+            for probe in _argument_sensitivity_probes(blueprint.arguments):
+                try:
+                    probe_first = await self._preview_generated_source(
+                        name=blueprint.name,
+                        description=blueprint.description,
+                        source=source,
+                        arguments=probe,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    probe_second = await self._preview_generated_source(
+                        name=blueprint.name,
+                        description=blueprint.description,
+                        source=source,
+                        arguments=probe,
+                        timeout_seconds=timeout_seconds,
+                    )
+                except Exception:
+                    continue
+                if probe_first != probe_second:
+                    raise ArtifactValidationError(
+                        "generated tool is nondeterministic on an input-sensitivity "
+                        "probe"
+                    )
+                if probe_first != expected:
+                    sensitivity_case = ToolTestCase(
+                        name="runtime-derived input sensitivity probe",
+                        arguments=probe,
+                        expected=probe_first,
+                    )
+                    break
+            if sensitivity_case is None:
+                raise ArtifactValidationError(
+                    "generated tool does not demonstrate input-dependent behavior; "
+                    "all valid bounded input mutations returned the same result"
+                )
+            tests.append(sensitivity_case)
+        else:
+            tests.append(
+                ToolTestCase(
+                    name="owner-specified semantic oracle",
+                    arguments=blueprint.arguments,
+                    expected=expected,
+                )
+            )
 
-        test = ToolTestCase(
-            name=(
-                "owner-specified semantic oracle"
-                if blueprint.oracle == "owner_expected"
-                else "runtime-derived deterministic tool smoke test"
-            ),
-            arguments=blueprint.arguments,
-            expected=expected,
+        input_schema = merge_example_schemas(
+            [schema_from_example(case.arguments) for case in tests]
+        )
+        output_schema = merge_example_schemas(
+            [schema_from_example(case.expected) for case in tests]
         )
         manifest = ToolManifest(
             name=blueprint.name,
             version=version,
             description=blueprint.description,
-            input_schema=schema_from_example(test.arguments),
-            output_schema=schema_from_example(test.expected),
-            tests=(test,),
+            input_schema=input_schema,
+            output_schema=output_schema,
+            tests=tuple(tests),
             scope=scope,
             lesson_ids=(),
             timeout_seconds=timeout_seconds,
@@ -511,14 +703,17 @@ class LearningRuntime:
         return result
 
     def active_tool_names(self) -> list[str]:
-        return sorted(
-            record.name
-            for record in self.store.list_records(
-                status=ArtifactStatus.ACTIVE,
-                kind=ArtifactKind.TOOL,
-            )
-            if self._visible(record)
-        )
+        names: list[str] = []
+        for record in self.store.list_records(
+            status=ArtifactStatus.ACTIVE,
+            kind=ArtifactKind.TOOL,
+        ):
+            if not self._visible(record):
+                continue
+            manifest, _ = self.store.load_tool(record)
+            if self._tool_has_current_functional_contract(manifest):
+                names.append(record.name)
+        return sorted(names)
 
     def active_tool_definitions(self) -> list[dict[str, Any]]:
         definitions: list[dict[str, Any]] = []
@@ -529,14 +724,32 @@ class LearningRuntime:
             if not self._visible(record):
                 continue
             manifest, _ = self.store.load_tool(record)
+            if not self._tool_has_current_functional_contract(manifest):
+                continue
             definitions.append(
                 {
                     "name": manifest.name,
                     "description": manifest.description,
                     "parameters": manifest.input_schema,
+                    "capabilities": list(manifest.provides_capabilities),
+                    "repair_ticket_id": manifest.repair_ticket_id,
                 }
             )
         return sorted(definitions, key=lambda item: str(item["name"]))
+
+    def active_tool_manifests(self) -> list[ToolManifest]:
+        manifests: list[ToolManifest] = []
+        for record in self.store.list_records(
+            status=ArtifactStatus.ACTIVE,
+            kind=ArtifactKind.TOOL,
+        ):
+            if not self._visible(record):
+                continue
+            manifest, _ = self.store.load_tool(record)
+            if not self._tool_has_current_functional_contract(manifest):
+                continue
+            manifests.append(manifest)
+        return sorted(manifests, key=lambda item: item.name)
 
     def render_matching_skills(self, user_input: str, *, maximum: int = 5) -> str:
         matched: list[tuple[ArtifactRecord, SkillManifest]] = []
@@ -595,9 +808,18 @@ class LearningRuntime:
                     f"test {case.name!r} failed: expected {case.expected!r}, got {actual!r}"
                 )
             cases.append({"name": case.name, "passed": True})
+        test_names = {case.name.casefold() for case in manifest.tests}
+        if "owner-specified semantic oracle" in test_names:
+            validation_strength = "semantic_oracle"
+        elif _INPUT_SENSITIVITY_TEST_NAME in test_names:
+            validation_strength = "behavioral_input_sensitivity"
+        else:
+            validation_strength = "explicit_test_contract"
         return {
             "passed": True,
             "checked_at": utc_now(),
+            "functional_contract_version": 2,
+            "validation_strength": validation_strength,
             "static_policy": (
                 "owner_privileged"
                 if self.policy.privileged_generated_code
@@ -739,8 +961,28 @@ class LearningRuntime:
         ]
         if not records:
             return None
+        if kind is ArtifactKind.TOOL:
+            records = [
+                record
+                for record in records
+                if self._tool_has_current_functional_contract(
+                    self.store.load_tool(record)[0]
+                )
+            ]
+            if not records:
+                return None
         records.sort(key=lambda item: item.scope is ArtifactScope.TASK, reverse=True)
         return records[0]
+
+    @staticmethod
+    def _tool_has_current_functional_contract(manifest: ToolManifest) -> bool:
+        """Hide legacy runtime-smoke artifacts that never proved behavior."""
+
+        names = {case.name.casefold() for case in manifest.tests}
+        return not (
+            names.intersection(_RUNTIME_SMOKE_TEST_NAMES)
+            and _INPUT_SENSITIVITY_TEST_NAME not in names
+        )
 
     def _scope_key(self, scope: ArtifactScope) -> str:
         return "persistent" if scope is ArtifactScope.PERSISTENT else self.task_scope_key
