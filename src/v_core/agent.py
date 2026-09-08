@@ -30,6 +30,7 @@ from .config import Config
 from .response_preview import response_preview
 from .autonomy.local_read_scope import literal_paths, resolve_read_scope
 from .tool_catalog_review import review_catalog
+from .tool_self_test import test_local_tools
 from .llm import LLM
 from .mcp_tools import MCPTools
 from .model_loader.router import classify_model_phase
@@ -1216,15 +1217,24 @@ Current relationship stage: {stage}.
         if semantic_intent is not None:
             self._apply_language_intent(semantic_intent, trace)
 
-        if semantic_intent is not None and semantic_intent.capabilities == ("tool_catalog",):
+        if semantic_intent is not None and semantic_intent.capabilities in (("tool_catalog",), ("tool_self_test",)):
             try:
                 definitions = await self.tools.openai_tool_definitions()
-                answer, observation = review_catalog(definitions, prompt)
+                if semantic_intent.capabilities == ("tool_self_test",):
+                    answer, observation = await test_local_tools(
+                        self.tools, definitions, trace, prompt=prompt,
+                        allow_write=not TaskContract.requests_read_only(prompt),
+                    )
+                else:
+                    answer, observation = review_catalog(definitions, prompt)
             except Exception as error:
-                answer = "Boss, tool catalog discovery failed. No tools were tested and no review was completed."
+                answer = "Boss, the tool review could not finish. I cannot report an overall successful result. Check the execution log for any completed checks."
                 observation = {"status": "failed", "error_type": type(error).__name__}
             if trace is not None:
-                trace.record_event("tool_catalog_review", observation)
+                trace.record_event(
+                    "tool_self_test" if semantic_intent.capabilities == ("tool_self_test",) else "tool_catalog_review",
+                    observation,
+                )
             self._finish_agent_trace(trace, answer)
             if on_token is not None:
                 on_token(answer)
@@ -1443,6 +1453,31 @@ Current relationship stage: {stage}.
                         "semantic_web_requirements_discarded": True,
                     },
                 )
+
+        if (
+            semantic_classification_attempted
+            and semantic_intent is None
+            and semantic_failure_reason
+            and not self._contract_has_execution_route(contract)
+        ):
+            # An action verb or continuation is not an execution contract.
+            # In particular a previous metadata review proves no repair.
+            # Fail closed after inheritance and owner constraints, before any
+            # answer generation can invent completion of the rejected task.
+            answer = (
+                "Boss, I couldn't reliably identify the requested action. "
+                "No tools ran, and no repairs or tests were performed. "
+                "Which specific tool and change should I check?"
+            )
+            if trace is not None:
+                trace.record_event("classification_blocked", {
+                    "reason": "no_verified_execution_route",
+                    "classification_failure": semantic_failure_reason,
+                })
+            self._finish_agent_trace(trace, answer)
+            if on_token is not None:
+                on_token(answer)
+            return answer
 
         read_candidates = literal_paths(prompt)
         if (

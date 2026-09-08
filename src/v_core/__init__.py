@@ -4,4 +4,4 @@ V-Core.
 PALADYN Framework powered by V.
 """
 
-__version__ = "3.8"
+__version__ = "3.9"

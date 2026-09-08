@@ -1,8 +1,27 @@
 # V-Core Changelog
 
-## Unreleased
+## 3.9 - 2026-09-08
+
+### Verification scope
+- 842 Full and 791 Public automated tests passed. Nine local filesystem cases
+  passed against the actual MCP provider, and five fixed-target read-only
+  public network cases passed in an isolated browser profile.
+- This release does not certify all tools. Tor, authenticated services,
+  generated-tool behavior, and universal source verification are not covered by
+  these live checks. See `docs/local-tool-checks.md` for the exact evidence.
 
 ### Added
+- Bounded functional checks for nine built-in filesystem operations, including
+  reading, writing, editing, moving, listing, searching, directory creation,
+  nested tree output, and metadata, using disposable local fixtures and recorded executions.
+  Reports distinguish passed, failed, and untested tools; passing one fixture
+  does not certify a tool. Other tools are not run by this check path.
+- Public and Full editions include the documented scope and limitations of
+  local functional checks in `docs/local-tool-checks.md`.
+- An opt-in fixed-target network smoke script checks public example-page reads,
+  snapshots, unavailable-domain errors, search results, and a grounded IANA
+  page read in an isolated browser profile. It is separate from automatic local
+  tool checks and does not use accounts, forms, or generated tools.
 - PALADYN-Full manual model hierarchy: owners can persist the exact priority
   and fallback order of the qualified three-model pool; Public hides the menu
   and ignores a transferred Full-only strategy in favor of automatic scoring
@@ -16,6 +35,10 @@
   cannot claim host, network, filesystem, policy, or edition capabilities
 
 ### Fixed
+- Failed action classification with no execution route now asks for clarification
+  instead of allowing an unsupported repair or test-completion report.
+- Local checks reject directory output that only mentions a fixture filename,
+  and detect in-place argument remapping before executing a fixture operation.
 - Full Tor discovery now falls back from a failed configured index to
   DuckDuckGo's official onion service, inspects bounded public directory results
   through Tor, and records each source attempt instead of retrying one broken

@@ -20,6 +20,7 @@ _CAPABILITIES = frozenset(
         "learning_tool",
         "runtime_review",
         "tool_catalog",
+        "tool_self_test",
     }
 )
 
@@ -160,6 +161,12 @@ Return exactly one JSON object with this shape:
 "web_query":"","language_scope":"none","response_language":""}
 
 Allowed capability labels:
+- tool_self_test: check whether existing tools actually work using prepared
+  local functional fixtures and report failures or untested cases. Use ONLY
+  tool_self_test for tool health checks, including mixed greetings and requests
+  to check tool completeness in practice. This does not authorize repair,
+  creation, network probing or arbitrary execution. Metadata-only review is
+  tool_catalog instead.
 - tool_catalog: review the available tool descriptions and input schemas, list
   their documented interfaces, or suggest interface improvements. This is
   metadata inspection only, not executing, testing, creating or repairing tools.
