@@ -1123,6 +1123,25 @@ class TaskContract:
             "learning_create_tool",
             "learning_create_snapshot_extractor",
         }
+        created_tool_name = ""
+        created_tool_index = -1
+        for index, call in enumerate(succeeded):
+            if call.get("tool") not in tool_builders:
+                continue
+            try:
+                payload = json.loads(str(call.get("result_excerpt", "")))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict) and payload.get("name"):
+                created_tool_name = str(payload["name"])
+                created_tool_index = index
+        created_tool_executed = bool(
+            created_tool_name
+            and any(
+                index > created_tool_index and call.get("tool") == created_tool_name
+                for index, call in enumerate(succeeded)
+            )
+        )
         artifact_fallback_completed = self.allows_artifact_fallback and any(
             name in {*tool_builders, "learning_create_skill"}
             for name in names
@@ -1331,6 +1350,8 @@ class TaskContract:
         if self.requires_command_execution and not any(
             name in {"sandbox_execute_offline", "evm_foundry_test_offline"}
             for name in names
+        ) and not (
+            self.requires_created_tool_execution and created_tool_executed
         ):
             missing.append("command_execution")
 
@@ -1339,22 +1360,7 @@ class TaskContract:
         ):
             missing.append("learning_create_tool")
         if self.requires_created_tool_execution:
-            created_name = ""
-            created_index = -1
-            for index, call in enumerate(succeeded):
-                if call.get("tool") not in tool_builders:
-                    continue
-                try:
-                    payload = json.loads(str(call.get("result_excerpt", "")))
-                except (TypeError, json.JSONDecodeError):
-                    continue
-                if isinstance(payload, dict) and payload.get("name"):
-                    created_name = str(payload["name"])
-                    created_index = index
-            if not created_name or not any(
-                index > created_index and call.get("tool") == created_name
-                for index, call in enumerate(succeeded)
-            ):
+            if not created_tool_executed:
                 missing.append("generated_tool_execution")
         if self.requires_created_skill and "learning_create_skill" not in names:
             missing.append("learning_create_skill")
@@ -1873,10 +1879,17 @@ class TaskContract:
                         "domain correctness yet."
                         + runtime_note
                     )
+                coverage_note = (
+                    " Only the supplied examples were checked; broader correctness "
+                    "has not been independently established."
+                    if validation.get("semantic_correctness") == "not_independently_established"
+                    else ""
+                )
                 return (
                     f"Done. PALADYN built the generated tool, validated, and activated "
                     f"`{payload['name']}` from the generated source."
                     + test_report
+                    + coverage_note
                 )
 
         if not self.requires_first_heading:

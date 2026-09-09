@@ -172,6 +172,37 @@ def test_source_phase_recovers_source_from_one_unclosed_compatibility_wrapper() 
     )
 
 
+def test_source_phase_accepts_repeated_identical_valid_fences_amid_prose() -> None:
+    source = 'def run(arguments):\n    return {"wynik": int(arguments["n"]) * 2}'
+    answer = f"I fixed it.\n```python\n{source}\n```\nAgain:\n```python\n{source}\n```"
+
+    assert Agent._parse_generated_tool_source(answer) == source
+
+
+def test_source_phase_rejects_two_distinct_valid_fenced_modules() -> None:
+    answer = (
+        '```python\ndef run(arguments):\n    return {"wynik": 4}\n```\n'
+        '```python\ndef run(arguments):\n    return {"wynik": 14}\n```'
+    )
+
+    assert Agent._parse_generated_tool_source(answer) == ""
+
+
+def test_source_phase_extracts_one_valid_plain_module_after_prose() -> None:
+    source = 'def run(arguments):\n    return {"wynik": int(arguments["n"]) * 2}'
+
+    assert Agent._parse_generated_tool_source("Fixed it.\n\n" + source) == source
+
+
+def test_source_phase_prompt_forbids_embedding_orchestration_in_run() -> None:
+    prompt = Agent._generated_source_phase_prompt(
+        'n = 2 expected = {"wynik": 4}'
+    )
+
+    assert "implements ONLY the reusable operation" in prompt
+    assert "Never put test cases, activation logic" in prompt
+
+
 def test_source_phase_prompt_binds_runtime_fixture_fields() -> None:
     prompt = Agent._generated_source_phase_prompt(
         'items = [1, 2] scale = 3 expected = {"values": [3, 6]}'
@@ -8286,7 +8317,7 @@ async def test_agent_gives_model_source_only_and_runtime_owns_tool_contract() ->
     assert tools.calls[0][0] == "learning_create_tool"
     assert tools.calls[1] == ("double_value", {"value": 21})
     assert '"result": 42' in answer
-    assert routed_phases == ["tool_use"]
+    assert routed_phases == []
 
 
 @pytest.mark.asyncio

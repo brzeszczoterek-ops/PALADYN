@@ -405,7 +405,7 @@ def test_hash_chain_detects_modified_evidence(tmp_path: Path) -> None:
         journal.read_verified()
 
 
-def test_lesson_requires_independent_verified_evidence(tmp_path: Path) -> None:
+def test_failures_do_not_validate_a_proposed_remedy(tmp_path: Path) -> None:
     learning = runtime(tmp_path)
     first = learning.record_evidence(
         LearningEvidence(
@@ -446,7 +446,7 @@ def test_lesson_requires_independent_verified_evidence(tmp_path: Path) -> None:
         action="Select and verify the matching parser before processing.",
         evidence_ids=[first.evidence_id, second.evidence_id],
     )
-    assert validated.status is LessonStatus.VALIDATED
+    assert validated.status is LessonStatus.CANDIDATE
     assert validated.confidence == pytest.approx(0.925)
 
 
@@ -1412,9 +1412,11 @@ async def test_mcp_runtime_builds_full_tool_contract_from_source_only(
     assert created["name"] == "double_from_source"
     assert created["status"] == "active"
     assert created["validation"]["passed"] is True
-    assert created["validation"]["tests"] == [
+    assert [{"name": case["name"], "passed": case["passed"]}
+            for case in created["validation"]["tests"]] == [
         {"name": "owner-specified semantic oracle", "passed": True}
     ]
+    assert created["validation"]["test_counts"] == {"passed": 1, "failed": 0, "not_run": 0}
     assert json.loads(await tools.call("double_from_source", {"value": 9})) == {
         "result": 18
     }
@@ -1433,7 +1435,8 @@ async def test_source_only_builder_marks_runtime_derived_tool_smoke_test(
     )
     manifest, _ = learning.store.load_tool(created)
 
-    assert created.status is ArtifactStatus.ACTIVE
+    assert created.status is ArtifactStatus.VALIDATED
+    assert created.validation["activation_eligible"] is False
     assert created.validation["validation_strength"] == (
         "behavioral_input_sensitivity"
     )
@@ -1444,9 +1447,8 @@ async def test_source_only_builder_marks_runtime_derived_tool_smoke_test(
     assert manifest.tests[0].expected == {"result": 6}
     assert manifest.tests[1].arguments == {"value": 4}
     assert manifest.tests[1].expected == {"result": 8}
-    assert await learning.execute_tool("smoke_double", {"value": 5}) == {
-        "result": 10
-    }
+    with pytest.raises(GeneratedToolError, match="not active"):
+        await learning.execute_tool("smoke_double", {"value": 5})
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
@@ -1475,16 +1477,10 @@ async def test_source_only_builder_probes_all_nested_object_fields(
         ),
     )
 
-    assert created.status is ArtifactStatus.ACTIVE
-    assert await learning.execute_tool(
-        "summarize_inventory",
-        {
-            "items": [
-                {"name": "x", "quantity": 3, "unit_price": 5},
-                {"name": "y", "quantity": 2, "unit_price": 7},
-            ]
-        },
-    ) == {"item_count": 2, "total_value": 29}
+    assert created.status is ArtifactStatus.VALIDATED
+    assert created.validation["activation_eligible"] is False
+    assert created.validation["validation_strength"] == "behavioral_input_sensitivity"
+    assert learning.active_tool_names() == []
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
@@ -1890,6 +1886,13 @@ async def test_validated_lesson_can_promote_persistent_tool(tmp_path: Path) -> N
         trigger="A repeated deterministic calculation is required.",
         action="Use the tested calculation tool and validate its output schema.",
         evidence_ids=[first.evidence_id, second.evidence_id],
+    )
+    # Independently supplied expected result, executed in the real offline sandbox.
+    tested_tool = await owner.create_tool(tool_manifest(), DOUBLE_SOURCE)
+    actual = await owner.execute_tool(tested_tool.name, {"value": 5})
+    lesson = owner.record_lesson_regression(
+        lesson_id=lesson.lesson_id, task_id="arithmetic-regression", test_id="double-five",
+        expected={"result": 10}, actual=actual, trusted_verifier=True,
     )
     assert lesson.status is LessonStatus.VALIDATED
 

@@ -48,6 +48,7 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, tuple[str, ...]] = {
     "runtime_review_task": ("runtime.review",),
     "learning_record_evidence": ("learning.evidence.record",),
     "learning_propose_lesson": ("learning.lesson.propose",),
+    "learning_recall_failures": ("learning.evidence.inspect",),
     "learning_stage_tool": ("learning.tool.stage",),
     "learning_stage_skill": ("learning.skill.stage",),
     "learning_create_tool": ("learning.tool.create",),
@@ -220,6 +221,7 @@ class ToolCallOutcome:
     error: str = ""
     recovery_ticket: dict[str, Any] | None = None
     exception: Exception | None = None
+    failure_details: dict[str, Any] = field(default_factory=dict)
 
 
 class ToolRecoveryRegistry:
@@ -520,6 +522,28 @@ class ToolRecoveryRegistry:
             for provider in sorted(self._providers.values(), key=lambda item: item.tool)
         ]
 
+    def provider_diagnostics(self, requested_tool: str) -> list[dict[str, Any]]:
+        """Return bounded routing state, including providers skipped by a circuit.
+
+        The last error is historical evidence. Callers must not present it as
+        the result of a new execution which never reached the provider.
+        """
+
+        requested = str(requested_tool).strip()
+        capabilities = set(self.capabilities(requested))
+        return [
+            {
+                "provider": provider.tool,
+                "available": not provider.circuit_open,
+                "circuit_open": provider.circuit_open,
+                "retry_after": provider.retry_after,
+                "historical_last_error": provider.last_error[:2_000],
+                "updated_at": provider.updated_at,
+            }
+            for provider in sorted(self._providers.values(), key=lambda item: item.tool)
+            if capabilities.intersection(provider.capabilities)
+        ]
+
     def _load_providers(self) -> dict[str, ProviderState]:
         values = self._load_json(self.state_path, [])
         return {
@@ -603,6 +627,44 @@ async def execute_with_recovery(
         registry.register_provider(requested_tool, capabilities_for_tool(requested_tool))
         candidates = registry.providers_for(requested_tool)
 
+    if not candidates:
+        providers = registry.provider_diagnostics(requested_tool)
+        blocked = [item for item in providers if item["circuit_open"]]
+        if blocked:
+            descriptions = []
+            for item in blocked[:8]:
+                retry = item["retry_after"] or "manual recovery required"
+                historical = item["historical_last_error"] or "not recorded"
+                descriptions.append(
+                    f"{item['provider']}: circuit open; retry after {retry}; "
+                    f"historical previous failure: {historical}"
+                )
+            reason = "; ".join(descriptions)
+            error = (
+                "ToolDispatchUnavailableError: no provider was executed because "
+                f"all matching providers are temporarily unavailable. {reason}"
+            )
+            code = "matching_providers_circuit_open"
+        else:
+            error = (
+                "ToolDispatchUnavailableError: no provider was executed because "
+                f"no eligible provider is registered for {requested_tool!r}."
+            )
+            code = "no_eligible_provider"
+        return ToolCallOutcome(
+            result=f"Tool execution not started: {error}",
+            requested_tool=requested_tool,
+            provider_tool=requested_tool,
+            capabilities=registry.capabilities(requested_tool),
+            error=error,
+            failure_details={
+                "stage": "dispatch",
+                "reason": code,
+                "execution_attempted": False,
+                "providers": providers[:16],
+            },
+        )
+
     attempts: list[dict[str, Any]] = []
     last_result = ""
     last_error = ""
@@ -610,20 +672,46 @@ async def execute_with_recovery(
     ticket: RecoveryTicket | None = None
     for provider in candidates:
         provider_exception: Exception | None = None
+        failure_details: dict[str, Any] = {}
         try:
             raw_result = await call_provider(provider.tool, arguments)
             result = str(raw_result)
             error = detect_failure(result, provider.tool)
         except Exception as exc:  # trusted caller decides how to render this
-            result = f"Tool execution failed: {type(exc).__name__}: {exc}"
-            error = f"{type(exc).__name__}: {exc}"
-            last_exception = exc
+            message = str(exc).strip() or "exception contained no message"
+            result = f"Tool execution failed: {type(exc).__name__}: {message}"
+            error = f"{type(exc).__name__}: {message}"
             provider_exception = exc
+            failure_details = {
+                "stage": "provider_execution",
+                "execution_attempted": True,
+                "provider": provider.tool,
+                "exception_type": type(exc).__name__,
+            }
+            report = getattr(exc, "report", None)
+            if isinstance(report, dict):
+                failure_details["validation"] = {
+                    key: report[key]
+                    for key in (
+                        "stage",
+                        "tests_total",
+                        "tests_passed",
+                        "tests_failed",
+                        "tests_not_run",
+                        "semantic_correctness",
+                    )
+                    if key in report
+                    and isinstance(report[key], (str, int, float, bool, type(None)))
+                }
+        last_exception = provider_exception
         attempts.append(
             {
                 "provider": provider.tool,
                 "status": "failed" if error else "succeeded",
                 "error": error[:2_000],
+                "stage": "provider_execution",
+                "execution_attempted": True,
+                **({"failure_details": failure_details} if failure_details else {}),
             }
         )
         if not error:
@@ -657,4 +745,12 @@ async def execute_with_recovery(
         error=last_error or "all capability providers failed",
         recovery_ticket=(ticket.to_dict() if ticket is not None else None),
         exception=last_exception,
+        failure_details=(
+            attempts[-1].get("failure_details")
+            or {
+                "stage": "provider_execution",
+                "execution_attempted": True,
+                "provider": attempts[-1]["provider"],
+            }
+        ),
     )

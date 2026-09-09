@@ -17,7 +17,7 @@ recorded evidence -- rejected if unsupported or malformed
 candidate lesson -- remains a hypothesis without independent support
     |
     v
-validated lesson -- multiple tasks/fingerprints + verified evidence
+validated lesson -- trusted regression checks for this exact proposal
     |
     v
 tool or skill bundle in quarantine
@@ -64,15 +64,49 @@ model-authored replacement. Significant whitespace and line breaks are
 preserved up to the evidence-size bound. The correction remains unverified
 until supported by a real test or runtime verifier.
 
-A lesson becomes `validated` only when it has:
+A proposal requires evidence of failure, regression, or correction, but remains
+`candidate` regardless of how many failures support it. Repeated observations
+are not proof that the proposed remedy works; average evidence confidence is
+not confidence in its cause or remedy.
 
-- evidence from at least two distinct tasks;
-- at least two distinct evidence fingerprints;
-- at least one verified item;
-- average confidence of at least `0.65`;
-- at least one failure, regression, or correction.
+The internal `record_lesson_regression` API accepts results from a trusted
+evaluator, not from an LLM tool. That evaluator must actually test the proposed
+behavior and supply independently established expectations. The runtime compares
+canonical JSON receipts and binds them to the exact hypothesis, trigger, and
+action. Only passing latest results for **all recorded test IDs** validate that
+proposal. A subsequent failure returns it to candidate; passing another test
+does not hide the unresolved failure. Repeating a receipt ID does not increase
+counters or replace history. The counters count recorded regression attempts,
+not production usage. Validation covers these tests, not universal correctness.
 
-Until then it remains a candidate and cannot justify a persistent artifact.
+Legacy validated labels without matching regression receipts cannot justify
+new persistent artifacts through a lesson link. This does not automatically
+retire existing artifacts or change owner-profile permissions.
+
+### Recalling failures
+
+`learning_recall_failures` reads recorded tool failures from the current
+workspace only. Supply `tool`, optional `arguments` for an exact digest match,
+and `limit` (1–20). Without arguments, results are explicitly only same-tool
+matches. Repetitions are grouped with an occurrence count, not promoted into
+stronger evidence. Raw arguments are not returned. Error text is untrusted
+historical data and can contain private or externally supplied text.
+
+Failure evidence also records whether execution reached a provider and at which
+stage it stopped. A dispatch rejected because every matching provider has an
+open circuit is therefore not counted or described as a new provider execution.
+Its previous error remains explicitly historical. Actual validation exceptions
+retain a bounded report stage and aggregate case counts, not generated source or
+raw test payloads.
+
+Legacy unscoped events and unverified model claims are excluded. A match does
+not compare tool versions or current environment state and does not establish
+the cause. The tool is available for runtime reviews; it does not run repairs,
+authorize retries, or inject proposed actions into the system prompt.
+
+This is a persistent diagnostic/evaluation foundation, not a completed
+autonomous learning loop. Automatic selection of a changed approach and
+independent general-purpose regression generation are not implemented here.
 
 ## Generated tools
 
@@ -101,6 +135,13 @@ test cases. PALADYN then:
    and total-workspace disk limits;
 5. validates the returned JSON against the declared output schema;
 6. checks the bundle digest again immediately before activation.
+
+When expected answers were obtained from the candidate itself, even successful
+determinism and input-sensitivity checks stop at a non-executable prototype.
+Technical status `validated` is not permission to activate it. Independent
+expected-result verification is still required; see
+`docs/generated-tool-validation.md`. The agent reports the incomplete task and
+does not automatically retry this qualification gate.
 
 After activation, PALADYN binds the final owner fixture to the validated input
 schema and invokes the new tool itself. A successful creation call is therefore

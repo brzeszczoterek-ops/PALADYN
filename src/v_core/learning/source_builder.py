@@ -7,6 +7,8 @@ import json
 import re
 from typing import Any
 
+from ..generated_tool_contract import GeneratedToolContract
+
 
 class SourceBlueprintError(ValueError):
     """The runtime could not build a grounded tool contract from source."""
@@ -19,6 +21,8 @@ class SourceBlueprint:
     arguments: dict[str, Any]
     expected: dict[str, Any] | None
     oracle: str
+    tests: tuple[tuple[dict[str, Any], dict[str, Any]], ...] = ()
+    final_arguments: dict[str, Any] | None = None
 
 
 _EXPLICIT_NAME = re.compile(
@@ -118,6 +122,7 @@ def build_source_blueprint(
     observed_snapshot: str = "",
     name_hint: str = "",
     description_hint: str = "",
+    generated_contract: GeneratedToolContract | None = None,
 ) -> SourceBlueprint:
     """Build identity and a concrete test fixture from trusted runtime context.
 
@@ -128,6 +133,38 @@ def build_source_blueprint(
 
     assignments = json_assignments(objective)
     fields, defaults = source_argument_defaults(source)
+    if generated_contract is not None:
+        contract_fields = set(generated_contract.tests[0].arguments)
+        if fields != contract_fields:
+            missing = sorted(contract_fields - fields)
+            extra = sorted(fields - contract_fields)
+            details = []
+            if missing:
+                details.append("ignored contract fields: " + ", ".join(missing))
+            if extra:
+                details.append("uncontracted source fields: " + ", ".join(extra))
+            raise SourceBlueprintError(
+                "generated source does not match the frozen runtime test contract ("
+                + "; ".join(details)
+                + ")"
+            )
+        name = _tool_name(objective, source, name_hint)
+        description = description_hint.strip() or (
+            f"Process bounded JSON input for the current PALADYN task with {name}."
+        )
+        frozen_tests = tuple(
+            (dict(case.arguments), dict(case.expected))
+            for case in generated_contract.tests
+        )
+        return SourceBlueprint(
+            name=name,
+            description=description[:500],
+            arguments=dict(frozen_tests[0][0]),
+            expected=dict(frozen_tests[0][1]),
+            oracle="owner_text_semantic_extraction",
+            tests=frozen_tests,
+            final_arguments=dict(generated_contract.final_arguments),
+        )
     objective_fields = {
         name
         for name in assignments
@@ -183,6 +220,7 @@ def build_source_blueprint(
         arguments=arguments,
         expected=expected,
         oracle=("owner_expected" if expected is not None else "deterministic_smoke"),
+        tests=((arguments, expected),) if expected is not None else (),
     )
 
 

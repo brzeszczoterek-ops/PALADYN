@@ -13,6 +13,7 @@ import re
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, is_dataclass, replace
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlsplit, urlunsplit
 from uuid import uuid4
@@ -27,6 +28,20 @@ from .autonomy import (
     TaskContract,
 )
 from .config import Config
+from .creation_budget import (
+    CREATION_ATTEMPT_TOOLS,
+    CREATION_TOOLS,
+    SOURCE_DRAFT_TOOL,
+    TOTAL_ATTEMPT_LIMIT,
+    TOTAL_SECONDS,
+    evaluate as creation_budget,
+)
+from .generated_tool_contract import (
+    GeneratedToolContract,
+    GeneratedToolContractError,
+    extract_generated_tool_contract,
+    has_natural_fixture_candidate,
+)
 from .response_preview import response_preview
 from .autonomy.local_read_scope import literal_paths, resolve_read_scope
 from .tool_catalog_review import review_catalog
@@ -83,6 +98,7 @@ class Agent:
             "search_files",
             "memory_recall",
             "learning_list_artifacts",
+            "learning_recall_failures",
             "runtime_review_task",
         }
     )
@@ -1722,6 +1738,63 @@ Current relationship stage: {stage}.
             tool_definitions,
             capability_hints=capability_hints,
         )
+        generated_tool_contract: GeneratedToolContract | None = None
+        source_only_builder = any(
+            isinstance(item, dict)
+            and item.get("function", {}).get("name") == "learning_create_tool"
+            and item.get("function", {}).get("parameters", {}).get("required")
+            == ["source"]
+            for item in tool_definitions
+        )
+        assignments = self._structured_literal_assignments(routing_prompt)
+        if (
+            source_only_builder
+            and contract.requires_created_tool_execution
+            and not assignments.get("expected")
+            and has_natural_fixture_candidate(routing_prompt)
+            and callable(getattr(self.llm, "ask", None))
+        ):
+            try:
+                generated_tool_contract = await extract_generated_tool_contract(
+                    self.llm, routing_prompt
+                )
+            except GeneratedToolContractError as error:
+                answer = (
+                    "Boss, I can't freeze the tool tests without guessing: "
+                    f"{error}. State the example inputs, their expected outputs, "
+                    "and the separate final input once more. No code was generated."
+                )
+                if trace is not None:
+                    trace.record_event(
+                        "generated_tool_contract_rejected",
+                        {"reason": str(error)[:500]},
+                    )
+                    trace.await_owner(
+                        reason="generated tool test contract is ambiguous",
+                        step_limit=self.MAX_AGENT_STEPS,
+                        successful_tool_count=0,
+                        failed_tool_count=0,
+                        missing=["generated_tool_test_contract"],
+                        progress_summary=None,
+                        accepted_commands=["reply with the missing information", "/stop"],
+                    )
+                    self._last_execution_context = AgentTaskTrace.latest_context(trace.root)
+                if on_token is not None:
+                    on_token(answer)
+                return answer
+            setter = getattr(self.tools, "set_generated_tool_contract", None)
+            if callable(setter):
+                setter(generated_tool_contract)
+            if trace is not None:
+                trace.record_event(
+                    "generated_tool_contract_frozen",
+                    {
+                        "test_count": len(generated_tool_contract.tests),
+                        "input_fields": sorted(generated_tool_contract.tests[0].arguments),
+                        "output_fields": sorted(generated_tool_contract.tests[0].expected),
+                        "provenance": generated_tool_contract.provenance,
+                    },
+                )
         agent_system_base = system_prompt
         system_prompt = agent_system_base + (
             "\n\n=== AGENT MODE ===\n"
@@ -1770,11 +1843,22 @@ Current relationship stage: {stage}.
         )
 
         prior_calls = list(trace.tool_calls) if trace is not None else []
+        runtime_creation_attempts: list[dict[str, Any]] = [
+            dict(call)
+            for call in prior_calls
+            if call.get("tool") == SOURCE_DRAFT_TOOL
+        ]
         successful_calls: list[dict[str, Any]] = [
-            dict(call) for call in prior_calls if call.get("status") == "succeeded"
+            dict(call)
+            for call in prior_calls
+            if call.get("status") == "succeeded"
+            and call.get("tool") != SOURCE_DRAFT_TOOL
         ]
         failed_calls: list[dict[str, Any]] = [
-            dict(call) for call in prior_calls if call.get("status") == "failed"
+            dict(call)
+            for call in prior_calls
+            if call.get("status") == "failed"
+            and call.get("tool") != SOURCE_DRAFT_TOOL
         ]
         successful_tools: list[str] = [
             str(call.get("tool", ""))
@@ -1808,7 +1892,7 @@ Current relationship stage: {stage}.
 
         def evidence_ledger() -> list[dict[str, Any]]:
             return sorted(
-                [*successful_calls, *failed_calls],
+                [*successful_calls, *failed_calls, *runtime_creation_attempts],
                 key=lambda call: int(call.get("sequence") or 0),
             )
 
@@ -1920,6 +2004,8 @@ Current relationship stage: {stage}.
         # so they cannot extend the task; they only let the model render the
         # evidence-backed answer or hit the deterministic fallback.
         for step in range(maximum_steps + 2):
+            if self._creation_failure_budget_exhausted(evidence_ledger()):
+                return await self._finish_creation_failure_budget(prompt, evidence_ledger(), trace, on_token)
             finalization_required = (
                 bool(successful_calls)
                 and not unmet_requirements()
@@ -1960,9 +2046,25 @@ Current relationship stage: {stage}.
                 and not finalization_required
                 else None
             )
+            bound_generated_execution = (
+                self._runtime_generated_tool_execution_request(
+                    routing_prompt,
+                    contract,
+                    active_tool_definitions,
+                    successful_calls,
+                    observed_snapshot=latest_browser_snapshot_text,
+                    generated_contract=generated_tool_contract,
+                )
+                if not finalization_required
+                else None
+            )
             phase_kind = (
                 routed_phase
-                if finalization_required or (literal_read and literal_read[0] == "read_file")
+                if (
+                    finalization_required
+                    or (literal_read and literal_read[0] == "read_file")
+                    or bound_generated_execution is not None
+                )
                 else classify_model_phase(
                     prompt,
                     contract,
@@ -1996,7 +2098,10 @@ Current relationship stage: {stage}.
                         },
                     )
             phase_prompt = (
-                self._generated_source_phase_prompt(prompt)
+                self._generated_source_phase_prompt(
+                    prompt,
+                    generated_contract=generated_tool_contract,
+                )
                 if source_owned_phase
                 else self._agent_mode_prompt(active_tool_definitions)
             )
@@ -2097,13 +2202,14 @@ Current relationship stage: {stage}.
             if runtime_execution_request is not None and not runtime_execution_source:
                 runtime_execution_source = "runtime_owner_literal"
             if runtime_execution_request is None:
-                runtime_execution_request = (
+                runtime_execution_request = bound_generated_execution or (
                     self._runtime_generated_tool_execution_request(
                         routing_prompt,
                         contract,
                         active_tool_definitions,
                         successful_calls,
                         observed_snapshot=latest_browser_snapshot_text,
+                        generated_contract=generated_tool_contract,
                     )
                 )
                 if runtime_execution_request is not None:
@@ -2140,13 +2246,15 @@ Current relationship stage: {stage}.
                     if finalization_required and preview is not None and callable(streamer):
                         preview("draft_start", "")
                         chunks = []
-                        async for chunk in streamer(messages=messages, max_tokens=512):
-                            chunks.append(chunk)
-                            preview("draft_token", chunk)
+                        budget = creation_budget(evidence_ledger())
+                        async with asyncio.timeout(budget.remaining_seconds if budget.attempts else None):
+                            async for chunk in streamer(messages=messages, max_tokens=512):
+                                chunks.append(chunk)
+                                preview("draft_token", chunk)
                         answer = "".join(chunks)
                         preview("draft_validating", "")
                     elif callable(responder):
-                        response = await responder(
+                        response = await self._await_creation_step(responder(
                             messages=messages,
                             tools=model_tool_definitions or None,
                             tool_choice=(
@@ -2164,14 +2272,14 @@ Current relationship stage: {stage}.
                                 and contract.requires_evidence_report
                                 else 256
                                 if finalization_required
-                                else 1_024
+                                else 384
                                 if source_owned_phase
                                 else self._agent_generation_budget(
                                     active_tool_definitions,
                                     context_tokens=context_tokens,
                                 )
                             ),
-                        )
+                        ), evidence_ledger())
                         answer = str(getattr(response, "content", "") or "")
                         for index, call in enumerate(
                             getattr(response, "tool_calls", []) or []
@@ -2195,14 +2303,20 @@ Current relationship stage: {stage}.
                                 }
                             )
                     elif on_token is None:
-                        answer = await self.llm.ask(messages=messages)
+                        answer = await self._await_creation_step(self.llm.ask(messages=messages), evidence_ledger())
                     else:
                         # Compatibility path for models/templates without native tools.
-                        answer, _ = await self._stream_guarded_english(
+                        answer, _ = await self._await_creation_step(self._stream_guarded_english(
                             messages,
                             lambda _chunk: None,
                             max_tokens=512,
+                        ), evidence_ledger())
+                except TimeoutError:
+                    if creation_budget(evidence_ledger()).attempts:
+                        return await self._finish_creation_failure_budget(
+                            prompt, evidence_ledger(), trace, on_token, reason="time_budget",
                         )
+                    raise
                 except APIStatusError as error:
                     if (
                         generation_attempt == 0
@@ -2242,12 +2356,47 @@ Current relationship stage: {stage}.
                             },
                         )
                 else:
+                    draft_digest = hashlib.sha256(answer.encode("utf-8")).hexdigest()
+                    if trace is not None:
+                        sequence = trace.tool_started(
+                            SOURCE_DRAFT_TOOL,
+                            {
+                                "bytes": len(answer.encode("utf-8")),
+                                "sha256": draft_digest,
+                            },
+                        )
+                        trace.tool_finished(
+                            sequence,
+                            "Generated source draft did not contain one unambiguous valid run function.",
+                            error="SourceDraftValidationError: missing or ambiguous valid run function",
+                        )
+                        runtime_creation_attempts.append(
+                            dict(trace.tool_calls[sequence - 1])
+                        )
+                    else:
+                        runtime_creation_attempts.append(
+                            {
+                                "sequence": len(evidence_ledger()) + 1,
+                                "tool": SOURCE_DRAFT_TOOL,
+                                "arguments": {
+                                    "bytes": len(answer.encode("utf-8")),
+                                    "sha256": draft_digest,
+                                },
+                                "status": "failed",
+                                "started_at": datetime.now(timezone.utc).isoformat(),
+                                "error": (
+                                    "SourceDraftValidationError: missing or "
+                                    "ambiguous valid run function"
+                                ),
+                            }
+                        )
                     if trace is not None:
                         trace.record_event(
                             "generated_tool_source_rejected",
                             {
-                                "reason": "missing_valid_run_function",
+                                "reason": "missing_or_ambiguous_valid_run_function",
                                 "candidate": answer[:2_000],
+                                "attempt": creation_budget(evidence_ledger()).attempts,
                             },
                         )
                     messages.extend(
@@ -3131,6 +3280,18 @@ Current relationship stage: {stage}.
                     arguments,
                 )
                 ledger = evidence_ledger()
+                candidate = None
+                creation_probe = ""
+                creation_model = str(getattr(getattr(self.llm, "config", None), "model", ""))
+                if tool_name in CREATION_TOOLS:
+                    inspect_candidate = getattr(self.tools, "creation_candidate", None)
+                    if callable(inspect_candidate):
+                        candidate = inspect_candidate(tool_name, arguments)
+                    admitted, creation_probe = creation_budget(ledger).admit(candidate, creation_model)
+                    if not admitted:
+                        return await self._finish_creation_failure_budget(
+                            prompt, ledger, trace, on_token, reason=creation_probe,
+                        )
                 prior_failed_identical = sum(
                     1
                     for previous_call in ledger
@@ -3150,7 +3311,7 @@ Current relationship stage: {stage}.
                         break
                     consecutive_repeats += 1
 
-                if consecutive_repeats >= 3 or prior_failed_identical >= 3:
+                if (consecutive_repeats >= 3 or prior_failed_identical >= 3) and creation_probe != "changed_model_probe":
                     if trace is not None:
                         trace.record_event(
                             "repeated_tool_loop_detected",
@@ -3213,6 +3374,7 @@ Current relationship stage: {stage}.
                     return answer
 
                 trace_sequence: int | None = None
+                creation_started_at = datetime.now(timezone.utc).isoformat()
                 if trace is not None:
                     trace_sequence = trace.tool_started(tool_name or "<missing>", arguments)
                     print(
@@ -3231,14 +3393,14 @@ Current relationship stage: {stage}.
                         tool_error = (
                             "ToolArgumentValidationError: " + argument_problem
                         )
-                if consecutive_repeats >= 2:
+                if consecutive_repeats >= 2 and creation_probe != "changed_model_probe":
                     tool_error = (
                         "RepeatedToolCallError: PALADYN rejected a third "
                         "consecutive request for the same tool with identical "
                         "arguments. Use existing evidence, change strategy, or "
                         "finish truthfully."
                     )
-                if prior_failed_identical >= 2:
+                if prior_failed_identical >= 2 and creation_probe != "changed_model_probe":
                     tool_error = (
                         "RepeatedFailedToolCallError: this exact action has already "
                         "failed twice. Do not retry or guess a nearby domain. For web "
@@ -3294,10 +3456,14 @@ Current relationship stage: {stage}.
                     provided_capabilities: list[str] = []
                     recovery_attempts: list[dict[str, Any]] = []
                     recovery_ticket: dict[str, Any] | None = None
+                    recovery_failure_details: dict[str, Any] = {}
                     try:
                         recovering_call = getattr(self.tools, "call_with_recovery", None)
                         if callable(recovering_call):
-                            recovery_outcome = await recovering_call(tool_name, arguments)
+                            recovery_outcome = await self._await_creation_step(
+                                recovering_call(tool_name, arguments),
+                                ledger + [{"tool": tool_name, "started_at": creation_started_at}],
+                            )
                             tool_result = recovery_outcome.result
                             provider_tool = str(
                                 getattr(recovery_outcome, "provider_tool", tool_name)
@@ -3314,14 +3480,26 @@ Current relationship stage: {stage}.
                                 "recovery_ticket",
                                 None,
                             )
+                            recovery_failure_details = dict(
+                                getattr(recovery_outcome, "failure_details", {}) or {}
+                            )
                             tool_error = str(
                                 getattr(recovery_outcome, "error", "") or ""
                             ) or None
                         else:
-                            tool_result = await self.tools.call(tool_name, arguments)
+                            tool_result = await self._await_creation_step(
+                                self.tools.call(tool_name, arguments),
+                                ledger + [{"tool": tool_name, "started_at": creation_started_at}],
+                            )
                     except Exception as exc:
                         tool_error = f"{type(exc).__name__}: {exc}"
                         tool_result = f"Tool execution failed: {tool_error}"
+                        recovery_failure_details = {
+                            "stage": "provider_execution",
+                            "execution_attempted": True,
+                            "provider": provider_tool,
+                            "exception_type": type(exc).__name__,
+                        }
                     else:
                         tool_result = str(tool_result)
                         if tool_error is None:
@@ -3336,6 +3514,7 @@ Current relationship stage: {stage}.
                     provided_capabilities = []
                     recovery_attempts = []
                     recovery_ticket = None
+                    recovery_failure_details = {}
                     tool_result = f"Tool execution failed: {tool_error}"
 
                 tool_result = str(tool_result)
@@ -3398,6 +3577,7 @@ Current relationship stage: {stage}.
                         len(successful_calls) + len(failed_calls) + 1
                     ),
                     "tool": tool_name,
+                    "started_at": creation_started_at,
                     "provider_tool": provider_tool,
                     "capabilities": provided_capabilities,
                     "provider_attempts": recovery_attempts,
@@ -3415,7 +3595,40 @@ Current relationship stage: {stage}.
                     call_record["binding_source"] = runtime_execution_source
                 if recovery_ticket is not None:
                     call_record["recovery_ticket"] = recovery_ticket
+                if recovery_failure_details:
+                    call_record["failure_details"] = recovery_failure_details
+                if (
+                    tool_name == "learning_create_repair_adapter"
+                    and tool_error is None
+                    and isinstance(arguments, dict)
+                    and arguments.get("ticket_id")
+                ):
+                    call_record["repaired_ticket_id"] = str(
+                        arguments["ticket_id"]
+                    )[:128]
+                if tool_name in CREATION_TOOLS:
+                    take_validation = getattr(self.tools, "take_creation_validation", None)
+                    receipt = take_validation(tool_name, arguments) if callable(take_validation) else None
+                    creation_metadata = {
+                        "creation_candidate": candidate,
+                        "creation_validation": receipt,
+                        "creation_probe": creation_probe,
+                        "creation_model": creation_model,
+                    }
+                    call_record.update(creation_metadata)
+                    # Metadata comes only from local executor methods, never
+                    # the tool's JSON result or a generated source dictionary.
+                    if trace is not None and trace_sequence is not None:
+                        trace.tool_calls[trace_sequence - 1].update(creation_metadata)
                 if trace is not None and trace_sequence is not None:
+                    if recovery_failure_details:
+                        trace.tool_calls[trace_sequence - 1]["failure_details"] = (
+                            recovery_failure_details
+                        )
+                    if call_record.get("repaired_ticket_id"):
+                        trace.tool_calls[trace_sequence - 1]["repaired_ticket_id"] = (
+                            call_record["repaired_ticket_id"]
+                        )
                     trace.tool_finished(
                         trace_sequence,
                         tool_result,
@@ -3434,6 +3647,53 @@ Current relationship stage: {stage}.
                         f"[Task {trace.task_id}] tool {trace_sequence} "
                         f"{'failed' if tool_error else 'completed'}: {tool_name}"
                     )
+                    if tool_name in CREATION_TOOLS:
+                        budget = creation_budget([*ledger, call_record])
+                        trace.record_event("creation_budget_observed", {
+                            "sequence": trace_sequence, "attempts": budget.attempts,
+                            "stagnant_failures": budget.stagnant,
+                            "verified_progress_resets": budget.progress_resets,
+                            "probe": creation_probe,
+                            "remaining_seconds": round(budget.remaining_seconds, 2),
+                            "cause_verified": False,
+                        })
+                prototype_answer = self._generated_prototype_answer(tool_name, tool_result)
+                if prototype_answer is not None:
+                    if trace is not None:
+                        capture_failure = getattr(self.tools, "capture_tool_failure", None)
+                        if callable(capture_failure):
+                            try:
+                                evidence = capture_failure(
+                                    task_id=trace.task_id, tool=tool_name,
+                                    arguments=arguments if isinstance(arguments, dict) else {},
+                                    error="Prototype qualification incomplete: independent expected-result verification is missing.",
+                                )
+                            except Exception as error:
+                                trace.record_event("learning_capture_failed", {
+                                    "tool": tool_name, "error": str(error)[:2_000],
+                                })
+                            else:
+                                if isinstance(evidence, dict):
+                                    trace.record_event("learning_evidence_recorded", {
+                                        "tool": tool_name, "evidence_id": evidence.get("evidence_id"),
+                                        "outcome": "failure",
+                                    })
+                        trace.record_event("generated_prototype_requires_verification", {
+                            "tool": tool_name, "sequence": trace_sequence,
+                            "activated": False, "automatic_retry": False,
+                        })
+                        trace.fail("prototype needs independent expected-result verification")
+                        self._last_execution_context = AgentTaskTrace.latest_context(trace.root)
+                    prototype_answer = await self._render_prototype_feedback(
+                        prompt, prototype_answer, trace=trace,
+                    )
+                    await self._remember_task(
+                        prompt, prototype_answer,
+                        execution=trace.evidence() if trace is not None else None,
+                    )
+                    if on_token is not None:
+                        on_token(prototype_answer)
+                    return prototype_answer
                 if tool_error is None:
                     recoverable_failure_tool = ""
                     consecutive_recoverable_tool_failures = 0
@@ -3558,6 +3818,7 @@ Current relationship stage: {stage}.
                                     arguments if isinstance(arguments, dict) else {}
                                 ),
                                 error=tool_error or "unknown tool failure",
+                                failure_details=(recovery_failure_details or None),
                             )
                         except Exception as learning_error:
                             trace.record_event(
@@ -3586,6 +3847,14 @@ Current relationship stage: {stage}.
                                         ),
                                     },
                                 )
+
+                # Count persisted failures, not matching source text or consecutive
+                # error classes. Model switches, unrelated successes and context
+                # rollovers must not buy another generation budget.
+                if self._creation_failure_budget_exhausted(evidence_ledger()):
+                    return await self._finish_creation_failure_budget(
+                        prompt, evidence_ledger(), trace, on_token,
+                    )
 
                 tool_message = (
                     "=== UNTRUSTED TOOL OUTPUT ===\n"
@@ -6264,6 +6533,7 @@ Rules:
             matched = True
         if contract.requires_runtime_review or "runtime_review" in hints:
             selected.add("runtime_review_task")
+            selected.add("learning_recall_failures")
             matched = True
         explicit_tool_creation = (
             contract.requires_created_tool
@@ -6397,13 +6667,23 @@ Rules:
         return False
 
     @classmethod
-    def _generated_source_phase_prompt(cls, prompt: str) -> str:
+    def _generated_source_phase_prompt(
+        cls,
+        prompt: str,
+        *,
+        generated_contract: GeneratedToolContract | None = None,
+    ) -> str:
         assignments = cls._structured_literal_assignments(prompt)
-        fields = [
-            name
-            for name in assignments
-            if name not in {"expected", "test_expected", "version", "timeout_seconds"}
-        ]
+        fields = (
+            list(generated_contract.tests[0].arguments)
+            if generated_contract is not None
+            else [
+                name
+                for name in assignments
+                if name
+                not in {"expected", "test_expected", "version", "timeout_seconds"}
+            ]
+        )
         bindings = "\n".join(
             f"    {name} = arguments[{name!r}]" for name in fields
         )
@@ -6413,6 +6693,16 @@ Rules:
             + (bindings or "    pass")
             + "\nReplace `pass` when present and return the result object."
         )
+        if generated_contract is not None:
+            skeleton += (
+                "\nThe frozen runtime contract requires the returned object to use "
+                "exactly these field names: "
+                + json.dumps(
+                    list(generated_contract.tests[0].expected),
+                    ensure_ascii=False,
+                )
+                + ". Do not copy the contract's example values into source."
+            )
         return """
 PALADYN is in generated-tool SOURCE PHASE.
 
@@ -6420,11 +6710,15 @@ The runtime—not the language model—owns the tool name, description, manifest
 fixture, schemas, tests, quarantine, validation, activation, and evidence report.
 No callable tools are exposed to the model in this phase.
 
-Return ONLY Python source code. Do not return JSON, a function-call envelope,
-Markdown commentary, a manifest, schemas, tests, or an explanation. The source
-must define a synchronous `def run(arguments)` and return one JSON object. Read
-task inputs from `arguments` using the exact field names present in Boss's
-objective. Keep the implementation deterministic. Do not fabricate external
+Return ONLY Python source code, preferably under 20 lines. Do not return JSON, a
+function-call envelope, Markdown commentary, a manifest, schemas, tests, or an
+explanation. The source must define a synchronous `def run(arguments)` and
+return one JSON object. The function implements ONLY the reusable operation.
+Never put test cases, activation logic, proof fields, the final requested
+invocation, or fixed example values inside `run`; PALADYN performs those stages
+after this source response. Read task inputs from `arguments` using the exact
+field names present in Boss's objective and compute the returned object from
+those inputs. Keep the implementation deterministic. Do not fabricate external
 facts; operate only on supplied arguments. PALADYN will bind exact immutable
 fixtures, run the source offline twice when no owner oracle exists, and mutate
 those fixtures to prove the output actually depends on its input. A constant
@@ -6432,12 +6726,196 @@ report, a list of future actions, or any result whose work is still `pending`
 will be rejected. If the task lacks the real bounded input needed to test the
 tool, do not fake completion—produce source that declares the required input so
 PALADYN can report the missing fixture. It will derive strict schemas, validate
-the artifact in quarantine, and activate it only after the checks pass.
+the artifact in quarantine. Candidate-derived expectations characterize only a
+prototype and never authorize activation. Activation additionally requires an
+independently specified expected-result contract, not a result inferred from
+the candidate's own output.
 """.strip() + skeleton
 
     @staticmethod
+    def _generated_prototype_answer(tool_name: str, tool_result: str) -> str | None:
+        if tool_name != "learning_create_tool":
+            return None
+        try:
+            payload = json.loads(tool_result)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        validation = payload.get("validation")
+        if (payload.get("status") != "validated" or not isinstance(validation, dict)
+                or validation.get("activation_eligible") is not False
+                or validation.get("qualification") != "prototype_only"
+                or validation.get("passed") is not True):
+            return None
+        return (
+            "Boss, I've got a prototype, not a working tool. Checking its answers "
+            "against itself is a self-check, not proof it does the job. "
+            "The code and sandbox results are saved, but I'm not activating it. "
+            "We need a test with a known correct answer that doesn't come from this code. "
+            "Your task isn't done, and this run has stopped."
+        )
+
+    _CREATION_TOOLS = CREATION_TOOLS
+    _CREATION_ATTEMPT_TOOLS = CREATION_ATTEMPT_TOOLS
+    _CREATION_FAILURE_LIMIT = 3
+
+    async def _await_creation_step(self, operation, calls: list[dict[str, Any]]):
+        budget = creation_budget(calls)
+        if not budget.attempts:
+            return await operation
+        return await asyncio.wait_for(operation, timeout=max(0.001, budget.remaining_seconds))
+
+    @classmethod
+    def _creation_failure_budget_exhausted(cls, calls: list[dict[str, Any]]) -> bool:
+        return bool(creation_budget(calls).stop_reason)
+
+    async def _finish_creation_failure_budget(
+        self, prompt: str, calls: list[dict[str, Any]],
+        trace: AgentTaskTrace | None, on_token: Callable[[str], None] | None,
+        *, reason: str = "",
+    ) -> str:
+        failures = [
+            call
+            for call in calls
+            if call.get("status") == "failed"
+            and call.get("tool") in self._CREATION_ATTEMPT_TOOLS
+        ]
+        budget = creation_budget(calls)
+        reason = reason or budget.stop_reason or "no_verified_progress"
+        answer = (
+            f"Boss, {len(failures)} creation attempts failed. I'm stopping this run — "
+            "another rewrite isn't evidence that anything works. Your task isn't complete. "
+            f"Budget: {budget.attempts}/{TOTAL_ATTEMPT_LIMIT} attempts; "
+            f"{budget.stagnant} failures without verified progress. "
+            "Before another attempt, we need to review the recorded failures and establish "
+            "a clear input and an independently expected result. No automatic retry is running."
+        )
+        if trace is not None:
+            trace.record_event("creation_failure_budget_exhausted", {
+                "limit": self._CREATION_FAILURE_LIMIT,
+                "reason": reason,
+                "total_attempt_limit": TOTAL_ATTEMPT_LIMIT,
+                "total_seconds": TOTAL_SECONDS,
+                "attempts": budget.attempts,
+                "stagnant_failures": budget.stagnant,
+                "verified_progress_resets": budget.progress_resets,
+                "code_probe_used": budget.code_probe_used,
+                "model_probe_used": budget.model_probe_used,
+                "failed_sequences": [call.get("sequence") for call in failures],
+                "automatic_retry": False,
+                "cause_verified": False,
+            })
+            trace.fail("creation failure budget exhausted; task incomplete")
+            self._last_execution_context = AgentTaskTrace.latest_context(trace.root)
+        answer = await self._render_stopped_task_feedback(
+            prompt, answer, trace=trace, event_prefix="creation_failure_feedback",
+            facts=(f"{len(failures)} creation attempts failed; run stopped; task incomplete; "
+                   "no automatic retry; failures need review, not an invented root cause. "
+                   "Do not claim a prototype was saved, activated or successfully tested."),
+        )
+        await self._remember_task(prompt, answer, execution=trace.evidence() if trace else None)
+        if on_token is not None:
+            on_token(answer)
+        return answer
+
+    async def _render_prototype_feedback(
+        self, prompt: str, grounded_answer: str, *, trace: AgentTaskTrace | None = None,
+    ) -> str:
+        return await self._render_stopped_task_feedback(
+            prompt, grounded_answer, trace=trace, event_prefix="prototype_feedback",
+            facts=("prototype saved; sandbox self-checks only; not activated; task incomplete; "
+                   "run stopped; independent expected result still needed."),
+        )
+
+    async def _render_stopped_task_feedback(
+        self, prompt: str, grounded_answer: str, *, trace: AgentTaskTrace | None = None,
+        facts: str, event_prefix: str,
+    ) -> str:
+        """Present the fixed runtime outcome through the existing language/voice layer.
+
+        No source, historical dialogue, tools, or execution authority are passed
+        to this presentation step. English needs no extra model turn; configured
+        language overrides use the normal V rewrite path. Failure cannot restart
+        the already stopped task or change artifact qualification.
+        """
+        messages = [
+            {"role": "system", "content": (
+                "Present this completed runtime outcome as V, Boss's sharp hacker peer. "
+                f"Preserve these facts: {facts} Be direct and conversational, not bureaucratic. "
+                "Do not invent actions, offer a running background job, or force profanity."
+            )},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            rendered = await asyncio.wait_for(self._enforce_english(
+                messages, grounded_answer, allow_verified_tool_fallback=False,
+            ), timeout=15.0)
+            if (not rendered or unsupported_execution_claims(rendered, ())
+                    or not matches_requested_language(rendered, self._effective_response_language(prompt))):
+                raise ValueError("presentation was empty, in the wrong language, or added unsupported actions")
+        except Exception as error:
+            if trace is not None:
+                trace.record_event(f"{event_prefix}_fallback", {
+                    "error_type": type(error).__name__,
+                    "requested_language": self._effective_response_language(prompt),
+                    "fallback_language": "English",
+                })
+            return grounded_answer
+        if trace is not None:
+            trace.record_event(f"{event_prefix}_rendered", {
+                "requested_language": self._effective_response_language(prompt),
+                "qualification_unchanged": True,
+            })
+        return rendered
+
+    @staticmethod
     def _parse_generated_tool_source(answer: str) -> str:
-        """Accept a raw or single fenced Python module with a valid run entrypoint."""
+        """Extract one unambiguous Python module with a valid run entrypoint."""
+
+        def normalize_candidate(text: str) -> str:
+            text = text.strip()
+            if text.startswith("{"):
+                recovered: dict[str, Any] | None = None
+                for suffix in ("", "}", "}}"):
+                    try:
+                        candidate = json.loads(text + suffix)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(candidate, dict):
+                        recovered = candidate
+                        break
+                arguments = (
+                    recovered.get("arguments", {})
+                    if isinstance(recovered, dict)
+                    else {}
+                )
+                if (
+                    isinstance(recovered, dict)
+                    and recovered.get("tool") == "learning_create_tool"
+                    and isinstance(arguments, dict)
+                    and isinstance(arguments.get("source"), str)
+                ):
+                    text = arguments["source"].strip()
+                else:
+                    return ""
+            if not text or text.startswith(("[", "<tool")):
+                return ""
+            try:
+                tree = ast.parse(text, mode="exec")
+            except SyntaxError:
+                return ""
+            run = next(
+                (
+                    node
+                    for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == "run"
+                ),
+                None,
+            )
+            if run is None or len(run.args.args) != 1 or run.args.vararg is not None:
+                return ""
+            return text
 
         text = answer.strip()
         fenced = list(
@@ -6447,51 +6925,24 @@ the artifact in quarantine, and activate it only after the checks pass.
                 flags=re.IGNORECASE | re.DOTALL,
             )
         )
-        if len(fenced) == 1:
-            text = fenced[0].group("source").strip()
-        elif fenced:
+        if not fenced:
+            direct = normalize_candidate(text)
+            if direct:
+                return direct
+            embedded = {
+                source
+                for match in re.finditer(r"(?m)^def\s+run\s*\(", text)
+                if (source := normalize_candidate(text[match.start() :]))
+            }
+            return embedded.pop() if len(embedded) == 1 else ""
+        valid_sources = {
+            source
+            for match in fenced
+            if (source := normalize_candidate(match.group("source")))
+        }
+        if len(valid_sources) != 1:
             return ""
-        if text.startswith("{"):
-            recovered: dict[str, Any] | None = None
-            for suffix in ("", "}", "}}"):
-                try:
-                    candidate = json.loads(text + suffix)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(candidate, dict):
-                    recovered = candidate
-                    break
-            arguments = (
-                recovered.get("arguments", {})
-                if isinstance(recovered, dict)
-                else {}
-            )
-            if (
-                isinstance(recovered, dict)
-                and recovered.get("tool") == "learning_create_tool"
-                and isinstance(arguments, dict)
-                and isinstance(arguments.get("source"), str)
-            ):
-                text = arguments["source"].strip()
-            else:
-                return ""
-        if not text or text.startswith(("[", "<tool")):
-            return ""
-        try:
-            tree = ast.parse(text, mode="exec")
-        except SyntaxError:
-            return ""
-        run = next(
-            (
-                node
-                for node in tree.body
-                if isinstance(node, ast.FunctionDef) and node.name == "run"
-            ),
-            None,
-        )
-        if run is None or len(run.args.args) != 1 or run.args.vararg is not None:
-            return ""
-        return text
+        return valid_sources.pop()
 
     @classmethod
     def _runtime_grounded_required_tool_request(
@@ -7132,6 +7583,7 @@ the artifact in quarantine, and activate it only after the checks pass.
         successful_calls: list[dict[str, Any]],
         *,
         observed_snapshot: str = "",
+        generated_contract: GeneratedToolContract | None = None,
     ) -> tuple[str, dict[str, Any]] | None:
         """Bind the post-activation execution without asking the model again."""
 
@@ -7161,6 +7613,11 @@ the artifact in quarantine, and activate it only after the checks pass.
         required = schema.get("required", [])
         if not isinstance(properties, dict) or not isinstance(required, list):
             return None
+        if generated_contract is not None:
+            arguments = deepcopy(generated_contract.final_arguments)
+            if any(str(field) not in arguments for field in required):
+                return None
+            return name, arguments
         assignments = cls._structured_literal_assignments(prompt)
         arguments: dict[str, Any] = {}
         for field in properties:
@@ -7264,6 +7721,30 @@ the artifact in quarantine, and activate it only after the checks pass.
             ]
         required_tool_missing = set(contract.required_tools).intersection(missing)
         if required_tool_missing:
+            repaired_tickets = {
+                str(call.get("repaired_ticket_id", ""))
+                for call in successful_calls
+                if call.get("tool") == "learning_create_repair_adapter"
+                and call.get("repaired_ticket_id")
+            }
+            pending_generated_recovery = any(
+                isinstance(call.get("recovery_ticket"), dict)
+                and str(call["recovery_ticket"].get("capability", "")).startswith(
+                    "generated."
+                )
+                and str(call["recovery_ticket"].get("ticket_id", ""))
+                not in repaired_tickets
+                for call in (failed_calls or [])
+            )
+            if pending_generated_recovery:
+                repair = [
+                    item
+                    for item in definitions
+                    if item.get("function", {}).get("name")
+                    == "learning_create_repair_adapter"
+                ]
+                if repair:
+                    return repair
             required = [
                 item
                 for item in definitions

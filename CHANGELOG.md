@@ -1,5 +1,76 @@
 # V-Core Changelog
 
+## 3.10 - 2026-09-09
+
+### Verification scope
+- 925 Full and 874 Public automated tests passed. A fresh isolated AgenticQwen run extracted
+  two natural-Polish input/output examples, executed both comparisons in
+  Bubblewrap, activated the generated tool, and bound a separate final input
+  that returned the expected result.
+
+### Added
+- Natural-language generated-tool test contracts. Before code generation,
+  PALADYN can normalize owner-stated examples and a separate final invocation
+  in any model-understood language, then freezes them in runtime state. Every
+  accepted value must occur in an exact quote from the current owner message;
+  inconsistent, fabricated, or ambiguous fixtures stop before source creation.
+- Multiple frozen semantic examples are executed as independent Bubblewrap
+  cases. A generated tool activates only after every expected-result comparison
+  passes, and its first requested invocation uses the frozen final arguments
+  rather than arguments rewritten by the code-generating model.
+- Read-only failure recall scoped to the current workspace, with optional exact
+  argument matching, grouped repetitions, and explicit uncertainty about causes.
+- Internal trusted lesson-regression accounting, bound to the proposal content;
+  duplicate receipts do not inflate counts and unresolved failures prevent
+  validation. No automatic repair or unrestricted retry loop is introduced.
+
+### Fixed
+- Generated-source responses may contain surrounding prose or repeated identical
+  Python fences without being discarded. PALADYN accepts exactly one distinct
+  valid `run(arguments)` module and still rejects multiple different valid
+  candidates as ambiguous.
+- Source-draft parse failures now consume the same bounded creation-attempt and
+  time budget as executed builder failures. Three stagnant invalid drafts stop
+  before a fourth generation instead of escaping the creation circuit breaker.
+- The generated-source phase now asks only for the reusable operation, excludes
+  tests/activation/final invocation from `run`, and uses a smaller response
+  budget. Runtime validation and activation remain separate and authoritative.
+- A successfully executed newly created tool now satisfies the execution part
+  of its own creation contract. PALADYN no longer launches an unrelated extra
+  sandbox command after the requested generated tool has already run.
+- Runtime-bound first execution of a newly activated tool no longer hot-swaps
+  to a tool-use model merely to transport arguments the runtime already owns.
+- Recovery now distinguishes an executed provider failure from a dispatch that
+  never reached any provider. Circuit-open skips retain the historical reason,
+  retry time, and `execution_attempted=false` in the trace and failure evidence;
+  real validation exceptions retain their bounded stage and test counts.
+- A required generated tool failure now opens an explicit repair phase instead
+  of hiding the repair adapter behind the original required-tool filter. After
+  sandbox replay succeeds, the stable original capability is retested through
+  the activated replacement before the agent can finalize its report.
+- Creation separates stagnation from a non-renewable eight-request/600-second
+  budget. Comparable local executor validation receipts can reset stagnation;
+  changed code and an unseen model each allow at most one unverified probe.
+  Changed or self-derived test expectations cannot establish progress. History,
+  qualification, permissions and sandbox restrictions remain unchanged.
+- Prototype feedback no longer forces Polish or bypasses V's language layer.
+  The default grounded message is direct and conversational; configured languages
+  use the existing rewrite path with a 15-second deadline and no tool access.
+  Qualification and stopped-task state remain unchanged by presentation.
+- Source-only prototypes using their own outputs as test expectations no longer
+  activate, even when input sensitivity passes. Existing such bundles are hidden
+  from execution without deleting their history. The agent stops with an explicit
+  incomplete-qualification report instead of retrying or claiming task completion.
+- Repeated failures no longer automatically validate a proposed remedy. New
+  persistent artifact lesson links require actual matching regression receipts,
+  not legacy status labels alone; existing active artifacts are unchanged.
+- Generated-tool validation preserves passed, failed, and unrun case results
+  after an error, including the failure stage and bounded comparison receipts.
+  Failed revisions remain rejected without replacing a prior active version.
+- Manifest test names no longer establish owner-oracle provenance; input
+  sensitivity requires observed input/output variation. Reports explicitly
+  distinguish supplied-example checks from independent domain correctness.
+
 ## 3.9 - 2026-09-08
 
 ### Verification scope

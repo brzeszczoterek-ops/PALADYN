@@ -1,18 +1,30 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
+import shutil
+from types import SimpleNamespace
 
 import pytest
 
+from v_core.agent import Agent
 from v_core.autonomy import AuthorizationEnvelope, AuthorizationGuard
 from v_core.autonomy.task_contract import TaskContract
 from v_core.learning import (
+    ArtifactValidationError,
     ArtifactPolicyError,
     ArtifactScope,
     LearningRuntime,
     ToolManifest,
     ToolTestCase,
 )
+from v_core.mcp_tools import MCPTools
+from v_core.llm.llm import LLMResponse, LLMToolCall
+from v_core.memory.session import Session
+from v_core.persona.kernel import IdentityKernel
+from v_core.persona.runtime import PersonaRuntime
+from v_core.persona.voice import VoiceProfile
 from v_core.sandbox import BubblewrapBackend
 from v_core.tool_recovery import (
     ToolRecoveryRegistry,
@@ -28,6 +40,265 @@ def _runtime(tmp_path: Path) -> LearningRuntime:
         AuthorizationGuard(tmp_path, envelope),
         BubblewrapBackend(),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+async def test_mcp_creation_failure_repair_and_retest_cycle(tmp_path: Path) -> None:
+    tools = MCPTools(
+        SimpleNamespace(
+            filesystem_server=["/usr/bin/false"],
+            browser_server=["/usr/bin/false"],
+            workspace=tmp_path / "workspace",
+            learning_root=tmp_path / "learning",
+            autonomy_root=tmp_path / "autonomy",
+            learning_profile="client",
+            evm_profile="client",
+        )
+    )
+    assert tools.learning is not None
+    schema = {
+        "type": "object",
+        "properties": {"value": {"type": "integer"}},
+        "required": ["value"],
+        "additionalProperties": False,
+    }
+    original = await tools.learning.create_tool(
+        ToolManifest(
+            name="safe_divide_ten",
+            version="1.0.0",
+            description="Divide ten by a non-zero fixture value.",
+            input_schema=schema,
+            output_schema={
+                "type": "object",
+                "properties": {"result": {"type": "integer"}},
+                "required": ["result"],
+                "additionalProperties": False,
+            },
+            tests=(
+                ToolTestCase(
+                    name="known non-zero value",
+                    arguments={"value": 2},
+                    expected={"result": 5},
+                ),
+            ),
+        ),
+        'def run(arguments):\n    return {"result": 10 // arguments["value"]}\n',
+    )
+    assert original.status.value == "active"
+    tools._register_recovery_providers()
+
+    failed = await tools.call_with_recovery("safe_divide_ten", {"value": 0})
+
+    assert failed.error
+    assert failed.failure_details["stage"] == "provider_execution"
+    assert failed.failure_details["execution_attempted"] is True
+    assert len(failed.attempts) == 1
+    ticket_id = failed.recovery_ticket["ticket_id"]
+    assert tools.recovery.ticket(ticket_id).state == "open"
+
+    repair_source = (
+        'def run(arguments):\n'
+        '    value = arguments["value"]\n'
+        '    return {"result": 0 if value == 0 else 10 // value}\n'
+    )
+    repair_result = json.loads(
+        await tools._call_direct(
+            "learning_create_repair_adapter",
+            {
+                "ticket_id": ticket_id,
+                "name": "safe_divide_ten_repair",
+                "description": "Handle the captured zero-value failure.",
+                "source": repair_source,
+                "expected": {"result": 0},
+            },
+        )
+    )
+
+    assert repair_result["artifact"]["status"] == "active"
+    assert repair_result["recovery"]["state"] == "active"
+    repaired = await tools.call_with_recovery("safe_divide_ten", {"value": 0})
+    regression = await tools.call_with_recovery("safe_divide_ten", {"value": 2})
+
+    assert repaired.error == ""
+    assert repaired.provider_tool == "safe_divide_ten_repair"
+    assert json.loads(repaired.result) == {"result": 0}
+    assert regression.error == ""
+    assert regression.provider_tool == "safe_divide_ten_repair"
+    assert json.loads(regression.result) == {"result": 5}
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap required")
+async def test_agent_completes_failure_repair_and_retest_cycle(tmp_path: Path) -> None:
+    tools = MCPTools(
+        SimpleNamespace(
+            filesystem_server=["/usr/bin/false"],
+            browser_server=["/usr/bin/false"],
+            workspace=tmp_path / "workspace",
+            learning_root=tmp_path / "learning",
+            autonomy_root=tmp_path / "autonomy",
+            learning_profile="client",
+            evm_profile="client",
+        )
+    )
+    assert tools.learning is not None
+    schema = {
+        "type": "object",
+        "properties": {"value": {"type": "integer"}},
+        "required": ["value"],
+        "additionalProperties": False,
+    }
+    await tools.learning.create_tool(
+        ToolManifest(
+            name="safe_divide_ten",
+            version="1.0.0",
+            description="Divide ten by a non-zero fixture value.",
+            input_schema=schema,
+            output_schema={
+                "type": "object",
+                "properties": {"result": {"type": "integer"}},
+                "required": ["result"],
+                "additionalProperties": False,
+            },
+            tests=(
+                ToolTestCase(
+                    name="known non-zero value",
+                    arguments={"value": 2},
+                    expected={"result": 5},
+                ),
+            ),
+        ),
+        'def run(arguments):\n    return {"result": 10 // arguments["value"]}\n',
+    )
+    tools._register_recovery_providers()
+    repair_source = (
+        'def run(arguments):\n'
+        '    value = arguments["value"]\n'
+        '    return {"result": 0 if value == 0 else 10 // value}\n'
+    )
+
+    class Model:
+        config = SimpleNamespace(context=12_000, model="scripted-local-model")
+
+        def __init__(self) -> None:
+            self.turn = 0
+
+        async def respond(self, **kwargs) -> LLMResponse:
+            self.turn += 1
+            names = {
+                item["function"]["name"]
+                for item in (kwargs.get("tools") or [])
+            }
+            if self.turn == 1:
+                assert "safe_divide_ten" in names
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall("initial", "safe_divide_ten", {"value": 0})
+                    ]
+                )
+            if self.turn == 2:
+                assert "learning_create_repair_adapter" in names
+                ticket_id = next(
+                    item["ticket_id"]
+                    for item in tools.recovery.list_tickets(state="open")
+                    if item["capability"] == "generated.safe_divide_ten"
+                )
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "bad_repair",
+                            "learning_create_repair_adapter",
+                            {
+                                "ticket_id": ticket_id,
+                                "name": "safe_divide_ten_repair",
+                                "description": "Handle the captured zero-value failure.",
+                                "source": (
+                                    'def run(arguments):\n'
+                                    '    value = arguments["value"]\n'
+                                    '    return {"result": value - value + 1}\n'
+                                ),
+                                "expected": {"result": 0},
+                            },
+                        )
+                    ]
+                )
+            if self.turn == 3:
+                assert names == {"learning_create_repair_adapter"}
+                ticket_id = next(
+                    item["ticket_id"]
+                    for item in tools.recovery.list_tickets(state="open")
+                    if item["capability"] == "generated.safe_divide_ten"
+                )
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall(
+                            "good_repair",
+                            "learning_create_repair_adapter",
+                            {
+                                "ticket_id": ticket_id,
+                                "name": "safe_divide_ten_repair",
+                                "description": "Handle the captured zero-value failure.",
+                                "source": repair_source,
+                                "expected": {"result": 0},
+                            },
+                        )
+                    ]
+                )
+            if self.turn == 4:
+                # The objective keeps its original capability name. Recovery
+                # selects the activated replacement behind that stable name.
+                assert names == {"safe_divide_ten"}
+                return LLMResponse(
+                    tool_calls=[
+                        LLMToolCall("retest", "safe_divide_ten", {"value": 0})
+                    ]
+                )
+            return LLMResponse(
+                content=(
+                    "The original provider failed on the zero fixture. The repair "
+                    "passed its replay and regression checks; the verified result is 0."
+                )
+            )
+
+    class Memory:
+        session = Session()
+
+        async def process(self, *args, **kwargs) -> None:
+            return None
+
+    agent = object.__new__(Agent)
+    agent.tools = tools
+    agent.llm = Model()
+    agent.memory = Memory()
+    agent.persona = PersonaRuntime(identity=IdentityKernel(), voice=VoiceProfile())
+    agent._build_system_prompt = lambda prompt, agent_mode: "system"
+    agent._agent_trace_root = tmp_path / "autonomy" / "interactive"
+
+    answer = await agent._run_agent_loop(
+        "Run safe_divide_ten with value 0. If it fails, repair it, retest the "
+        "same input, and report the verified result."
+    )
+    await asyncio.gather(*agent._memory_tasks)
+
+    assert "verified result is 0" in answer
+    checkpoint = json.loads(
+        next((agent._agent_trace_root / "checkpoints").glob("*.json")).read_text()
+    )
+    calls = checkpoint["tool_calls"]
+    assert [call["tool"] for call in calls] == [
+        "safe_divide_ten",
+        "learning_create_repair_adapter",
+        "learning_create_repair_adapter",
+        "safe_divide_ten",
+    ]
+    assert calls[0]["status"] == "failed"
+    assert calls[0]["failure_details"]["execution_attempted"] is True
+    assert calls[1]["status"] == "failed"
+    assert calls[1]["failure_details"]["validation"]["stage"] == "comparison"
+    assert calls[2]["status"] == "succeeded"
+    assert calls[3]["status"] == "succeeded"
+    assert calls[3]["provider_tool"] == "safe_divide_ten_repair"
 
 
 @pytest.mark.asyncio
@@ -84,6 +355,114 @@ async def test_repeated_failures_open_circuit_and_persist(tmp_path: Path) -> Non
     )
     assert state["circuit_open"] is True
     assert restarted.providers_for("broken_transform") == []
+
+
+@pytest.mark.asyncio
+async def test_open_circuit_reports_skipped_execution_and_historical_error(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "recovery"
+    registry = ToolRecoveryRegistry(root)
+    registry.register_provider("broken_transform", ("generated.transform",))
+    for _ in range(2):
+        registry.record_failure(
+            tool="broken_transform",
+            requested_tool="broken_transform",
+            arguments={"value": 3},
+            error="ArtifactValidationError: fixture comparison failed",
+        )
+    calls: list[str] = []
+
+    async def should_not_run(tool: str, _arguments: dict) -> str:
+        calls.append(tool)
+        return "unexpected"
+
+    outcome = await execute_with_recovery(
+        ToolRecoveryRegistry(root),
+        requested_tool="broken_transform",
+        arguments={"value": 3},
+        call_provider=should_not_run,
+        detect_failure=lambda _result, _tool: "",
+    )
+
+    assert calls == []
+    assert outcome.attempts == ()
+    assert outcome.exception is None
+    assert outcome.failure_details["stage"] == "dispatch"
+    assert outcome.failure_details["execution_attempted"] is False
+    assert outcome.failure_details["reason"] == "matching_providers_circuit_open"
+    assert "no provider was executed" in outcome.error
+    assert "historical previous failure" in outcome.error
+    assert "fixture comparison failed" in outcome.error
+    assert "all capability providers failed" not in outcome.error
+    assert outcome.result.startswith("Tool execution not started:")
+
+
+@pytest.mark.asyncio
+async def test_provider_exception_preserves_validation_stage(tmp_path: Path) -> None:
+    registry = ToolRecoveryRegistry(tmp_path / "recovery")
+    registry.register_provider("validator", ("generated.validate",))
+
+    async def reject(_tool: str, _arguments: dict) -> str:
+        raise ArtifactValidationError(
+            "fixture comparison failed",
+            report={
+                "stage": "comparison",
+                "tests_total": 2,
+                "tests_passed": 1,
+                "tests_failed": 1,
+                "tests_not_run": 0,
+                "semantic_correctness": "not_independently_established",
+                "source": "must not be copied into diagnostics",
+            },
+        )
+
+    outcome = await execute_with_recovery(
+        registry,
+        requested_tool="validator",
+        arguments={"value": 3},
+        call_provider=reject,
+        detect_failure=lambda _result, _tool: "",
+    )
+
+    assert outcome.failure_details["stage"] == "provider_execution"
+    assert outcome.failure_details["execution_attempted"] is True
+    assert outcome.failure_details["exception_type"] == "ArtifactValidationError"
+    assert outcome.failure_details["validation"] == {
+        "stage": "comparison",
+        "tests_total": 2,
+        "tests_passed": 1,
+        "tests_failed": 1,
+        "tests_not_run": 0,
+        "semantic_correctness": "not_independently_established",
+    }
+
+
+@pytest.mark.asyncio
+async def test_last_exception_matches_last_failed_provider(tmp_path: Path) -> None:
+    registry = ToolRecoveryRegistry(tmp_path / "recovery")
+    registry.register_provider("first", ("generated.shared",), priority=200)
+    registry.register_provider("second", ("generated.shared",), priority=100)
+
+    async def fail(tool: str, _arguments: dict) -> str:
+        if tool == "first":
+            raise RuntimeError("first provider exception")
+        return "Tool execution failed: second provider returned an error"
+
+    outcome = await execute_with_recovery(
+        registry,
+        requested_tool="first",
+        arguments={"value": 3},
+        call_provider=fail,
+        detect_failure=lambda result, _tool: (
+            result if result.startswith("Tool execution failed:") else ""
+        ),
+    )
+
+    assert [attempt["provider"] for attempt in outcome.attempts] == ["first", "second"]
+    assert outcome.exception is None
+    assert outcome.provider_tool == "second"
+    assert "second provider returned an error" in outcome.error
 
 
 @pytest.mark.asyncio

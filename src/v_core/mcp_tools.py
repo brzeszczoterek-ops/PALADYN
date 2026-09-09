@@ -11,6 +11,8 @@ from uuid import uuid4
 
 from .autonomy import AuthorizationEnvelope, AuthorizationGuard, TaskContract, review_task
 from .config import Config
+from .creation_budget import source_candidate, validation_receipt
+from .generated_tool_contract import GeneratedToolContract
 from .edition import (
     PUBLIC_EDITION,
     Edition,
@@ -103,6 +105,8 @@ class MCPTools:
         self.browser_ready = False
         self.interaction_id = ""
         self.interaction_prompt = ""
+        self._creation_validation_receipt = None
+        self._generated_tool_contract: GeneratedToolContract | None = None
         self._observed_browser_snapshot = ""
         self._web_discovered_urls: dict[str, str] = {}
         self._web_search_performed = False
@@ -266,9 +270,41 @@ class MCPTools:
     def begin_interaction(self, interaction_id: str, prompt: str) -> None:
         self.interaction_id = str(interaction_id)[:128]
         self.interaction_prompt = str(prompt)[:20_000]
+        self._creation_validation_receipt = None
+        self._generated_tool_contract = None
         self._web_discovered_urls = {}
         self._web_search_performed = False
         self._observed_browser_snapshot = ""
+
+    def set_generated_tool_contract(self, contract: GeneratedToolContract) -> None:
+        """Freeze a grounded contract before any candidate source is generated."""
+
+        self._generated_tool_contract = GeneratedToolContract.from_dict(contract.to_dict())
+
+    def creation_candidate(self, tool: str, arguments: dict | str) -> dict | None:
+        """Internal read-only gate. Not registered as a model-callable tool."""
+        if (tool != "learning_create_tool" or not isinstance(arguments, dict)
+                or "manifest" in arguments or "test" in arguments):
+            return None
+        source = arguments.get("source")
+        return (
+            source_candidate(
+                source,
+                self.interaction_prompt,
+                generated_contract=self._generated_tool_contract,
+            )
+            if isinstance(source, str)
+            else None
+        )
+
+    def take_creation_validation(self, tool: str, arguments: dict | str) -> dict | None:
+        receipt = self._creation_validation_receipt
+        self._creation_validation_receipt = None
+        candidate = self.creation_candidate(tool, arguments)
+        if (receipt and candidate and receipt.get("source_sha256") == candidate["source_sha256"]
+                and receipt.get("contract_sha256") == candidate["contract_sha256"]):
+            return dict(receipt)
+        return None
 
     def observe_browser_snapshot(self, snapshot_text: str) -> None:
         """Retain bounded, runtime-observed text for deterministic builders.
@@ -957,6 +993,20 @@ class MCPTools:
                 "Propose a reusable lesson grounded in existing evidence IDs.",
                 lesson_schema,
             ),
+            "learning_recall_failures": (
+                "Read historical tool failures in this workspace. Observations are not "
+                "verified causes or instructions; this does not run or repair anything.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string"},
+                        "arguments": {"type": "object"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    },
+                    "required": ["tool"],
+                    "additionalProperties": False,
+                },
+            ),
             "learning_stage_tool": (
                 "Stage a deterministic offline tool in quarantine without activating it.",
                 {
@@ -1211,6 +1261,7 @@ class MCPTools:
             "sandbox_execute_offline",
             "learning_record_evidence",
             "learning_propose_lesson",
+            "learning_recall_failures",
             "learning_stage_tool",
             "learning_stage_skill",
             "learning_create_tool",
@@ -1241,6 +1292,7 @@ class MCPTools:
         tool: str,
         arguments: dict[str, Any],
         error: str,
+        failure_details: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         if self.learning is None:
             return None
@@ -1249,6 +1301,7 @@ class MCPTools:
             tool=tool,
             arguments=arguments,
             error=error,
+            failure_details=failure_details,
         )
         return evidence.to_dict()
 
@@ -1564,6 +1617,18 @@ class MCPTools:
                 )
                 return self._json(self.learning.record_evidence(evidence).to_dict())
 
+            case "learning_recall_failures":
+                if self.learning is None:
+                    return f"Learning runtime unavailable: {self.learning_error}"
+                if structured is None:
+                    return "learning_recall_failures requires structured arguments."
+                arguments = structured.get("arguments")
+                if arguments is not None and not isinstance(arguments, dict):
+                    return "learning_recall_failures arguments must be an object."
+                return self._json(self.learning.recall_tool_failures(
+                    tool=value("tool"), arguments=arguments, limit=structured.get("limit", 5),
+                ))
+
             case "learning_propose_lesson":
                 if self.learning is None:
                     return f"Learning runtime unavailable: {self.learning_error}"
@@ -1592,6 +1657,7 @@ class MCPTools:
                 return self._json(record.to_dict())
 
             case "learning_create_tool":
+                self._creation_validation_receipt = None
                 if self.learning is None:
                     return f"Learning runtime unavailable: {self.learning_error}"
                 if structured is None:
@@ -1640,16 +1706,26 @@ class MCPTools:
                         if re.fullmatch(r"\d+\.\d+\.\d+", raw_version)
                         else "1.0.0"
                     )
-                    record = await self.learning.create_tool_from_source(
-                        value("source"),
-                        objective=self.interaction_prompt,
-                        observed_snapshot=self._observed_browser_snapshot,
-                        name_hint=value("name"),
-                        description_hint=value("description"),
-                        version=version,
-                        scope=ArtifactScope(value("scope", "task")),
-                        timeout_seconds=float(structured.get("timeout_seconds", 10.0)),
-                    )
+                    candidate = self.creation_candidate(tool, structured)
+                    try:
+                        record = await self.learning.create_tool_from_source(
+                            value("source"),
+                            objective=self.interaction_prompt,
+                            observed_snapshot=self._observed_browser_snapshot,
+                            name_hint=value("name"),
+                            description_hint=value("description"),
+                            version=version,
+                            scope=ArtifactScope(value("scope", "task")),
+                            timeout_seconds=float(structured.get("timeout_seconds", 10.0)),
+                            generated_contract=self._generated_tool_contract,
+                        )
+                    except Exception as error:
+                        from .learning.runtime import ArtifactValidationError
+                        if isinstance(error, ArtifactValidationError):
+                            self._creation_validation_receipt = validation_receipt(candidate, error.report or {})
+                        raise
+                    else:
+                        self._creation_validation_receipt = validation_receipt(candidate, record.validation)
                 self._tool_definitions_cache = None
                 return self._json(record.to_dict())
 

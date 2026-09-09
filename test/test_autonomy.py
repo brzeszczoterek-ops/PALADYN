@@ -2729,6 +2729,36 @@ def test_explicit_test_execution_still_requires_command_execution() -> None:
     assert contract.requires_command_execution is True
 
 
+def test_created_tool_execution_satisfies_its_execution_requirement() -> None:
+    contract = TaskContract(
+        requires_command_execution=True,
+        requires_created_tool=True,
+        requires_created_tool_execution=True,
+    )
+    calls = [
+        {
+            "tool": "learning_create_tool",
+            "status": "succeeded",
+            "result_excerpt": '{"name":"double_value","status":"active"}',
+        },
+        {
+            "tool": "double_value",
+            "status": "succeeded",
+            "result_excerpt": '{"result":18}',
+        },
+    ]
+
+    assert contract.unmet(calls) == []
+
+
+def test_unrelated_command_still_requires_command_runner() -> None:
+    contract = TaskContract(requires_command_execution=True)
+
+    assert contract.unmet([
+        {"tool": "some_generated_name", "status": "succeeded"}
+    ]) == ["command_execution"]
+
+
 def test_research_facets_require_price_and_commerce_evidence() -> None:
     contract = TaskContract(
         required_research_facets=("price", "purchase_source"),
